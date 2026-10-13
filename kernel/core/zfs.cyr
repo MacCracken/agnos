@@ -1,13 +1,13 @@
 # === ZFS (read-only) — agnos 1.57.11 ===
 # Reads OpenZFS pools: vdev labels -> best uberblock -> MOS -> DSL -> every dataset that would mount is grafted
 # under the mount point the way `zpool import -o readonly=on -R /mnt/zfs <pool>` + `zfs mount -a` shows it ->
-# ZPL directories, files and symlinks. NOTHING IS EVER WRITTEN: write is 1.57.12 (operator ruling 2026-10-09).
+# ZPL directories, files and symlinks. THE READER WRITES NOTHING; the writer is core/zfs_write.cyr (1.57.12).
 # Every layout, every source and every place this departs from the reference readers (FreeBSD's loader, GRUB/
 # U-Boot) is in agnosticos/docs/development/prior-art/zfs-prior-art.md — the § numbers below point there.
 # Checksums + decompression are core/zfs_codec.cyr (host-proven: scripts/check/host-zfs-oracles.sh).
 #
-# ⛔ NO LARGE .bss. The kernel image has ~97 KB under the 0x390000 wall (scripts/check/image-layout-check.sh),
-# and .bss is inside the LOAD segment. Every buffer here lives in one 6 MiB direct-mapped area (zfs_mem,
+# ⛔ NO LARGE .bss. The kernel image ends a few hundred KB under the layout wall (scripts/check/image-layout-check.sh
+# prints the headroom of every build), and .bss is inside the LOAD segment. Every buffer here lives in one 6 MiB direct-mapped area (zfs_mem,
 # layout ZfsR) that is allocated only once a probe has found a ZFS label — a box without ZFS pays nothing.
 # ⛔ ONE WALKER AT A TIME. Every entry point is reached under fs_spin_lock (the vfs.cyr / syscall.cyr arms take
 # it), which is what makes the module scratch below safe — the FAT/exFAT/ext2 rule.
@@ -65,7 +65,8 @@ enum ZfsR {
     ZR_WALK = 0x49B000;    # 4 KiB  selftest walker path
     ZR_WBUF = 0x4A0000;    # 64 KiB selftest read buffer
     ZR_BNC  = 0x4B0000;    # 4 KiB  bounce for an unaligned device read
-    ZR_END  = 0x4B1000;
+    ZR_UP   = 0x4B1000;    # 2 x 1 KiB a path operand of open#7 and the write verbs, copied ONCE (zfs_upath)
+    ZR_END  = 0x4B1800;
 }
 
 enum ZfsWhy {
@@ -77,6 +78,8 @@ var zfs_active = 0;
 var zfs_backend = 0;           # BLK_* tag the pool was found on
 var zfs_part_lba = 0;          # partition base LBA (0 = whole disk)
 var zfs_dev_bytes = 0;         # device size in bytes, rounded down to 256 KiB (0 = unknown: front labels only)
+var zfs_lbl_ok = 0;            # bit l = label l's nvlist verified at import AND names the chosen label's pool_guid
+# and leaf guid (the writer needs all four)
 var zfs_lbsz = 512;            # that backend's LBA size
 var zfs_mem = 0;               # direct-map VA of the 6 MiB area (0 = never allocated)
 var zfs_mem_phys = 0;
@@ -108,6 +111,7 @@ var zfs_lay_ds = 0;            # cached SA layout key: dataset slot + 1, layout 
 var zfs_lay_num = 0;
 var zfs_lay_n = 0;
 var zfs_res_type = 0;          # zfs_resolve result: 1 file, 2 dir, 3 symlink, 0 other
+var zfs_res_cl = 0;            # and (1.57.12 B7) the length of its canonical path, left at ZR_PC (a graft is matched on it)
 var zfs_de_type = 0;           # zfs_dir_next result type (same codes), inode
 var zfs_de_ino = 0;
 
@@ -283,18 +287,25 @@ fn zfs_eck_ok(buf, len, v0, v1, v2) {
     memcpy(e + 8, &sv, 32);
     return memeq(&got, &sv, 32);
 }
-# Every label's nvlist that verifies; keep the highest txg's in ZR_LBL. 0 / -1.
+# Every label's nvlist that verifies; keep the highest txg's in ZR_LBL. 0 / -1. zfs_lbl_ok keeps only the labels that
+# name the chosen one's pool_guid and leaf guid (vdev_validate's identity test): the eck verifier is only the
+# device offset, so an intact label of another pool (or of this one at an old geometry) verifies wherever it sits.
 fn zfs_label_load() {
     var tmp = zfs_mem + ZR_RAW;
     var nl = 4;
     if (zfs_dev_bytes == 0) { nl = 2; }
     var best = 0 - 1;
     var bt = 0;
+    var g[64];                   # per label: pool_guid, guid
+    zfs_lbl_ok = 0;
     var l = 0;
     while (l < nl) {
         var off = zfs_label_off(l) + ZK_NVOFF;
         if (zfs_rd(off, ZK_NVSIZE, tmp) == 0) {
             if (zfs_eck_ok(tmp, ZK_NVSIZE, off, 0, 0) == 1 && load8(tmp) == 1 && zfs_be32(tmp + 4) == 0) {
+                zfs_lbl_ok = zfs_lbl_ok | (1 << l);
+                store64(&g + l * 16, zfs_nv_u64(tmp + 12, tmp + ZK_NVSIZE - 40, "pool_guid"));
+                store64(&g + l * 16 + 8, zfs_nv_u64(tmp + 12, tmp + ZK_NVSIZE - 40, "guid"));
                 var t = zfs_nv_u64(tmp + 12, tmp + ZK_NVSIZE - 40, "txg");
                 if (zfs_nv_ok == 1 && (best < 0 || t > bt)) {
                     best = l;
@@ -306,6 +317,13 @@ fn zfs_label_load() {
         l = l + 1;
     }
     if (best < 0) { kprintln("zfs: no label verifies", 22); return 0 - 1; }
+    l = 0;
+    while (l < nl) {
+        if (load64(&g + l * 16) != load64(&g + best * 16) || load64(&g + l * 16 + 8) != load64(&g + best * 16 + 8)) {
+            zfs_lbl_ok = zfs_lbl_ok & (15 - (1 << l));
+        }
+        l = l + 1;
+    }
     return 0;
 }
 
@@ -479,12 +497,11 @@ fn zfs_ck_ok(bp, pr, buf, len) {
     var ck = (pr >> 40) & 0xFF;
     if (ck == 2) { return 1; }
     var got[32];
-    if (ck == 7) { if (zfs_fletcher4(buf, len, &got) != 0) { zfs_why = ZW_CKSUM; return 0; } }
-    elif (ck == 6) { if (zfs_fletcher2(buf, len, &got) != 0) { zfs_why = ZW_CKSUM; return 0; } }
-    elif (ck == 8) { zfs_sha256_words(buf, len, &got); }
-    elif (ck == 11) { zfs_sha512_256_le_words(buf, len, &got); }    # native SHA-512 stores the DIGEST BYTES (sha2_zfs.c), unlike SHA-256's BE words
-    else { zfs_why = ZW_CKALG; zfs_why_arg = ck; return 0; }
-    if (memeq(&got, bp + 96, 32) == 1) { return 1; }
+    # zfs_codec.cyr zfs_cksum_words: the writer computes through the same dispatch (sha512's words are the DIGEST
+    # BYTES, sha2_zfs.c, unlike SHA-256's big-endian words)
+    var r = zfs_cksum_words(ck, buf, len, &got);
+    if (r == (0 - 2)) { zfs_why = ZW_CKALG; zfs_why_arg = ck; return 0; }
+    if (r == 0 && memeq(&got, bp + 96, 32) == 1) { return 1; }
     zfs_why = ZW_CKSUM;
     return 0;
 }
@@ -502,8 +519,10 @@ fn zfs_emb_read(bp, pr, dst, cap) {
     return zfs_decomp((pr >> 32) & 0x7F, &pl, psz, dst, lsz);
 }
 
-# A gang block (§ 2): read + verify the header, then concatenate the children's physical bytes into raw.
-fn zfs_gang_read(bp, w0, off, raw, psz) {
+# A gang block (§ 2): read + verify the header, then concatenate the children's physical bytes into raw. The header copy
+# at off is verified against DVA[0]'s vdev and offset and the physical birth whichever DVA it is read from — OpenZFS's
+# zio_checksum_gang_verifier uses BP_IDENTITY (&blk_dva[0]) for every copy (1.57.12 B10 review, design k.120).
+fn zfs_gang_read(bp, off, raw, psz) {
     if (zfs_gang_depth >= 2) { zfs_why = ZW_GANG; return 0 - 1; }
     var hdr = zfs_mem + ZR_GANG + zfs_gang_depth * 0x10000;
     var pb = load64(bp + 72);
@@ -512,7 +531,7 @@ fn zfs_gang_read(bp, w0, off, raw, psz) {
     var ok = 0;
     while (ok == 0) {
         if (zfs_rd(off + ZK_DATA0, gs, hdr) == 0) {
-            if (zfs_eck_ok(hdr, gs, w0 >> 32, off, pb) == 1) { ok = 1; }
+            if (zfs_eck_ok(hdr, gs, load64(bp) >> 32, (load64(bp + 8) & 0x7FFFFFFFFFFFFFFF) << 9, pb) == 1) { ok = 1; }
         }
         if (ok == 0) {
             if (gs == 512) { zfs_why = ZW_GANG; return 0 - 1; }
@@ -573,7 +592,7 @@ fn zfs_bp_read(bp, dst, cap) {
             else {
                 var off = (w1 & 0x7FFFFFFFFFFFFFFF) << 9;
                 var rc = 0;
-                if ((w1 >> 63) == 1) { rc = zfs_gang_read(bp, w0, off, raw, psz); }
+                if ((w1 >> 63) == 1) { rc = zfs_gang_read(bp, off, raw, psz); }
                 else {
                     rc = zfs_rd(off + ZK_DATA0, psz, raw);
                     if (rc != 0) { zfs_why = ZW_IO; }
@@ -959,18 +978,33 @@ fn zfs_zap_u64(dn, name, out) {
 }
 
 # --- DSL: datasets, properties, grafts (§ 7) -----------------------------------------------------------------------
-# String property pname of the dsl_dir whose props ZAP is MOS object pz (scratch dnode zdn): the local value, else
-# pname$recvd. Copied NUL-terminated into out (cap bytes). Length, or -2 when unset.
+# pname + suffix in ZR_NAME (rebuilt per lookup: a lookup in a normalized ZAP scans through ZR_NAME).
+fn zfs_prop_key(pname, pl, suf, sl) {
+    var nb = zfs_mem + ZR_NAME;
+    memcpy(nb, pname, pl);
+    memcpy(nb + pl, suf, sl);
+    return nb;
+}
+# Property pname at ONE dsl_dir, from its props ZAP at zdn, in dsl_prop_get_dd's order (dsl_prop.c:118-170):
+# pname$iuv (a value older readers must not see — redundant_metadata, snapdir), then pname, then pname$recvd unless
+# pname$inherit is present (`zfs inherit` over a received value masks it; the walk goes on to the parent). At most
+# maxn integers of isz bytes to out. Integer count, -2 unset at this dsl_dir, -1 a read error.
+fn zfs_prop_find(zdn, pname, isz, maxn, out) {
+    var pl = strlen(pname);
+    var r = zfs_zap_lookup(zdn, zfs_prop_key(pname, pl, "$iuv", 4), pl + 4, isz, maxn, out);
+    if (r == (0 - 2)) { r = zfs_zap_lookup(zdn, pname, pl, isz, maxn, out); }
+    if (r != (0 - 2)) { return r; }
+    var v = 0;
+    r = zfs_zap_lookup(zdn, zfs_prop_key(pname, pl, "$inherit", 8), pl + 8, 8, 1, &v);
+    if (r >= 0) { return 0 - 2; }
+    if (r == (0 - 1)) { return r; }
+    return zfs_zap_lookup(zdn, zfs_prop_key(pname, pl, "$recvd", 6), pl + 6, isz, maxn, out);
+}
+# String property pname of the dsl_dir whose props ZAP is MOS object pz (scratch dnode zdn), copied NUL-terminated
+# into out (cap bytes). Length, or -2 when unset (or unreadable: the reader's callers inherit instead).
 fn zfs_prop_str(pz, pname, out, cap, zdn) {
     if (zfs_dnode(zfs_mem + ZR_MOS, pz, zdn) != 0) { return 0 - 2; }
-    var r = zfs_zap_lookup(zdn, pname, strlen(pname), 1, cap - 1, out);
-    if (r < 0) {
-        var nb = zfs_mem + ZR_NAME;
-        var pl = strlen(pname);
-        memcpy(nb, pname, pl);
-        memcpy(nb + pl, "$recvd", 6);
-        r = zfs_zap_lookup(zdn, nb, pl + 6, 1, cap - 1, out);
-    }
+    var r = zfs_prop_find(zdn, pname, 1, cap - 1, out);
     if (r < 0) { return 0 - 2; }
     while (r > 0 && load8(out + r - 1) == 0) { r = r - 1; }
     store8(out + r, 0);
@@ -979,19 +1013,16 @@ fn zfs_prop_str(pz, pname, out, cap, zdn) {
 fn zfs_prop_u64(pz, pname, dflt, zdn) {
     if (zfs_dnode(zfs_mem + ZR_MOS, pz, zdn) != 0) { return dflt; }
     var v = 0;
-    if (zfs_zap_u64(zdn, pname, &v) == 1) { return v; }
-    var nb = zfs_mem + ZR_NAME;
-    var pl = strlen(pname);
-    memcpy(nb, pname, pl);
-    memcpy(nb + pl, "$recvd", 6);
-    if (zfs_zap_lookup(zdn, nb, pl + 6, 8, 1, &v) == 1) { return v; }
+    if (zfs_prop_find(zdn, pname, 8, 1, &v) == 1) { return v; }
     return dflt;
 }
 
 # Open dataset object dsobj into slot ds: its object set, master node, and (ZPL >= 5) the SA registry. 0 / -1.
 # Slot layout: +0 meta-dnode · +512 ROOT · +520 1 = SA-based · +528 LAYOUTS object · +536 case-folded lookups ·
 # +544 MODE +552 SIZE +560 MTIME +568 LINKS +576 SYMLINK attribute numbers (-1 = unregistered) · +584 u16[128]
-# registered length + 1 per attribute number · +840 dataset object · +848 name length · +856 name.
+# registered length + 1 per attribute number · +840 dataset object · +848 name length · +856 name (<= 136 B) ·
+# +992 GEN +1000 CTIME +1008 FLAGS attribute numbers (-1 = unregistered; 1.57.12 B5 — the writer's SA updates and
+# the fds' generation check, design § f.4) · +1016 the write verdict (core/zfs_write.cyr zfs_wmount: 1 = writable).
 fn zfs_ds_open(ds, dsobj) {
     var dn = zfs_dnslot(0);
     if (zfs_dnode(zfs_mem + ZR_MOS, dsobj, dn) != 0) { return 0 - 1; }
@@ -1019,6 +1050,8 @@ fn zfs_ds_open(ds, dsobj) {
     store64(ds + 520, 0);
     var k = 0;
     while (k < 5) { store64(ds + 544 + k * 8, 0 - 1); k = k + 1; }
+    k = 0;
+    while (k < 3) { store64(ds + 992 + k * 8, 0 - 1); k = k + 1; }
     memset(ds + 584, 0, 256);
     var sa = 0;
     if (zfs_zap_u64(mn, "SA_ATTRS", &sa) != 1) { return 0; }        # ZPL <= 4: znode_phys_t bonuses
@@ -1042,6 +1075,9 @@ fn zfs_ds_open(ds, dsobj) {
         if (zfs_is(nm, nl, "ZPL_MTIME") == 1) { store64(ds + 560, num); }
         if (zfs_is(nm, nl, "ZPL_LINKS") == 1) { store64(ds + 568, num); }
         if (zfs_is(nm, nl, "ZPL_SYMLINK") == 1) { store64(ds + 576, num); }
+        if (zfs_is(nm, nl, "ZPL_GEN") == 1) { store64(ds + 992, num); }
+        if (zfs_is(nm, nl, "ZPL_CTIME") == 1) { store64(ds + 1000, num); }
+        if (zfs_is(nm, nl, "ZPL_FLAGS") == 1) { store64(ds + 1008, num); }
         r = zfs_zap_next(sm, &cur);
     }
     if (r < 0 || load64(ds + 544) < 0 || load64(ds + 552) < 0) { zfs_why = ZW_CORRUPT; return 0 - 1; }
@@ -1093,7 +1129,7 @@ fn zfs_graft(dsobj, mp, ml, dsname, dnl) {
         return 0 - 1;
     }
     var nl = dnl;
-    if (nl > 160) { nl = 160; }
+    if (nl > 136) { nl = 136; }
     store64(ds + 848, nl);
     memcpy(ds + 856, dsname, nl);
     if (zfs_gr_add(1, ((zfs_nds + 1) << 48) | load64(ds + 512), mp, ml) < 0) { return 0 - 1; }
@@ -1191,7 +1227,9 @@ fn zfs_sa_layout(di, ds, lay) {
     zfs_lay_ds = di + 1;
     return 0;
 }
-# Attribute num in one SA buffer (bonus or spill). Length / -2 absent / -1 error.
+# Attribute num in one SA buffer (bonus or spill). Length / -2 absent / -1 error. A hit also leaves the attribute's
+# offset in buf in zfs_sa_at (1.57.12 B5: the writer updates a fixed-size attribute IN PLACE there — sa.c:378-385).
+var zfs_sa_at = 0;
 fn zfs_sa_find(di, ds, buf, blen, num, out, cap) {
     if (blen < 8 || load32(buf) != ZK_SAMAGIC) { zfs_why = ZW_CORRUPT; return 0 - 1; }
     var li = load16(buf + 4);
@@ -1217,6 +1255,7 @@ fn zfs_sa_find(di, ds, buf, blen, num, out, cap) {
             var c = ln;
             if (c > cap) { c = cap; }
             memcpy(out, buf + off, c);
+            zfs_sa_at = off;
             return ln;
         }
         off = (off + ln + 7) & (0 - 8);
@@ -1359,7 +1398,11 @@ fn zfs_resolve(path, len, follow) {
     var links = 0;
     while (1 == 1) {
         while (ap < al && load8(a + ap) == 47) { ap = ap + 1; }
-        if (ap >= al) { zfs_res_type = ty; return cur; }
+        if (ap >= al) {
+            zfs_res_type = ty;
+            zfs_res_cl = cl;
+            return cur;
+        }
         var s = ap;
         while (ap < al && load8(a + ap) != 47) { ap = ap + 1; }
         var nl = ap - s;
@@ -1620,7 +1663,7 @@ fn zfs_init() {
             if (found == 0 && gpt_present == 1 && tag == blk_active) {
                 var pi = 0;
                 while (pi < gpt_partition_count && found == 0) {
-                    if (gpt_partition_info(pi) == 1) {
+                    if (gpt_used_info(pi) == 1) {
                         var esp = 0;
                         if (gpt_q_type_lo == GPT_TYPE_ESP_LO && gpt_q_type_hi == GPT_TYPE_ESP_HI) { esp = 1; }
                         if (esp == 0) {
@@ -1656,11 +1699,26 @@ fn zfs_init() {
     kprint_num(zfs_ashift);
     kprint(" datasets=", 10);
     kprint_num(zfs_nds);
-    kprintln(" read-only", 10);
+    kprintln("", 0);
+    # 1.57.12 (core/zfs_write.cyr): the write gate and the allocator state load. The pool's access verdict is the
+    # named `zfs: <pool> rw` / `read-only (<why>)` line that follows (this line ended " read-only" through
+    # 1.57.11), then one line per refused dataset. Writes nothing (B1).
+    zfs_wmount();
     return 0;
 }
 
 # --- VFS-facing entries (all called under fs_spin_lock) ------------------------------------------------------------
+# (1.57.12 B7 review) Path operand k (0 / 1) of open#7 or a write verb — len bytes at path, ring-3 memory when a syscall
+# arm passes it — copied ONCE into ZR_UP + k KiB, so every check and every lookup reads the same bytes: re-read from the
+# caller's buffer, a second thread of its own could make the name KEPT differ from the name checked and looked up (a
+# ".." or a '/' entry). Returns the copy (path itself when it already is it), or 0 when len is outside [0, 1023]
+# (zfs_resolve's bound — the caller answers "path unresolvable: 36", as the resolve did). fs_spin_lock held.
+fn zfs_upath(k, path, len) {
+    if (len < 0 || len > 1023) { return 0; }
+    var p = zfs_mem + ZR_UP + k * 1024;
+    if (path != p) { memcpy(p, path, len); }
+    return p;
+}
 # Where the ZFS-relative part of an absolute path routed to FS_ZFS starts. Computed from the path, NOT read from
 # vfs_mnt_reloff: that is one global every CPU's vfs_resolve_mount writes, and the mount table it derives from is
 # immutable after boot (vfs_mount_init), so the answer is a pure function of the path.
@@ -1687,8 +1745,10 @@ fn zfs_readdir_sys(path, buf, maxn, curp) {
     fs_spin_unlock();
     return n;
 }
-# The 48-byte agnos stat (ABI § 4.1) of ref into sb. 0 / -1.
+# The 48-byte agnos stat (ABI § 4.1) of ref into sb. 0 / -1. (1.57.12 B11) A pending policy-B txg of ref commits first
+# (zfs_write.cyr zfs_wp_obs: commit-before-observe) — st_size / st_mtime / st_blocks are the committed object's.
 fn zfs_stat_ref(ref, sb) {
+    if (zfs_wp_obs(ref) != 0) { return 0 - 1; }     # (B11 review) a failed commit-before-observe is -1, as read#5's
     var di = zfs_ref_di(ref);
     if (di < 0) {
         store64(sb, 0x41ED);
@@ -1724,50 +1784,146 @@ fn zfs_stat(path, len, follow, sb) {
     return zfs_stat_ref(r, sb);
 }
 fn zfs_readlink(path, len, buf, cap) {
+    zfs_wp_obs(0);                                   # (1.57.12 B11) only the pending txg's age bound: a symlink is never it
     var r = zfs_resolve(path, len, 0);
     if (r < 0 || zfs_res_type != 3) { return 0 - 1; }
     return zfs_readlink_ref(r, buf, cap);
 }
-# open#7 on the ZFS mount. Read-only by construction: any write, create or truncate flag is -1. AO_DIRECTORY ->
-# a VFS_ZFS_DIR fd (getdents#29); a regular file -> a VFS_ZFS_FILE fd that streams any size and seeks.
+# open#7 on the ZFS mount. AO_DIRECTORY -> a VFS_ZFS_DIR fd (getdents#29; no write flag). A regular file -> a
+# VFS_ZFS_FILE fd that streams any size and seeks: payload [0] the position · [1] the object's ZPL_GEN (D11: every fd
+# op re-reads the dnode and compares it — an object number reused after an unlink fails -1; 0 = not checked, a pre-SA
+# dataset) | ZK_FDW when the fd may write · [2] the ref. 1.57.12 B5 (design § a.1, § f.4): AO_WRONLY (1) / AO_RDWR (2)
+# need a writable pool and dataset and an object the writer accepts (zfs_wopen, named refusals); AO_TRUNC (0x200)
+# truncates to 0 in its own txg (zfs_wtrunc — on any access mode, as the ext2 arm does: design § k.44, DECIDED
+# 2026-10-11); AO_CREAT (0x100) opens an existing file and (B6) CREATES a missing one — a plain file, mode 0100644, in
+# its own txg (zfs_wcreate: never through a final component that resolves at all — a dangling symlink is EEXIST, the
+# final component is not followed) — AO_EXCL (0x2000) with it refuses an existing name, tested BEFORE AO_TRUNC, and a
+# file just created is not truncated; AO_APPEND (0x400) is not honoured (ext2's rule); AO_NOFOLLOW (0x1000): the final
+# component is not followed. Every -1 is named in zfs_wr_* (B6 review: open#7's arm logs a refused write-intent open,
+# zfs_wr_say).
+enum ZfsFd {
+    ZK_FDW   = 0x4000000000000000;       # payload[1] bit 62: the fd was opened for writing
+    ZK_FDGEN = 0x3FFFFFFFFFFFFFFF;       # payload[1] bits 0-61: ZPL_GEN at open (a txg: < 2^62)
+}
 fn zfs_open(path, len, flags) {
-    if ((flags & 0x303) != 0) { return 0 - 1; }
+    var acc = flags & 3;
+    if (acc == 3) { return zfs_wno("access mode 3"); }
+    # (1.57.12 B11) AO_CREAT / AO_TRUNC mutate: a pending policy-B txg commits first (zfs_write.cyr zfs_wp_flush)
+    if ((flags & 0x300) != 0 && zfs_wp_flush() != 0) { return 0 - 1; }
+    path = zfs_upath(0, path, len);                  # read once (B7 review): the create below works on the same copy
+    if (path == 0) { return zfs_wnon("path unresolvable: ", 36); }
     var follow = 1;
     if ((flags & 0x1000) != 0) { follow = 0; }
+    if ((flags & 0x2100) == 0x2100) {
+        if (zfs_resolve(path, len, 0) >= 0) { return zfs_wno("name exists (AO_CREAT | AO_EXCL: EEXIST)"); }
+    }
     var r = zfs_resolve(path, len, follow);
-    if (r < 0) { return 0 - 1; }
+    var made = 0;
+    # B6: a missing name is created, its own txg — and (B6 review) ANY failed lookup goes to zfs_wcreate too, which
+    # creates only where its own no-follow lookup says absent and otherwise refuses BY NAME (an unreadable > 128 KiB
+    # microzap parent, a dangling final symlink, ...): until then this answered an unnamed -1
+    if (r < 0 && (flags & 0x900) == 0x100) {
+        if (zfs_wcreate(path, len, 0, 0, 0) != 0) { return 0 - 1; }
+        r = zfs_resolve(path, len, 0);
+        made = 1;
+    }
+    if (r < 0) { return zfs_wnon("path unresolvable: ", 0 - r); }
     var t = zfs_res_type;
+    if (zfs_wp_obs(r) != 0) { return 0 - 1; }       # (1.57.12 B11) the object a pending txg holds: committed first
     var fd = 0 - 1;
     var base = 0;
+    var wr = 0;
+    if (acc != 0 || (flags & 0x200) != 0) { wr = 1; }
     if ((flags & 0x800) != 0) {
-        if (t != 2) { return 0 - 1; }
+        if (t != 2 || wr == 1) { return zfs_wno("AO_DIRECTORY: not a directory, or a write flag"); }
+        # 1.57.12 B7: a dataset directory's fd carries its ZPL_GEN too (D11) — rmdir frees the object and a later create
+        # may reuse its number; zfs_getdents answers -1 then (a virtual directory: 0, never checked)
+        var dg = 0;
+        if (zfs_ref_di(r) >= 0) {
+            var ddn = zfs_dnslot(4);
+            if (zfs_ref_dn(r, ddn) != 0) { return zfs_wno("object unreadable"); }
+            dg = zfs_fd_gen(zfs_ref_di(r), ddn);
+            if (dg < 0) { return zfs_wno("object GEN unreadable"); }
+        }
         fd = vfs_alloc();
-        if (fd < 0) { return 0 - 1; }
+        if (fd < 0) { return zfs_wno("no free fd"); }
         base = vfs_fd_table() + fd * 32;
         ktag_set(base, VFS_ZFS_DIR);
         kpayload_set(base, 0, 0);
-        kpayload_set(base, 1, 0);
+        kpayload_set(base, 1, dg);
         kpayload_set(base, 2, r);
         return fd;
     }
-    if (t != 1) { return 0 - 1; }
+    if (t != 1) { return zfs_wnon("not a regular file: type ", t); }
+    if (wr == 1 && zfs_wopen(r) != 0) { return 0 - 1; }
     var dn = zfs_dnslot(4);
-    if (zfs_ref_dn(r, dn) != 0) { return 0 - 1; }
-    var size = zfs_attr(zfs_ref_di(r), dn, 1);
-    if (size < 0) { return 0 - 1; }
+    if (zfs_ref_dn(r, dn) != 0) { return zfs_wno("object unreadable"); }
+    var di = zfs_ref_di(r);
+    var size = zfs_attr(di, dn, 1);
+    var gen = zfs_fd_gen(di, dn);
+    if (size < 0 || gen < 0) { return zfs_wno("object SIZE / GEN unreadable"); }
     fd = vfs_alloc();
-    if (fd < 0) { return 0 - 1; }
+    if (fd < 0) { return zfs_wno("no free fd"); }
     base = vfs_fd_table() + fd * 32;
+    if ((flags & 0x200) != 0 && made == 0) {
+        # the slot RESERVED first, as a read-only fd of the file: a truncation of several txgs releases fs_lock between
+        # them (zfs_wf_yield, B5 review), and an untagged slot would be any other open's to take meanwhile
+        ktag_set(base, VFS_ZFS_FILE);
+        kpayload_set(base, 0, 0);
+        kpayload_set(base, 1, gen);
+        kpayload_set(base, 2, r);
+        if (zfs_wtrunc(r, 0) != 0) {
+            ktag_clear(base, 32);                        # released: VFS_FREE, payload 0 (vfs_close_inner's form)
+            return 0 - 1;
+        }
+    }
+    if (acc != 0) { gen = gen | ZK_FDW; }
     ktag_set(base, VFS_ZFS_FILE);
     kpayload_set(base, 0, 0);
-    kpayload_set(base, 1, size);
+    kpayload_set(base, 1, gen);
     kpayload_set(base, 2, r);
     return fd;
 }
-# read#5 of a VFS_ZFS_FILE fd. Bytes / 0 at EOF / -1.
+# ZPL_GEN of the SA dnode dn of dataset slot di (& ZK_FDGEN), or 0 where it is not kept — a pre-SA dataset, an
+# unregistered attribute (such a dataset is never writable, so its objects are never reused). -1 unreadable.
+fn zfs_fd_gen(di, dn) {
+    var ds = zfs_ds(di);
+    if (load64(ds + 520) != 1 || load64(ds + 992) < 0) { return 0; }
+    var v[16];
+    if (zfs_sa_attr(di, dn, load64(ds + 992), &v, 16) != 8) { return 0 - 1; }
+    return load64(&v) & ZK_FDGEN;
+}
+# D11's identity (design § f.4), ONE rule for every fd and for a multi-txg op between its txgs: is the SA dnode dn of
+# dataset slot di (just re-read) still the object opened at ZPL_GEN g — the same generation (1.57.12 B7: unlink frees
+# it, or a create reuses its number — design § k.41, k.50) and not on the DELETE_QUEUE with LINKS 0 (the lazy unlink,
+# design § f.5: freed at OpenZFS's next mount — D11 (a); B7 review: a directory fd and a truncation's re-check tested
+# the generation alone)? g 0: not checked (a pre-SA dataset — never writable, so its numbers are never reused). 1 / 0.
+fn zfs_fd_live(di, dn, g) {
+    if (g == 0) { return 1; }
+    if (zfs_fd_gen(di, dn) != g) { return 0; }
+    var lk[16];
+    if (zfs_sa_attr(di, dn, load64(zfs_ds(di) + 568), &lk, 16) == 8 && load64(&lk) == 0) { return 0; }
+    return 1;
+}
+# The object of a VFS_ZFS_FILE fd re-read (zfs_dnslot(4)) and its identity checked (zfs_fd_live, D11): its SIZE from the
+# SA — never a cached copy (read#5, lseek#58's SEEK_END) — or -1 when the object is gone, is another one now, or is on
+# the DELETE_QUEUE.
+fn zfs_fd_size(base) {
+    var ref = kpayload(base, 2);
+    var dn = zfs_dnslot(4);
+    if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
+    var di = zfs_ref_di(ref);
+    if (zfs_fd_live(di, dn, kpayload(base, 1) & ZK_FDGEN) == 0) { return 0 - 1; }
+    return zfs_attr(di, dn, 1);
+}
+# read#5 of a VFS_ZFS_FILE fd. Bytes / 0 at EOF / -1. (1.57.12 B11) A pending policy-B txg of its object commits first
+# (zfs_wp_obs) — a reader through ANY fd sees what a write through another one put there; another file's pending txg
+# stays open (a cp from ZFS to ZFS is still one txg per file).
 fn zfs_fd_read(base, buf, count) {
+    if (zfs_wp_obs(kpayload(base, 2)) != 0) { return 0 - 1; }
     var pos = kpayload(base, 0);
-    var size = kpayload(base, 1);
+    var size = zfs_fd_size(base);
+    if (size < 0) { return 0 - 1; }
     if (pos >= size) { return 0; }
     var n = size - pos;
     if (count < n) { n = count; }
@@ -1775,11 +1931,19 @@ fn zfs_fd_read(base, buf, count) {
     if (r > 0) { kpayload_set(base, 0, pos + r); }
     return r;
 }
-# getdents#29 of a VFS_ZFS_DIR fd: ABI § 4.2 records ("." and ".." first). Bytes / 0 at end / -1.
+# getdents#29 of a VFS_ZFS_DIR fd: ABI § 4.2 records ("." and ".." first). Bytes / 0 at end / -1 — and -1 (1.57.12 B7,
+# D11: zfs_fd_live) once the directory is gone, its object number names another one, or (B7 review) it is on the
+# DELETE_QUEUE — an rmdir or a rename over it that took the lazy path.
 fn zfs_getdents(base, ubuf, size) {
+    zfs_wp_obs(0);                                   # (1.57.12 B11) the age bound only: names never change in a pending txg
     var ref = kpayload(base, 2);
     var cur = kpayload(base, 0);
     var written = 0;
+    var dg = kpayload(base, 1);
+    if (dg != 0) {
+        var ddn = zfs_dnslot(4);
+        if (zfs_ref_dn(ref, ddn) != 0 || zfs_fd_live(zfs_ref_di(ref), ddn, dg) == 0) { return 0 - 1; }
+    }
     while (1 == 1) {
         var prev = cur;
         var r = zfs_dir_next(ref, &cur, 1);
@@ -1810,6 +1974,7 @@ fn zfs_getdents(base, ubuf, size) {
 # readdir#81 / readdir_at#101 records: 64 bytes, name NUL-terminated (<= 62 bytes), byte 63 = 1 for a directory.
 # "." and ".." are not listed. The cursor is opaque: 0 starts, -1 = exhausted. Count / -2 not found / -4 not a dir.
 fn zfs_readdir_at(path, plen, buf, maxn, curp) {
+    zfs_wp_obs(0);                                   # (1.57.12 B11) the age bound only
     var r = zfs_resolve(path, plen, 1);
     if (r < 0) { return 0 - 2; }
     if (zfs_res_type != 2) { return 0 - 4; }
@@ -1845,15 +2010,22 @@ fn zfs_readdir_at(path, plen, buf, maxn, curp) {
     return n;
 }
 # statfs#103 (ABI § 4.7): blocks of 2^ashift; total = the top-level vdev's allocatable size; free = total minus
-# the root dsl_dir's used bytes (dataset-accounted, so pool metadata outside $MOS is not counted); available =
-# free minus the 1/32 slop OpenZFS reserves (spa_slop_shift = 5).
+# the root dsl_dir's used bytes (dataset-accounted, so pool metadata outside $MOS is not counted); available (1.57.12
+# B5 review — design § a.4) = on a WRITABLE pool what the writer lets user data take: its room (zfs_wroom — OpenZFS's
+# slop, the deferral window's frees — (B11) the last two txgs', released at txg + 2 — and the metaslabs it can allocate in)
+# less the pool's allocated bytes; on a read-only one free less OpenZFS's slop (spa_get_slop_space of the allocatable
+# size). Never above free.
 fn zfs_fill_statfs(buf) {
+    if (zfs_wp_flush() != 0) { return 0 - 1; }      # (1.57.12 B11) the pool's space: a pending txg commits first (-1: it failed)
     var bs = 1 << zfs_ashift;
     var tot = zfs_asize >> zfs_ashift;
     var used = (zfs_used + bs - 1) >> zfs_ashift;
     var fre = tot - used;
     if (fre < 0) { fre = 0; }
-    var avl = fre - (tot >> 5);
+    var avl = fre - (zfs_wslop_sp(zfs_asize, 0) >> zfs_ashift);
+    var wa = zfs_wavail();
+    if (wa >= 0) { avl = wa >> zfs_ashift; }
+    if (avl > fre) { avl = fre; }
     if (avl < 0) { avl = 0; }
     store64(buf, bs);
     store64(buf + 8, tot);
@@ -1865,6 +2037,7 @@ fn zfs_fill_statfs(buf) {
 fn zfs_file_size(path, len) {
     var r = zfs_resolve(path, len, 1);
     if (r < 0 || zfs_res_type != 1) { return 0 - 1; }
+    if (zfs_wp_obs(r) != 0) { return 0 - 1; }       # (1.57.12 B11) exec / the kernel readers: committed first
     var dn = zfs_dnslot(4);
     if (zfs_ref_dn(r, dn) != 0) { return 0 - 1; }
     return zfs_attr(zfs_ref_di(r), dn, 1);

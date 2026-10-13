@@ -444,6 +444,21 @@ fn zfs_fletcher2(buf, len, out) {
     return 0;
 }
 
+# zfs_cksum_words(ck, buf, len, out) — the checksum a block pointer of algorithm ck carries in blk_cksum, over
+# [buf, buf + len), in the on-disk word order (zio_checksum_table, zio_checksum.c:170-207): 6 fletcher2, 7 fletcher4,
+# 8 sha256 (big-endian words, abd_checksum_sha256), 11 sha512 = SHA-512/256 as abd_checksum_sha512_native stores it
+# (the digest bytes in place: little-endian words, sha2_zfs.c). ONE dispatch for the reader's verify (zfs.cyr
+# zfs_ck_ok) and the writer's compute (zfs_write.cyr zfs_bp_build), so the two cannot disagree on a word order.
+# 0 · -1 a length the algorithm refuses (fletcher: not a multiple of 4 / 16) · -2 not implemented here (off, label,
+# gang header, zilog/zilog2, noparity, skein, edonr, blake3 — the label/gang/ZIL ones are embedded, not BP, checksums).
+fn zfs_cksum_words(ck, buf, len, out) {
+    if (ck == 7) { return zfs_fletcher4(buf, len, out); }
+    if (ck == 8) { return zfs_sha256_words(buf, len, out); }
+    if (ck == 11) { return zfs_sha512_256_le_words(buf, len, out); }
+    if (ck == 6) { return zfs_fletcher2(buf, len, out); }
+    return 0 - 2;
+}
+
 # =================================================================================================
 # LZ77 back-reference copy (shared by lz4 and inflate)
 # =================================================================================================
@@ -652,6 +667,53 @@ fn zfs_zle_decompress(src, slen, dst, dlen, n) {
     if (di != dlen) { return 0 - 1; }
     zfs_codec_outlen = di;
     return 0;
+}
+
+# zfs_zle_compress(src, slen, dst, dlen, n) — the WRITER's ZLE (1.57.12 B3a), OpenZFS zfs_zle_compress_buf
+# (module/zfs/zle.c:41-68) statement for statement, so its output is byte-identical to OpenZFS's: a run of up to
+# 256 - n zero bytes is one byte (run - 1 + n); otherwise up to n literal bytes follow a byte (count - 1), and a
+# literal run ends early only at TWO zeros in a row (a lone zero stays literal). The loop stops when fewer than 2
+# bytes of dst are left, and a literal run starts only with n bytes of room after its length byte.
+# Returns the compressed length, or -1 when the input did not fit in dlen — where OpenZFS returns s_len, its "did not
+# compress" signal (every OpenZFS caller passes d_len < s_len; -1 cannot be confused with a length at any dlen).
+# Reads only [src, src + slen), writes only [dst, dst + dlen) — offsets throughout, as the decoders. A literal run's
+# look-ahead reads src[si + 1] only while si + 1 < its limit (no reliance on && short-circuiting).
+fn zfs_zle_compress(src, slen, dst, dlen, n) {
+    if (slen < 0 || dlen < 0 || n < 1 || n > 255) { return 0 - 1; }
+    var si = 0;
+    var di = 0;
+    while (si < slen && di < dlen - 1) {
+        var first = si;
+        var lp = di;
+        di = di + 1;
+        if (load8(src + si) == 0) {
+            var zl = si + (256 - n);
+            if (zl > slen) { zl = slen; }
+            while (si < zl) {
+                if (load8(src + si) != 0) { break; }
+                si = si + 1;
+            }
+            store8(dst + lp, si - first - 1 + n);
+        } else {
+            if (dlen - di < n) { break; }
+            var ll = si + n;
+            if (ll > slen) { ll = slen; }
+            while (si < ll - 1) {
+                if ((load8(src + si) | load8(src + si + 1)) == 0) { break; }
+                store8(dst + di, load8(src + si));
+                di = di + 1;
+                si = si + 1;
+            }
+            if (load8(src + si) != 0) {
+                store8(dst + di, load8(src + si));
+                di = di + 1;
+                si = si + 1;
+            }
+            store8(dst + lp, si - first - 1);
+        }
+    }
+    if (si != slen) { return 0 - 1; }
+    return di;
 }
 
 # =================================================================================================

@@ -1,0 +1,1126 @@
+# zfs_wenc.cyr — the ZFS WRITER's pure on-disk encoders (agnos 1.57.12, bite B3a): block-pointer words, holes, the
+# metadata compression decision, and space-map entries. Like core/zfs_codec.cyr this file knows nothing about pools
+# or devices: every function is a transform over caller-supplied values and buffers, so tests/zfscodec includes it
+# VERBATIM and scores it on the host (scripts/check/host-zfs-oracles.sh, check.sh gate 37) against an independent
+# Python encoder written from OpenZFS 2.4.2's headers (spa.h, space_map.h) and against block pointers OpenZFS itself
+# wrote into the fixture pools. core/zfs_write.cyr (allocator, dirty set, commit) is the only kernel caller.
+# The ruled design is docs/development/proposals/2026-10-09-zfs-write.md ("design § x"); the on-disk rules with
+# their OpenZFS citations are agnosticos docs/development/prior-art/zfs-write-prior-art.md ("WPA § n").
+#
+# ⛔ What this file emits is what OpenZFS's own write path emits, field for field — the source of each rule is named
+# at the function. Where agnos deliberately emits LESS (never an embedded, gang, dedup or encrypted BP; ZLE where
+# OpenZFS would use lz4) the BP is still one OpenZFS itself can write, and every reader accepts it.
+# ⛔ Cyrius compares are SIGNED and >> is logical: every range test below is on a value already known to be small
+# and non-negative, and the words built here (a blk_prop has bit 63 set) are only stored, never compared.
+
+enum ZfsE {
+    ZE_MAXBLK  = 0x1000000;             # SPA_MAXBLOCKSIZE, 16 MiB (spa.h): no lsize / psize above it
+    ZE_ASZMAX  = 0xFFFFFF;              # DVA asize >> 9 fits 24 bits (SPA_ASIZEBITS)
+    ZE_VDEVMAX = 0xFFFFFF;              # 24-bit vdev ids (SPA_VDEVBITS); 2^24 is SM_NO_VDEVID
+    ZE_OFF47   = 0x800000000000;        # one-word space-map entry: offset < 2^47 units (SM_OFFSET_BITS)
+    ZE_RUN15   = 0x8000;                # one-word entry: run <= 2^15 units (SM_RUN_MAX)
+    ZE_RUN36   = 0x1000000000;          # two-word entry: run <= 2^36 units (SM2_RUN_MAX)
+    ZE_TXG50   = 0x4000000000000;       # debug entry: txg < 2^50 (SM_DEBUG_TXG_ENCODE's field)
+    ZE_OFF63   = 0x7FFFFFFFFFFFFFFF;    # two-word entry: offset < 2^63 units (SM2_OFFSET_BITS)
+    ZE_ZLE     = 14;                    # ZIO_COMPRESS_ZLE
+    ZE_ZLEN    = 64;                    # its ci_level, the n of zle.c (zio_compress.c:68-69)
+    ZE_OTNUM   = 54;                    # DMU_OT_NUMTYPES (dmu.h:251): the legacy object types are 0 .. 53
+    ZE_BSWNUM  = 10;                    # DMU_BSWAP_NUMFUNCS (dmu.h:104): a DMU_OTN_* type's byteswap is 0 .. 9
+    ZE_SAMAGIC = 0x2F505A;              # SA_MAGIC (sa_impl.h): sa_hdr_phys_t.sa_magic, native byte order
+}
+
+# --- block pointers (spa.h:120-180 layout, :386-560 accessors; WPA § 4) -------------------------------------------
+# DMU_OT_IS_VALID (dmu.h:124-126): a legacy type < DMU_OT_NUMTYPES, or a DMU_OTN_* type (bit 7, NEWTYPE; bits 5-6 the
+# encrypted / metadata flags) whose byteswap (bits 0-4) < DMU_BSWAP_NUMFUNCS. zfs_blkptr_verify refuses any other
+# TYPE first, holes included (zio.c:1171), and OpenZFS runs it with BLK_VERIFY_HALT on every child BP of every
+# indirect and dnode block it writes (dbuf.c:5050, :5057, :5077) — a BP agnos wrote with a bad type would panic
+# OpenZFS the next time it rewrote the parent. 1 valid / 0.
+fn zfs_ot_valid(ty) {
+    if (ty < 0 || ty > 255) { return 0; }
+    if ((ty & 0x80) != 0) {
+        if ((ty & 0x1F) < ZE_BSWNUM) { return 1; }
+        return 0;
+    }
+    if (ty < ZE_OTNUM) { return 1; }
+    return 0;
+}
+# DVA word 0: asize >> 9 in bits 0-23 (DVA_SET_ASIZE, BF64_SET_SB(.., 0, 24, SPA_MINBLOCKSHIFT, 0)), the vdev in bits
+# 32-55, GRID and pads 0. -1 when asize is not a positive multiple of 512 that fits, or the vdev is out of range.
+fn zfs_dva_w0(asize, vdev) {
+    if (asize <= 0 || (asize & 511) != 0 || (asize >> 9) > ZE_ASZMAX) { return 0 - 1; }
+    if (vdev < 0 || vdev > ZE_VDEVMAX) { return 0 - 1; }
+    return (vdev << 32) | (asize >> 9);
+}
+# DVA word 1: offset >> 9 in bits 0-62 (DVA_SET_OFFSET), gang bit 63 = 0 — agnos never makes a gang block (it returns
+# ENOSPC where OpenZFS would gang, zio.c:4420-4426). -1 when the offset is negative or not 512-aligned.
+fn zfs_dva_w1(off) {
+    if (off < 0 || (off & 511) != 0) { return 0 - 1; }
+    return off >> 9;
+}
+# blk_prop (word 6) of a written, non-embedded block: LSIZE / PSIZE as (x >> 9) - 1 in bits 0-15 / 16-31
+# (BF64_SET_SB(.., SPA_MINBLOCKSHIFT, 1)), comp 32-38, E (39) 0, checksum 40-47, type 48-55, level 56-60, crypt (61)
+# 0, dedup (62) 0, byteorder (63) 1 = little-endian (ZFS_HOST_BYTEORDER) — the fields zio_write_compress sets
+# (zio.c:2110-2118). The ranges are zfs_blkptr_verify's (zio.c:1165-1298): sizes multiples of 512 in
+# [512, SPA_MAXBLOCKSIZE] with psize <= lsize, comp < ZIO_COMPRESS_FUNCTIONS (17), checksum < ZIO_CHECKSUM_FUNCTIONS
+# (15), the type DMU_OT_IS_VALID (zfs_ot_valid), level < 32. The prop word, or -1 for a field that cannot be encoded
+# (a valid prop is never all ones: dedup 0).
+fn zfs_bp_prop(lsize, psize, comp, ck, ty, lv) {
+    if (lsize < 512 || lsize > ZE_MAXBLK || (lsize & 511) != 0) { return 0 - 1; }
+    if (psize < 512 || psize > lsize || (psize & 511) != 0) { return 0 - 1; }
+    if (comp < 0 || comp > 16 || ck < 0 || ck > 14 || zfs_ot_valid(ty) == 0 || lv < 0 || lv > 31) { return 0 - 1; }
+    return (1 << 63) | (lv << 56) | (ty << 48) | (ck << 40) | (comp << 32) | (((psize >> 9) - 1) << 16) | ((lsize >> 9) - 1);
+}
+# Words 6-15 of a written block whose DVAs (words 0-5) are already in place: blk_prop, blk_prop2 0 (the rewrite flag
+# R, bit 63, is zfs rewrite's only — spa.h:540-547), blk_pad 0, PHYSICAL birth 0 (BP_SET_BIRTH(bp, T, T) stores 0
+# when the two are equal, spa.h:510-516 — every agnos block is written in the txg it is born in), LOGICAL birth T,
+# fill (dbuf_write_ready's, dbuf.c:5027-5084 — the caller's count), the four checksum words from ckw (32 bytes).
+fn zfs_bp_fin(bp, prop, birth, fill, ckw) {
+    store64(bp + 48, prop);
+    store64(bp + 56, 0);
+    store64(bp + 64, 0);
+    store64(bp + 72, 0);
+    store64(bp + 80, birth);
+    store64(bp + 88, fill);
+    memcpy(bp + 96, ckw, 32);
+    return 0;
+}
+# A hole. birth 0: BP_ZERO, all 128 bytes zero — a never-written block, or any hole when hole_birth is not active.
+# birth B != 0: a hole WITH birth (hole_birth): BP_ZERO, then LSIZE, TYPE, LEVEL and BP_SET_BIRTH(B, 0) — byteorder,
+# comp, checksum, psize, fill and the DVAs all 0. Three producers in OpenZFS write exactly this: a freed block
+# (dnode_sync.c:156-170), a block that compressed to nothing (zio.c:2097-2104, only when the BP it replaces had a
+# logical birth != 0 — the CALLER decides B), and the children of a re-materialised birth-B hole indirect
+# (dbuf_handle_indirect_hole, dbuf.c:1449-1465: LSIZE datablksz under an L1, else the parent's). 0 / -1 (bad lsize,
+# level, or a type zfs_blkptr_verify refuses — it checks a hole's TYPE too, zio.c:1171; the BP is then all zero).
+fn zfs_bp_mkhole(bp, lsize, ty, lv, birth) {
+    memset(bp, 0, 128);
+    if (birth == 0) { return 0; }
+    if (birth < 0 || lsize < 512 || lsize > ZE_MAXBLK || (lsize & 511) != 0 || zfs_ot_valid(ty) == 0 || lv < 0 || lv > 31) { return 0 - 1; }
+    store64(bp + 48, (lv << 56) | (ty << 48) | ((lsize >> 9) - 1));
+    store64(bp + 80, birth);
+    return 0;
+}
+
+# --- fills (dbuf_write_ready, dbuf.c:4987-5084; dbuf_write_children_ready, dbuf.c:5092-5134; WPA § 5) -------------
+# The fill of a dnode block (a meta-dnode L0) of size bytes at p: the 512-byte slots whose dn_type != 0, a
+# multi-slot dnode counted ONCE — its dn_extra_slots interior slots are stepped over, never read as dnodes
+# (dbuf.c:5036-5062). ⛔ Not makefs's `32 - used` (makefs/zfs/objset.c:129-136, inverted — WPA § 5).
+fn zfs_fill_dnodes(p, size) {
+    var f = 0;
+    var i = 0;
+    while (i < size) {
+        var t = load8(p + i);
+        var ex = load8(p + i + 12);
+        i = i + 512;
+        if (t != 0) {
+            f = f + 1;
+            i = i + ex * 512;
+        }
+    }
+    return f;
+}
+# Ready an indirect block of size bytes at p the way OpenZFS does before it is compressed: when EVERY child is a hole
+# (BP_IS_HOLE — not embedded, DVA[0] empty; a hole WITH birth is a hole) the whole block is ZEROED, so the
+# compression that follows turns it into a hole (dbuf_write_children_ready, dbuf.c:5101-5134); the fill is
+# Σ BP_GET_FILL over the non-hole children: 1 for an embedded child, else blk_fill (dbuf.c:5070-5080; the
+# encrypted form, fill in the low 32 bits, never reaches a writable dataset). Returns the fill.
+fn zfs_ind_ready(p, size) {
+    var f = 0;
+    var nh = 0;
+    var i = 0;
+    while (i < size) {
+        var bp = p + i;
+        i = i + 128;
+        var emb = (load64(bp + 48) >> 39) & 1;
+        if (emb == 0 && load64(bp) == 0 && load64(bp + 8) == 0) { continue; }
+        nh = nh + 1;
+        if (emb == 1) { f = f + 1; } else { f = f + load64(bp + 88); }
+    }
+    if (nh == 0) { memset(p, 0, size); }
+    return f;
+}
+
+# --- the compression decision (zio_write_compress, zio.c:1965-2035) -----------------------------------------------
+# Is [p, p + n) all zero bytes (abd_cmp_zero)? 1 / 0.
+fn zfs_wzero(p, n) {
+    var i = 0;
+    while (i + 8 <= n) {
+        if (load64(p + i) != 0) { return 0; }
+        i = i + 8;
+    }
+    while (i < n) {
+        if (load8(p + i) != 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+# What zio_write_compress makes of an lsize-byte block written with compress = ZLE on a vdev whose allocation unit is
+# ma (spa_min_alloc = spa_gcd_alloc = 1 << ashift for one disk/file top-level vdev), step for step:
+#   · all zeros -> psize 0, a hole (abd_cmp_zero, zio.c:1977-1978);
+#   · zio_compress_data with d_len = lsize - lsize/8 — OpenZFS's 12.5 % floor, which for ZLE skips the gcd rounding
+#     (zio_get_compression_max_size, zio.c:1783-1800 — design § k.7 answered by doing exactly what OpenZFS does): an
+#     output that does not fit is s_len, i.e. compress OFF;
+#   · rounded = zio_roundup_alloc_size(c_len) (zio.c:1775-1781: ma when c_len <= ma, else roundup to ma); rounded >=
+#     lsize -> compress OFF, psize = lsize; else the tail [c_len, rounded) is ZEROED and psize = rounded
+#     (zio.c:2009-2023). The embedded-BP branch (psize <= 112, zio.c:1993-2008) is never taken: agnos never embeds
+#     (WPA § 4: MAY), so such a block is written as ZLE / OFF — a BP OpenZFS writes whenever embedded_data is off.
+# Returns psize: 0 = a hole (nothing in dst) · lsize = compress OFF (nothing in dst; the block goes out as it is) ·
+# p < lsize = ZLE, the p physical bytes in dst (dst needs room for lsize bytes). ma must be a power of two.
+fn zfs_wcomp(src, lsize, dst, ma) {
+    if (zfs_wzero(src, lsize) == 1) { return 0; }
+    var c = zfs_zle_compress(src, lsize, dst, lsize - (lsize >> 3), ZE_ZLEN);
+    if (c < 0) { return lsize; }
+    var r = ma;
+    if (c > ma) { r = (c + ma - 1) & (0 - ma); }
+    if (r >= lsize) { return lsize; }
+    memset(dst + c, 0, r - c);
+    return r;
+}
+
+# --- space maps (space_map.h:104-203, space_map.c:515-656; WPA § 6.3) ---------------------------------------------
+# A debug entry: prefix 2 in bits 62-63, action (0 ALLOC / 1 FREE) in 60-61, sync pass in 50-59, txg in 0-49
+# (space_map_write_intro_debug, space_map.c:528-543). The word, or -1 for a field out of range. (The pad word a
+# two-word entry leaves at a block end is the debug entry 0/0/0 = 0x8000000000000000 — zfs_sm_seg writes it.)
+fn zfs_sm_dbg(act, pass, txg) {
+    if (act < 0 || act > 1 || pass < 0 || pass > 1023 || txg < 0 || txg >= ZE_TXG50) { return 0 - 1; }
+    return (1 << 63) | (act << 60) | (pass << 50) | txg;
+}
+# Append the one word w to the space map held in buf[0, len) (room for cap bytes). New length / -1 (no room).
+fn zfs_sm_put(buf, len, cap, w) {
+    if (len < 0 || (len & 7) != 0 || len + 8 > cap) { return 0 - 1; }
+    store64(buf + len, w);
+    return len + 8;
+}
+# Append the segment [start, start + size) — in sm_shift units relative to sm_start — as `words`-word entries of type
+# ty (0 ALLOC / 1 FREE) to the space map held in buf[0, len), whose data blocks are blksz bytes, room for cap bytes:
+# exactly space_map_write_seg (space_map.c:552-656). A run longer than one entry holds is split (SM_RUN_MAX 2^15 for
+# one word, SM2_RUN_MAX 2^36 for two); a two-word entry never straddles a block: when it would start in a block's
+# LAST word, that word becomes the pad debug entry 0x8000000000000000 and the entry starts the next block.
+#   words 1: (offset << 16) | (ty << 15) | (run - 1); every piece's offset < 2^47; no vdev (SM_NO_VDEVID) — a
+#            metaslab's own space map (design § c.5, B10).
+#   words 2: w0 = (3 << 62) | ((run - 1) << 24) | vdev, w1 = (ty << 63) | offset — a LOG space map's every entry
+#            (the replay looks the vdev up, spa_log_spacemap.c:1087-1094; WPA § 6.3 MUST).
+# Returns the new length, or -1 (a field out of range, or no room — the map is then partly appended: the caller fails
+# its commit). OpenZFS's own ASSERTs bound the inputs the same way (space_map.c:560-586).
+fn zfs_sm_seg(buf, len, cap, blksz, ty, start, size, vdev, words) {
+    if (len < 0 || (len & 7) != 0 || blksz < 16 || (blksz & 7) != 0) { return 0 - 1; }
+    if (ty < 0 || ty > 1 || start < 0 || size <= 0) { return 0 - 1; }
+    var rmax = ZE_RUN36;
+    if (words == 1) {
+        rmax = ZE_RUN15;
+        if (start >= ZE_OFF47 || size > ZE_OFF47 - start) { return 0 - 1; }
+    } elif (words == 2) {
+        if (vdev < 0 || vdev > ZE_VDEVMAX || size - 1 > ZE_OFF63 - start) { return 0 - 1; }
+    } else { return 0 - 1; }
+    while (size > 0) {
+        if (words == 2 && ((len + 8) % blksz) == 0) {
+            if (len + 8 > cap) { return 0 - 1; }
+            store64(buf + len, 1 << 63);
+            len = len + 8;
+            continue;
+        }
+        var r = size;
+        if (r > rmax) { r = rmax; }
+        if (len + words * 8 > cap) { return 0 - 1; }
+        if (words == 1) {
+            store64(buf + len, (start << 16) | (ty << 15) | (r - 1));
+        } else {
+            store64(buf + len, (3 << 62) | ((r - 1) << 24) | vdev);
+            store64(buf + len + 8, (ty << 63) | start);
+        }
+        len = len + words * 8;
+        start = start + r;
+        size = size - r;
+    }
+    return len;
+}
+
+# --- B4: the dataset COW's pure accounting rules (dsl_dataset.c, dsl_dir.c, dmu.c, zfs_quota.c; WPA § 4, § 7, § 8) ---
+# DMU_OT_IS_METADATA (dmu.h:131-133): a DMU_OTN_* type's bit 6; a legacy type's dmu_ot[].ot_metadata (dmu.c:105-160),
+# FALSE for exactly the five data types — 19 ZFS plain file, 23 zvol object, 25 other uint8[], 26 other uint64[],
+# 49 deduplicated block. 1 metadata / 0 data (an invalid type reads as metadata: never written — zfs_ot_valid).
+fn zfs_ot_meta(ty) {
+    if ((ty & 0x80) != 0) { return (ty >> 6) & 1; }
+    if (ty == 19 || ty == 23 || ty == 25 || ty == 26 || ty == 49) { return 0; }
+    return 1;
+}
+# BP_GET_UCSIZE (spa.h:549-559): PSIZE for metadata (level > 0 or a metadata type), LSIZE for data. An embedded BP's
+# PSIZE is 0 (spa.h:421-423) and its LSIZE is BPE_GET_LSIZE (bits 0-24), so killing an embedded METADATA block moves
+# nothing and an embedded DATA block moves its lsize (WPA § 4 review fix). A hole: 0.
+fn zfs_bp_ucsize(bp) {
+    var pr = load64(bp + 48);
+    var emb = (pr >> 39) & 1;
+    if (emb == 0 && load64(bp) == 0 && load64(bp + 8) == 0) { return 0; }
+    var md = 0;
+    if (((pr >> 56) & 0x1F) > 0 || zfs_ot_meta((pr >> 48) & 0xFF) == 1) { md = 1; }
+    if (emb == 1) {
+        if (md == 1) { return 0; }
+        return (pr & 0x1FFFFFF) + 1;
+    }
+    if (md == 1) { return (((pr >> 16) & 0xFFFF) + 1) << 9; }
+    return ((pr & 0xFFFF) + 1) << 9;
+}
+# BP_GET_BIRTH (spa.h:494-507, :540-541): the logical birth (word 10) — but for a non-embedded BP whose blk_prop2
+# rewrite flag (bit 63; word 7 is payload in an embedded BP, BP_GET_REWRITE reads 0 there) is set, the PHYSICAL birth:
+# word 9, or the logical birth when word 9 is 0. What dsl_dataset_block_kill compares with ds_prev_snap_txg
+# (dsl_dataset.c:303).
+fn zfs_bp_birth(bp) {
+    if (((load64(bp + 48) >> 39) & 1) == 1 || (load64(bp + 56) >> 63) == 0) { return load64(bp + 80); }
+    if (load64(bp + 72) != 0) { return load64(bp + 72); }
+    return load64(bp + 80);
+}
+# parent_delta — the share of a change of delta bytes that reaches the parent when resv bytes are reserved below it:
+# MAX(used + delta, resv) - MAX(used, resv). The dataset form (dsl_dataset.c:121-136: used = ds_unique_bytes, resv =
+# ds_reserved, the refreservation; resv 0 returns delta) and the dsl_dir form (dsl_dir.c:1155-1162: used =
+# dd_used_bytes, resv = dd_reserved) are this one formula. Successive calls TELESCOPE — Σ over a txg's changes equals one
+# call with their sum — which is why the commit applies a dataset's born-minus-killed once (design § e.1, D13).
+fn zfs_pdelta(used, delta, resv) {
+    if (resv == 0) { return delta; }
+    var o = used;
+    if (o < resv) { o = resv; }
+    var n = used + delta;
+    if (n < resv) { n = resv; }
+    return n - o;
+}
+# The DVAs dmu_write_policy gives a METADATA block of an objset whose copies property is c (dmu.c:2381-2424; level > 0,
+# a metadata type, or the objset block): redundant_metadata rm = 0 all (+1), 1 most (+1 for level >= 2 or a metadata
+# type — zfs_redundant_metadata_most_ditto_level 2), 2 some (+1 when DMU_OT_IS_CRITICAL: a metadata type but a dnode
+# block at level 0, a directory (20) and SA (44)), 3 none; then MIN(copies, spa_max_replication = 3).
+fn zfs_md_copies(c, rm, ty, lv) {
+    var n = c;
+    if (rm == 0) { n = c + 1; }
+    elif (rm == 1) { if (lv >= 2 || zfs_ot_meta(ty) == 1) { n = c + 1; } }
+    elif (rm == 2) {
+        if (zfs_ot_meta(ty) == 1 && (ty != 10 || lv > 0) && ty != 20 && ty != 44) { n = c + 1; }
+    }
+    if (n > 3) { n = 3; }
+    return n;
+}
+# zpl_get_file_info (zfs_quota.c:42-110): the uid, gid and project id user/group/project accounting charges a dnode to,
+# from its bonus type bt and the len bytes at data (the bonus, or the spill block when the SA is spill-held). ZNODE (17):
+# znode_phys_t zp_uid @128, zp_gid @136, project 0. SA (44): sa_hdr_phys_t — magic u32, layout info u16 whose bits
+# 10-15 are the header size in 8-byte units (SA_HDR_SIZE) — then, at FIXED offsets after the header, uid +24, gid +32,
+# flags +48 and, when flags has ZFS_PROJID (bit 47), the project id +128 (SA_*_OFFSET, zfs_sa.h:86-93; the default
+# project is 0); a zero magic is a file not yet filled in: ids 0. out: 3 x u64. 0 · 1 not an accounted type (no
+# DN_ID_*_EXIST: no delta, dmu_objset.c:2191-2290) · -1 unreadable (a byte-swapped header, a short buffer — refused).
+fn zfs_sa_ids(bt, data, len, out) {
+    store64(out, 0);
+    store64(out + 8, 0);
+    store64(out + 16, 0);
+    if (bt == 17) {
+        if (len < 144) { return 0 - 1; }
+        store64(out, load64(data + 128));
+        store64(out + 8, load64(data + 136));
+        return 0;
+    }
+    if (bt != 44) { return 1; }
+    if (len < 8) { return 0 - 1; }
+    var mg = load32(data);
+    if (mg == 0) { return 0; }
+    if (mg != ZE_SAMAGIC) { return 0 - 1; }
+    var hs = ((load16(data + 4) >> 10) & 0x3F) * 8;
+    if (hs < 8 || hs + 56 > len) { return 0 - 1; }
+    store64(out, load64(data + hs + 24));
+    store64(out + 8, load64(data + hs + 32));
+    if (((load64(data + hs + 48) >> 47) & 1) == 1) {
+        if (hs + 136 > len) { return 0 - 1; }
+        store64(out + 16, load64(data + hs + 128));
+    }
+    return 0;
+}
+
+# --- B8: the FAT ZAP (zap.c, zap_leaf.c, zap_micro.c's mzap_upgrade — OpenZFS 2.4.2; WPA § 9; design § f.2) ------------
+# Fat-ZAP mutation exactly as OpenZFS does it, function for function, over ONE ZAP object whose blocks the CALLER
+# resolves: zfs_zf_blk(k) — block k to WRITE (dirtied; a block past the object's end reads as zeros, the object grows) —,
+# zfs_zf_rblk(k) — to READ only (the address is good until the next block access) —, zfs_zf_kill(k, n) (dmu_free_range of
+# the n blocks from k: all of them or a failure, 0 / -1) and zfs_zf_gok() (may this ZAP's pointer table grow here? 0, or
+# the grow answers ZZ_NOGROW before it changes anything). core/zfs_write.cyr defines them over the dirty set
+# (zfs_wz_*); tests/zfscodec over a flat image, so the
+# host oracle (check.sh gate 37) runs THIS code against ZAPs OpenZFS itself built, byte for byte. Block size 1 <<
+# zfs_zf_bs (14: OpenZFS's fzap_default_block_shift; 17: makefs's).
+# A LEAF (zap_leaf_phys_t, zap_leaf.h): +0 ZBT_LEAF · +8 lh_pad1 (0) · +16 lh_prefix · +24 lh_magic · +28 lh_nfree · +30
+# lh_nentries · +32 lh_prefix_len · +34 lh_freelist · +36 lh_flags (bit 0 ZLF_ENTRIES_CDSORTED) · +48 l_hash[2^(bs - 5)]
+# (u16 chunk, 0xFFFF = CHAIN_END) · then NUMCHUNKS = (2^bs - 2 x 2^(bs - 5)) / 24 - 2 chunks of 24 bytes: ENTRY (252: +1
+# value intlen · +2 le_next · +4 name chunk · +6 name ints incl. the NUL · +8 value chunk · +10 value ints · +12 cd u32 ·
+# +16 the hash), ARRAY (251: +1 21 bytes, integers big-endian · +22 la_next) or FREE (253: 21 zero bytes · +22 lf_next).
+# The HEADER, block 0 (zap_phys_t, zap_impl.h): +0 ZBT_HEADER · +8 ZAP_MAGIC · +16 zt_blk · +24 zt_numblks · +32 zt_shift
+# · +40 zt_nextblk · +48 zt_blks_copied · +56 zap_freeblk · +64 zap_num_leafs · +72 zap_num_entries · +80 zap_salt · +88
+# zap_normflags · +96 zap_flags · the EMBEDDED pointer table its second half (u64 [2^(bs - 4) + idx]) while zt_blk == 0.
+# Not built (the caller refuses first): zap_flags (HASH64 / UINT64_KEY / PRE_HASHED_KEY), a normalised name that is not
+# ASCII (u8_textprep's tables), MT_NORMALIZE matching; zap_shrink (an emptied leaf is KEPT — legal, design § f.2: merge
+# is MAY; OpenZFS 2.4 merges two empty siblings, older releases never did).
+# ⛔ NEVER A STORE OUTSIDE A BLOCK: every chunk index read from a block is checked before use; an inconsistent block
+# sets zfs_zf_bad and the op answers ZZ_CORRUPT (the caller drops its txg — nothing is written). ⛔ (B8 review) NO
+# FAILURE IS SWALLOWED: OpenZFS ignores zap_put_leaf_maybe_grow_ptrtbl's grow error; here only a refusal that changed
+# nothing is (ZZ_NOSPC, ZZ_NOGROW) — any other failure fails the op, so its txg is dropped, never committed half-grown.
+enum ZfsZ {
+    ZZ_IO      = -1;                    # a block could not be had (the resolver named why)
+    ZZ_NOENT   = -2;
+    ZZ_EXIST   = -3;
+    ZZ_CORRUPT = -4;                    # zfs_zf_bad: an inconsistent leaf or table
+    ZZ_NOSPC   = -5;                    # zap_grow_ptrtbl: zt_shift >= hashbits - 2
+    ZZ_2BIG    = -6;                    # one entry needs more chunks than a leaf has (E2BIG)
+    ZZ_NOTSUP  = -7;                    # a normalised ZAP and a name that is not ASCII
+    ZZ_NOGROW  = -8;                    # the caller refuses this ZAP's pointer table a growth (zfs_zf_gok)
+    ZZ_MAGIC   = 0x2F52AB2AB;           # ZAP_MAGIC
+    ZZ_LMAGIC  = 0x2AB1EAF;             # ZAP_LEAF_MAGIC
+    ZZ_LOWW    = 20;                    # ZAP_LEAF_LOW_WATER
+}
+var zfs_zf_bs = 14;          # the ZAP's block shift (FZAP_BLOCK_SHIFT)
+var zfs_zf_bad = 0;          # 1 = a block was inconsistent (the op answers ZZ_CORRUPT)
+var zfs_zf_nb[33];           # 264 B: a normalised name (zfs_zf_hash)
+
+fn zfs_zl_nh() { return 1 << (zfs_zf_bs - 5); }                                   # ZAP_LEAF_HASH_NUMENTRIES
+fn zfs_zl_nc() { return ((1 << zfs_zf_bs) - 2 * (1 << (zfs_zf_bs - 5))) / 24 - 2; } # ZAP_LEAF_NUMCHUNKS
+fn zfs_zl_ch(lf, c) { return lf + 48 + 2 * (1 << (zfs_zf_bs - 5)) + 24 * c; }      # ZAP_LEAF_CHUNK
+# The chunk index c as read from a leaf: in range, or 0 with zfs_zf_bad set (an in-block stand-in: the op fails).
+fn zfs_zl_ok(c) {
+    if (c < 0 || c >= zfs_zl_nc()) {
+        zfs_zf_bad = 1;
+        return 0;
+    }
+    return c;
+}
+# LEAF_HASH_ENTPTR: the address of hash bucket of h in leaf lf (by the leaf's prefix length).
+fn zfs_zl_hp(lf, h) {
+    var s = 64 - (zfs_zf_bs - 5) - load16(lf + 32);
+    if (s <= 0 || s >= 64) {
+        zfs_zf_bad = 1;
+        return lf + 48;
+    }
+    return lf + 48 + 2 * ((zfs_zl_nh() - 1) & (h >> s));
+}
+# ZAP_HASH_IDX: the top n bits of h.
+fn zfs_zf_hidx(h, n) {
+    if (n <= 0) { return 0; }
+    return h >> (64 - n);
+}
+# The hash of name n (l bytes) in the ZAP whose header is at hdr (zap_hash: the CRC-64 of the salt over the NORMALISED
+# name, its top 28 bits) — normalisation here is what u8_textprep_str does to ASCII: U8_TEXTPREP_TOUPPER (2) folds a-z,
+# every other form (NFD / NFC / NFKD / NFKC) leaves ASCII alone. A normalised ZAP and a byte >= 128 (or a name past 256
+# bytes): zfs_zf_ns = 1 (ZZ_NOTSUP — the hash, a full 64-bit word, has no value to spare for an error).
+var zfs_zf_ns = 0;
+fn zfs_zf_hash(hdr, n, l) {
+    zfs_zf_ns = 0;
+    var nf = load64(hdr + 88);
+    if (nf == 0) { return zfs_zap_hash(load64(hdr + 80), n, l); }
+    zfs_zf_ns = 1;
+    if (l > 256) { return 0; }
+    var i = 0;
+    while (i < l) {
+        var c = load8(n + i);
+        if (c >= 128) { return 0; }
+        if ((nf & 2) != 0 && c >= 97 && c <= 122) { c = c - 32; }
+        store8(&zfs_zf_nb + i, c);
+        i = i + 1;
+    }
+    zfs_zf_ns = 0;
+    return zfs_zap_hash(load64(hdr + 80), &zfs_zf_nb, l);
+}
+
+# --- leaf chunks (zap_leaf.c) ---
+# zap_leaf_init: the header zeroed, every bucket CHAIN_END, every chunk FREE and chained to the next (the block is a
+# fresh one — zeros — so the FREE chunks' pad is zero), the magic, nfree = NUMCHUNKS, CDSORTED for a normalised ZAP.
+fn zfs_zl_init(lf, sort) {
+    memset(lf, 0, 1 << zfs_zf_bs);
+    memset(lf + 48, 0xFF, 2 * zfs_zl_nh());
+    var nc = zfs_zl_nc();
+    var i = 0;
+    while (i < nc) {
+        var cp = zfs_zl_ch(lf, i);
+        store8(cp, 253);
+        store16(cp + 22, i + 1);
+        i = i + 1;
+    }
+    store16(zfs_zl_ch(lf, nc - 1) + 22, 0xFFFF);
+    store64(lf, 1 << 63);
+    store32(lf + 24, ZZ_LMAGIC);
+    store16(lf + 28, nc);
+    if (sort != 0) { store8(lf + 36, 1); }
+    return 0;
+}
+# zap_leaf_chunk_alloc: the free list's head.
+fn zfs_zl_alloc(lf) {
+    var c = load16(lf + 34);
+    if (load16(lf + 28) == 0 || c >= zfs_zl_nc() || load8(zfs_zl_ch(lf, c)) != 253) {
+        zfs_zf_bad = 1;
+        return 0;
+    }
+    store16(lf + 34, load16(zfs_zl_ch(lf, c) + 22));
+    store16(lf + 28, load16(lf + 28) - 1);
+    return c;
+}
+# zap_leaf_chunk_free: FREE, its pad zeroed, onto the free list's head.
+fn zfs_zl_free(lf, c) {
+    var cp = zfs_zl_ch(lf, c);
+    store8(cp, 253);
+    memset(cp + 1, 0, 21);
+    store16(cp + 22, load16(lf + 34));
+    store16(lf + 34, c);
+    store16(lf + 28, load16(lf + 28) + 1);
+    return 0;
+}
+# zap_leaf_array_free (2.4: the chain goes onto the free list IN ITS ORDER, not reversed — "reducing fragmentation").
+fn zfs_zl_afree(lf, c) {
+    var nc = zfs_zl_nc();
+    var tail = lf + 34;
+    var old = load16(tail);
+    var g = 0;
+    while (c != 0xFFFF) {
+        if (c >= nc || g >= nc || load8(zfs_zl_ch(lf, c)) != 251) {
+            zfs_zf_bad = 1;
+            return 0;
+        }
+        var cp = zfs_zl_ch(lf, c);
+        store16(tail, c);
+        c = load16(cp + 22);
+        store8(cp, 253);
+        memset(cp + 1, 0, 21);
+        tail = cp + 22;
+        store16(lf + 28, load16(lf + 28) + 1);
+        g = g + 1;
+    }
+    store16(tail, old);
+    return 0;
+}
+# Integer i (isz bytes, native order) of the source at p; with nul = 1 the LAST integer is an implicit 0 (a name and its
+# NUL — the caller's name bytes need no terminator).
+fn zfs_zl_ldv(p, isz, i, n, nul) {
+    if (nul == 1 && i == n - 1) { return 0; }
+    var a = p + i * isz;
+    if (isz == 1) { return load8(a); }
+    if (isz == 2) { return load16(a); }
+    if (isz == 4) { return load32(a); }
+    return load64(a);
+}
+# zap_leaf_array_create: n integers of isz bytes, big-endian, 21 bytes a chunk, chained. The head chunk.
+fn zfs_zl_acreate(lf, p, isz, n, nul) {
+    var head = 0xFFFF;
+    var prev = 0 - 1;
+    var shift = (isz - 1) * 8;
+    var k = 0;
+    var byten = isz;
+    var v = 0;
+    if (n > 0) { v = zfs_zl_ldv(p, isz, 0, n, nul); }
+    var len = n;
+    while (len > 0 && zfs_zf_bad == 0) {
+        var c = zfs_zl_alloc(lf);
+        var la = zfs_zl_ch(lf, c);
+        store8(la, 251);
+        var i = 0;
+        while (i < 21 && len > 0) {
+            store8(la + 1 + i, (v >> shift) & 0xFF);
+            v = v << 8;
+            byten = byten - 1;
+            if (byten == 0) {
+                len = len - 1;
+                if (len > 0) {
+                    byten = isz;
+                    k = k + 1;
+                    v = zfs_zl_ldv(p, isz, k, n, nul);
+                }
+            }
+            i = i + 1;
+        }
+        if (prev < 0) { head = c; } else { store16(zfs_zl_ch(lf, prev) + 22, c); }
+        prev = c;
+    }
+    if (prev >= 0) { store16(zfs_zl_ch(lf, prev) + 22, 0xFFFF); }
+    return head;
+}
+# zap_leaf_array_copy: the array at chunk c of leaf l copied into leaf nl, chunk for chunk (non-destructive). Its head.
+fn zfs_zl_acopy(l, c, nl) {
+    var nc = zfs_zl_nc();
+    var head = 0xFFFF;
+    var prev = 0 - 1;
+    var g = 0;
+    while (c != 0xFFFF && zfs_zf_bad == 0) {
+        if (c >= nc || g >= nc || load8(zfs_zl_ch(l, c)) != 251) {
+            zfs_zf_bad = 1;
+            return head;
+        }
+        var n2 = zfs_zl_alloc(nl);
+        memcpy(zfs_zl_ch(nl, n2), zfs_zl_ch(l, c), 24);
+        c = load16(zfs_zl_ch(l, c) + 22);
+        if (prev < 0) { head = n2; } else { store16(zfs_zl_ch(nl, prev) + 22, n2); }
+        prev = n2;
+        g = g + 1;
+    }
+    if (prev >= 0) { store16(zfs_zl_ch(nl, prev) + 22, 0xFFFF); }
+    return head;
+}
+# zap_leaf_array_match's exact fast path: is the array at chunk c (n ints incl. the NUL) the name nm (l bytes) + NUL?
+fn zfs_zl_amatch(lf, c, n, nm, l) {
+    if (n != l + 1) { return 0; }
+    var nc = zfs_zl_nc();
+    var i = 0;
+    while (i < n) {
+        if (c >= nc || load8(zfs_zl_ch(lf, c)) != 251) {
+            zfs_zf_bad = 1;
+            return 0;
+        }
+        var la = zfs_zl_ch(lf, c);
+        var k = 0;
+        while (k < 21 && i < n) {
+            var want = 0;
+            if (i < l) { want = load8(nm + i); }
+            if (load8(la + 1 + k) != want) { return 0; }
+            k = k + 1;
+            i = i + 1;
+        }
+        c = load16(la + 22);
+    }
+    return 1;
+}
+# zap_leaf_lookup: the address of the u16 that links the entry named nm (l bytes) with hash h — a bucket slot or the
+# le_next of the entry before it (the entry is unlinked through it) — or 0.
+fn zfs_zl_lookup(lf, h, nm, l) {
+    var nc = zfs_zl_nc();
+    var cp = zfs_zl_hp(lf, h);
+    var g = 0;
+    while (load16(cp) != 0xFFFF && zfs_zf_bad == 0) {
+        var c = load16(cp);
+        if (c >= nc || g > nc || load8(zfs_zl_ch(lf, c)) != 252) {
+            zfs_zf_bad = 1;
+            return 0;
+        }
+        var le = zfs_zl_ch(lf, c);
+        if (load64(le + 16) == h && zfs_zl_amatch(lf, load16(le + 4), load16(le + 6), nm, l) == 1) { return cp; }
+        cp = le + 2;
+        g = g + 1;
+    }
+    return 0;
+}
+# zap_leaf_rehash_entry: entry chunk c linked into its bucket, the chain kept sorted by cd (before the first greater).
+fn zfs_zl_rehash(lf, c) {
+    var nc = zfs_zl_nc();
+    var le = zfs_zl_ch(lf, c);
+    var cd = load32(le + 12);
+    var p = zfs_zl_hp(lf, load64(le + 16));
+    var g = 0;
+    while (load16(p) != 0xFFFF) {
+        var c2 = load16(p);
+        if (c2 >= nc || g > nc) {
+            zfs_zf_bad = 1;
+            return 0;
+        }
+        var le2 = zfs_zl_ch(lf, c2);
+        if (load32(le2 + 12) > cd) { break; }
+        p = le2 + 2;
+        g = g + 1;
+    }
+    store16(le + 2, load16(p));
+    store16(p, c);
+    return 0;
+}
+# ZAP_LEAF_ARRAY_NCHUNKS
+fn zfs_zl_anc(bytes) { return (bytes + 20) / 21; }
+# zap_entry_create: the entry nm (l bytes) -> n integers of isz bytes at p, with collision differentiator cd (-1:
+# ZAP_NEED_CD — the lowest one no entry with hash h uses: a sorted leaf walks its sorted chain, an unsorted one tries
+# each cd in turn). 0 · 1 EAGAIN (too few free chunks: the caller splits) · ZZ_2BIG.
+fn zfs_zl_create(lf, h, cd, nm, l, isz, n, p) {
+    var need = 1 + zfs_zl_anc(l + 1) + zfs_zl_anc(isz * n);
+    if (need > zfs_zl_nc()) { return ZZ_2BIG; }
+    var nc = zfs_zl_nc();
+    if (cd < 0) {
+        cd = 0;
+        if ((load8(lf + 36) & 1) != 0) {
+            var c = load16(zfs_zl_hp(lf, h));
+            var g = 0;
+            while (c != 0xFFFF && g <= nc) {
+                c = zfs_zl_ok(c);
+                var le = zfs_zl_ch(lf, c);
+                if (load32(le + 12) > cd) { break; }
+                if (load64(le + 16) == h) { cd = cd + 1; }
+                c = load16(le + 2);
+                g = g + 1;
+            }
+        } else {
+            var used = 1;
+            while (used == 1 && zfs_zf_bad == 0) {
+                used = 0;
+                var c2 = load16(zfs_zl_hp(lf, h));
+                var g2 = 0;
+                while (c2 != 0xFFFF && used == 0 && g2 <= nc) {
+                    c2 = zfs_zl_ok(c2);
+                    var le2 = zfs_zl_ch(lf, c2);
+                    if (load64(le2 + 16) == h && load32(le2 + 12) == cd) { used = 1; }
+                    c2 = load16(le2 + 2);
+                    g2 = g2 + 1;
+                }
+                if (used == 1) { cd = cd + 1; }
+            }
+        }
+    }
+    if (load16(lf + 28) < need) { return 1; }
+    var e = zfs_zl_alloc(lf);
+    var en = zfs_zl_ch(lf, e);
+    store8(en, 252);
+    store8(en + 1, isz);
+    store16(en + 4, zfs_zl_acreate(lf, nm, 1, l + 1, 1));
+    store16(en + 6, l + 1);
+    store16(en + 8, zfs_zl_acreate(lf, p, isz, n, 0));
+    store16(en + 10, n);
+    store32(en + 12, cd);
+    store64(en + 16, h);
+    zfs_zl_rehash(lf, e);
+    store16(lf + 30, load16(lf + 30) + 1);
+    return 0;
+}
+# zap_entry_remove of the entry linked at cp: unlinked, its value and name arrays and then its chunk freed (that order:
+# a re-create of it takes back the same chunks), lh_nentries - 1.
+fn zfs_zl_remove(lf, cp) {
+    var e = zfs_zl_ok(load16(cp));
+    var le = zfs_zl_ch(lf, e);
+    var vc = load16(le + 8);
+    var nmc = load16(le + 4);
+    store16(cp, load16(le + 2));
+    zfs_zl_afree(lf, vc);
+    zfs_zl_afree(lf, nmc);
+    zfs_zl_free(lf, e);
+    store16(lf + 30, load16(lf + 30) - 1);
+    return 0;
+}
+# zap_entry_update of the entry linked at cp to n integers of isz bytes at p: its value array freed and re-created.
+# 0 · 1 EAGAIN.
+fn zfs_zl_update(lf, cp, isz, n, p) {
+    var le = zfs_zl_ch(lf, zfs_zl_ok(load16(cp)));
+    var dc = zfs_zl_anc(n * isz) - zfs_zl_anc(load16(le + 10) * load8(le + 1));
+    if (load16(lf + 28) < dc) { return 1; }
+    zfs_zl_afree(lf, load16(le + 8));
+    store16(le + 8, zfs_zl_acreate(lf, p, isz, n, 0));
+    store16(le + 10, n);
+    store8(le + 1, isz);
+    return 0;
+}
+# zap_leaf_transfer_entry: entry e of leaf l moved to leaf nl (a copy rehashed there; l's arrays and chunk freed).
+fn zfs_zl_xfer(l, e, nl) {
+    var le = zfs_zl_ch(l, e);
+    var c = zfs_zl_alloc(nl);
+    var nle = zfs_zl_ch(nl, c);
+    memcpy(nle, le, 24);
+    zfs_zl_rehash(nl, c);
+    store16(nle + 4, zfs_zl_acopy(l, load16(le + 4), nl));
+    store16(nle + 8, zfs_zl_acopy(l, load16(le + 8), nl));
+    zfs_zl_afree(l, load16(le + 8));
+    zfs_zl_afree(l, load16(le + 4));
+    zfs_zl_free(l, e);
+    store16(l + 30, load16(l + 30) - 1);
+    store16(nl + 30, load16(nl + 30) + 1);
+    return 0;
+}
+# zap_leaf_split: l's prefix grows by a bit, nl (fresh) takes prefix | 1; l's buckets are rebuilt in chunk order — every
+# entry whose hash has that bit set moved to nl, the rest rehashed.
+fn zfs_zl_split(l, nl, sort) {
+    var plen = load16(l + 32);
+    var bit = 63 - plen;
+    store64(l + 16, load64(l + 16) << 1);
+    store16(l + 32, plen + 1);
+    store64(nl + 16, load64(l + 16) | 1);
+    store16(nl + 32, plen + 1);
+    memset(l + 48, 0xFF, 2 * zfs_zl_nh());
+    if (sort != 0) { store8(l + 36, load8(l + 36) | 1); }
+    var nc = zfs_zl_nc();
+    var i = 0;
+    while (i < nc && zfs_zf_bad == 0) {
+        var le = zfs_zl_ch(l, i);
+        if (load8(le) == 252) {
+            if (((load64(le + 16) >> bit) & 1) == 1) { zfs_zl_xfer(l, i, nl); } else { zfs_zl_rehash(l, i); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- the object (zap.c) ---
+# zap_idx_to_blk: pointer-table entry idx — the embedded table, or block zt_blk + idx / 2^(bs - 3) of the external one
+# (zap_table_load: the OLD table while a doubling is under way). The leaf block, or ZZ_IO / ZZ_CORRUPT.
+fn zfs_zf_i2b(hdr, idx) {
+    var sh = load64(hdr + 32);
+    if (idx < 0 || sh < 1 || sh > 62 || idx >= (1 << sh)) {
+        zfs_zf_bad = 1;
+        return ZZ_CORRUPT;
+    }
+    if (load64(hdr + 24) == 0) {
+        if (idx >= (1 << (zfs_zf_bs - 4))) {
+            zfs_zf_bad = 1;
+            return ZZ_CORRUPT;
+        }
+        return load64(hdr + (1 << (zfs_zf_bs - 1)) + idx * 8);
+    }
+    var b = zfs_zf_rblk(load64(hdr + 16) + (idx >> (zfs_zf_bs - 3)));
+    if (b == 0) { return ZZ_IO; }
+    return load64(b + (idx & ((1 << (zfs_zf_bs - 3)) - 1)) * 8);
+}
+# zap_set_idx_to_blk: the embedded table while zt_blk is 0, else zap_table_store — and, mid-doubling (zt_nextblk), the
+# NEW table's two entries 2 idx and 2 idx + 1 as well. 0 / ZZ_IO.
+fn zfs_zf_sidx(hdr, idx, blk) {
+    if (load64(hdr + 16) == 0) {
+        store64(hdr + (1 << (zfs_zf_bs - 1)) + idx * 8, blk);
+        return 0;
+    }
+    var m = (1 << (zfs_zf_bs - 3)) - 1;
+    var b = zfs_zf_blk(load64(hdr + 16) + (idx >> (zfs_zf_bs - 3)));
+    if (b == 0) { return ZZ_IO; }
+    if (load64(hdr + 40) != 0) {
+        var i2 = idx * 2;
+        var b2 = zfs_zf_blk(load64(hdr + 40) + (i2 >> (zfs_zf_bs - 3)));
+        if (b2 == 0) { return ZZ_IO; }
+        store64(b2 + (i2 & m) * 8, blk);
+        store64(b2 + ((i2 & m) + 1) * 8, blk);
+    }
+    store64(b + (idx & m) * 8, blk);
+    return 0;
+}
+# zap_allocate_blocks: n blocks from zap_freeblk.
+fn zfs_zf_ablk(hdr, n) {
+    var b = load64(hdr + 56);
+    store64(hdr + 56, b + n);
+    return b;
+}
+# zap_ptrtbl_transfer: n entries at src, each written twice at dst.
+fn zfs_zf_xfer(src, dst, n) {
+    var i = 0;
+    while (i < n) {
+        var v = load64(src + i * 8);
+        store64(dst + i * 16, v);
+        store64(dst + i * 16 + 8, v);
+        i = i + 1;
+    }
+    return 0;
+}
+# zap_grow_ptrtbl: the EMBEDDED table moves to a block of its own (each entry twice, zt_shift + 1) — or the external one
+# DOUBLES, one source block per call (zap_table_grow: the new 2 x zt_numblks blocks allocated at the first, block
+# zt_blks_copied's halves copied into new 2b and 2b + 1; at the last the old blocks freed and the table switched). (B8
+# review) The last call frees the old table (zfs_zf_kill, every block or a failure) BEFORE it touches the header, then
+# writes zt_blk, zt_numblks, zt_shift, zt_nextblk and zt_blks_copied together — OpenZFS's own end state; a failed free
+# leaves the doubling where it was (the last block is copied again by the next call), never zt_blks_copied ==
+# zt_numblks with zt_nextblk set, from which the next zap_table_grow would copy a LEAF past the old table. 0 · ZZ_NOSPC
+# (zt_shift >= 28 - 2), ZZ_NOGROW (zfs_zf_gok) — nothing changed · ZZ_IO · ZZ_CORRUPT (zt_blks_copied past the table).
+fn zfs_zf_grow(hdr) {
+    if (load64(hdr + 32) >= 26) { return ZZ_NOSPC; }
+    if (zfs_zf_gok() != 0) { return ZZ_NOGROW; }
+    var hepb = 1 << (zfs_zf_bs - 4);
+    if (load64(hdr + 24) == 0) {
+        var nb = zfs_zf_ablk(hdr, 1);
+        var d = zfs_zf_blk(nb);
+        if (d == 0) { return ZZ_IO; }
+        zfs_zf_xfer(hdr + (1 << (zfs_zf_bs - 1)), d, hepb);
+        store64(hdr + 16, nb);
+        store64(hdr + 24, 1);
+        store64(hdr + 32, load64(hdr + 32) + 1);
+        return 0;
+    }
+    var nb2 = load64(hdr + 40);
+    if (nb2 == 0) {
+        nb2 = zfs_zf_ablk(hdr, load64(hdr + 24) * 2);
+        store64(hdr + 40, nb2);
+    }
+    var b = load64(hdr + 48);
+    if (b < 0 || b >= load64(hdr + 24)) {
+        zfs_zf_bad = 1;
+        return ZZ_CORRUPT;
+    }
+    var n0 = zfs_zf_blk(nb2 + 2 * b);
+    var n1 = zfs_zf_blk(nb2 + 2 * b + 1);
+    if (n0 == 0 || n1 == 0) { return ZZ_IO; }
+    var o = zfs_zf_rblk(load64(hdr + 16) + b);
+    if (o == 0) { return ZZ_IO; }
+    zfs_zf_xfer(o, n0, hepb);
+    zfs_zf_xfer(o + hepb * 8, n1, hepb);
+    if (b + 1 < load64(hdr + 24)) {
+        store64(hdr + 48, b + 1);
+        return 0;
+    }
+    if (zfs_zf_kill(load64(hdr + 16), load64(hdr + 24)) != 0) { return ZZ_IO; }
+    store64(hdr + 16, nb2);
+    store64(hdr + 24, load64(hdr + 24) * 2);
+    store64(hdr + 32, load64(hdr + 32) + 1);
+    store64(hdr + 40, 0);
+    store64(hdr + 48, 0);
+    return 0;
+}
+# The leaf block for hash h (zap_deref_leaf), its header checked: a leaf, its magic, its prefix h's. The block / < 0.
+fn zfs_zf_leafb(hdr, h) {
+    if (load64(hdr) != ((1 << 63) | 1) || load64(hdr + 8) != ZZ_MAGIC) {
+        zfs_zf_bad = 1;
+        return ZZ_CORRUPT;
+    }
+    return zfs_zf_i2b(hdr, zfs_zf_hidx(h, load64(hdr + 32)));
+}
+fn zfs_zf_lchk(lf, h) {
+    if (load64(lf) != (1 << 63) || load32(lf + 24) != ZZ_LMAGIC || load16(lf + 32) > 63 || zfs_zf_hidx(h, load16(lf + 32)) != load64(lf + 16)) {
+        zfs_zf_bad = 1;
+        return ZZ_CORRUPT;
+    }
+    return 0;
+}
+# zap_expand_leaf: split leaf lb (h's) — growing the pointer table first while the leaf's prefix is as long as the
+# table's (until it is not) — into lb and a new leaf at zap_freeblk (zap_create_leaf: zap_num_leafs + 1), its half of
+# the table's entries repointed. The leaf to retry h in, or < 0.
+fn zfs_zf_expand(hdr, h, lb) {
+    var l = zfs_zf_blk(lb);
+    if (l == 0) { return ZZ_IO; }
+    var opl = load16(l + 32);
+    while (opl == load64(hdr + 32)) {
+        var gr = zfs_zf_grow(hdr);
+        if (gr != 0) { return gr; }
+    }
+    if (opl > load64(hdr + 32)) {
+        zfs_zf_bad = 1;
+        return ZZ_CORRUPT;
+    }
+    var pd = load64(hdr + 32) - (opl + 1);
+    var sib = (zfs_zf_hidx(h, opl + 1) | 1) << pd;
+    var i = 0;
+    while (i < (1 << pd)) {
+        var x = zfs_zf_i2b(hdr, sib + i);
+        if (x < 0) { return x; }
+        if (x != lb) {
+            zfs_zf_bad = 1;
+            return ZZ_CORRUPT;
+        }
+        i = i + 1;
+    }
+    var nb = zfs_zf_ablk(hdr, 1);
+    var nl = zfs_zf_blk(nb);
+    if (nl == 0) { return ZZ_IO; }
+    l = zfs_zf_blk(lb);
+    if (l == 0) { return ZZ_IO; }
+    var srt = 0;
+    if (load64(hdr + 88) != 0) { srt = 1; }
+    zfs_zl_init(nl, srt);
+    store64(hdr + 64, load64(hdr + 64) + 1);
+    zfs_zl_split(l, nl, srt);
+    i = 0;
+    while (i < (1 << pd)) {
+        if (zfs_zf_sidx(hdr, sib + i, nb) != 0) { return ZZ_IO; }
+        i = i + 1;
+    }
+    if (zfs_zf_bad != 0) { return ZZ_CORRUPT; }
+    if (((h >> (64 - load16(l + 32))) & 1) == 1) { return nb; }
+    return lb;
+}
+# zap_put_leaf_maybe_grow_ptrtbl, after an add or update landed in leaf lf: a leaf at the table's prefix length with
+# fewer than ZAP_LEAF_LOW_WATER free chunks — or a doubling under way — grows the table once. OpenZFS ignores the
+# grow's error; (B8 review) here only a refusal that changed nothing (ZZ_NOSPC, ZZ_NOGROW) — any other failure is the
+# op's, whose txg the caller drops (a swallowed failed switch committed zt_blks_copied == zt_numblks with zt_nextblk
+# set). 0 / < 0.
+fn zfs_zf_maybe(hdr, lf) {
+    var sh = load64(hdr + 32);
+    if ((load16(lf + 32) == sh && load16(lf + 28) < ZZ_LOWW) || load64(hdr + 40) != 0) {
+        if (load64(hdr + 32) == sh) {
+            var r = zfs_zf_grow(hdr);
+            if (r != 0 && r != ZZ_NOSPC && r != ZZ_NOGROW) { return r; }
+        }
+    }
+    return 0;
+}
+# fzap_add_cd / fzap_update / fzap_remove — the ZAP's header at hdr (block 0, WRITABLE), the name nm (l bytes), its hash h
+# (zfs_zf_hash), n integers of isz bytes at p. op 0 add (cd as given, -1 ZAP_NEED_CD; EEXIST when present) · 1 update
+# (an existing entry's value replaced, else created) · 2 remove (ZZ_NOENT when absent). A leaf without room is split
+# (zap_expand_leaf) and the op retried there; zap_num_entries moves with every create and remove. 0 / < 0.
+fn zfs_zf_op(hdr, op, h, nm, l, isz, n, p, cd) {
+    zfs_zf_bad = 0;
+    var lb = zfs_zf_leafb(hdr, h);
+    if (lb < 0) { return lb; }
+    var lf = zfs_zf_blk(lb);
+    if (lf == 0) { return ZZ_IO; }
+    if (zfs_zf_lchk(lf, h) != 0) { return ZZ_CORRUPT; }
+    var g = 0;
+    while (g < 64) {
+        var cp = zfs_zl_lookup(lf, h, nm, l);
+        if (zfs_zf_bad != 0) { return ZZ_CORRUPT; }
+        var r = 0;
+        if (op == 2) {
+            if (cp == 0) { return ZZ_NOENT; }
+            zfs_zl_remove(lf, cp);
+            if (zfs_zf_bad != 0) { return ZZ_CORRUPT; }
+            store64(hdr + 72, load64(hdr + 72) - 1);
+            return 0;
+        }
+        if (cp != 0 && op == 0) { return ZZ_EXIST; }
+        if (cp != 0) { r = zfs_zl_update(lf, cp, isz, n, p); }
+        else {
+            r = zfs_zl_create(lf, h, cd, nm, l, isz, n, p);
+            if (r == 0) { store64(hdr + 72, load64(hdr + 72) + 1); }
+        }
+        if (zfs_zf_bad != 0) { return ZZ_CORRUPT; }
+        if (r < 0) { return r; }
+        if (r == 0) {
+            var mr = zfs_zf_maybe(hdr, lf);
+            if (zfs_zf_bad != 0) { return ZZ_CORRUPT; }
+            return mr;
+        }
+        lb = zfs_zf_expand(hdr, h, lb);
+        if (lb < 0) { return lb; }
+        lf = zfs_zf_blk(lb);
+        if (lf == 0) { return ZZ_IO; }
+        g = g + 1;
+    }
+    return ZZ_NOSPC;
+}
+# fzap_lookup: up to maxn integers of the entry nm (l bytes, hash h) into out as isz-byte native integers (read-only).
+# Its integer count / ZZ_NOENT / < 0.
+fn zfs_zf_get(hdr, h, nm, l, isz, maxn, out) {
+    zfs_zf_bad = 0;
+    var lb = zfs_zf_leafb(hdr, h);
+    if (lb < 0) { return lb; }
+    var lf = zfs_zf_rblk(lb);
+    if (lf == 0) { return ZZ_IO; }
+    if (zfs_zf_lchk(lf, h) != 0) { return ZZ_CORRUPT; }
+    var cp = zfs_zl_lookup(lf, h, nm, l);
+    if (zfs_zf_bad != 0) { return ZZ_CORRUPT; }
+    if (cp == 0) { return ZZ_NOENT; }
+    var le = zfs_zl_ch(lf, load16(cp));
+    var il = load8(le + 1);
+    var vn = load16(le + 10);
+    if (il > isz || (il != 1 && il != 2 && il != 4 && il != 8)) { return ZZ_CORRUPT; }
+    var c = load16(le + 8);
+    var k = 21;
+    var a = 0;
+    var i = 0;
+    while (i < vn && i < maxn) {
+        var v = 0;
+        var j = 0;
+        while (j < il) {
+            if (k == 21) {
+                c = zfs_zl_ok(c);
+                a = zfs_zl_ch(lf, c);
+                c = load16(a + 22);
+                k = 0;
+            }
+            v = (v << 8) | load8(a + 1 + k);
+            k = k + 1;
+            j = j + 1;
+        }
+        if (isz == 1) { store8(out + i, v); }
+        elif (isz == 2) { store16(out + i * 2, v); }
+        elif (isz == 4) { store32(out + i * 4, v); }
+        else { store64(out + i * 8, v); }
+        i = i + 1;
+    }
+    if (zfs_zf_bad != 0) { return ZZ_CORRUPT; }
+    return vn;
+}
+# fzap_upgrade + mzap_upgrade: block 0 at hdr (already 2^bs bytes) becomes the header — zeroed, ZBT_HEADER, the magic,
+# the embedded table (zt_shift = bs - 4, every entry -> block 1), zap_freeblk 2, one leaf, the microzap's salt and
+# normflags, zap_flags 0 — block 1 a fresh leaf, then every entry of the microzap snapshot mz (msz bytes: 64-byte chunks
+# after a 64-byte header) re-added IN CHUNK ORDER with its own cd (fzap_add_cd — leaf splits as needed). 0 / < 0.
+fn zfs_zf_upgrade(hdr, mz, msz) {
+    var salt = load64(mz + 8);
+    var nf = load64(mz + 16);
+    memset(hdr, 0, 1 << zfs_zf_bs);
+    store64(hdr, (1 << 63) | 1);
+    store64(hdr + 8, ZZ_MAGIC);
+    store64(hdr + 32, zfs_zf_bs - 4);
+    store64(hdr + 56, 2);
+    store64(hdr + 64, 1);
+    store64(hdr + 80, salt);
+    store64(hdr + 88, nf);
+    var i = 0;
+    while (i < (1 << (zfs_zf_bs - 4))) {
+        store64(hdr + (1 << (zfs_zf_bs - 1)) + i * 8, 1);
+        i = i + 1;
+    }
+    var l1 = zfs_zf_blk(1);
+    if (l1 == 0) { return ZZ_IO; }
+    var srt = 0;
+    if (nf != 0) { srt = 1; }
+    zfs_zl_init(l1, srt);
+    var k = 64;
+    while (k + 64 <= msz) {
+        var e = mz + k;
+        if (load8(e + 14) != 0) {
+            var nl = 0;
+            while (nl < 50 && load8(e + 14 + nl) != 0) { nl = nl + 1; }
+            if (nl >= 50) { return ZZ_CORRUPT; }
+            var h = zfs_zf_hash(hdr, e + 14, nl);
+            if (zfs_zf_ns != 0) { return ZZ_NOTSUP; }
+            var r = zfs_zf_op(hdr, 0, h, e + 14, nl, 8, 1, e, load32(e + 8));
+            if (r != 0) { return r; }
+        }
+        k = k + 64;
+    }
+    return 0;
+}
+
+# --- B11: UTF-8 names on a utf8only dataset (u8_validate, module/unicode/u8_textprep.c:337-446; design § a.3, k.55) -------
+# FreeBSD answers EILSEQ before any lookup, create, rename, link, mkdir or symlink of a name on a utf8only (or normalised)
+# dataset when u8_validate(name, strlen(name), NULL, U8_VALIDATE_ENTIRE) fails (zfs_vnops_os.c:846, :1073, :1444, :3340,
+# :3629, :3858). Its rules ARE Unicode's well-formed table (Table 3-7): a lead byte 0x80-0xC1 is illegal (EILSEQ —
+# u8_number_of_bytes' I_), 0xF5-0xFF out of range (ERANGE, O_); a lead whose sequence the bytes left cannot hold is
+# EINVAL; the SECOND byte's range depends on the lead (u8_valid_min_2nd_byte / _max_2nd_byte: E0 A0-BF — no overlong
+# 3-byte form, ED 80-9F — no UTF-16 surrogate, F0 90-BF — no overlong 4-byte form, F4 80-8F — nothing past U+10FFFF,
+# every other lead 80-BF) and every later one 80-BF (U8_ILLEGAL_NEXT_BYTE_COMMON). NUL is a valid one-byte character
+# here (the caller refuses it on its own). Normalisation (formC / formD / formKC / formKD) needs the Unicode tables —
+# not built: a non-ASCII name there stays refused by name (zfs_write.cyr zfs_wname). Host-proven against Python's
+# strict UTF-8 codec and a port of the tables (scripts/check/host-zfs-oracles.sh). 0 valid · 1 EILSEQ · 2 ERANGE ·
+# 3 EINVAL — the first error, in u8_validate's own order.
+fn zfs_u8_valid(s, n) {
+    var i = 0;
+    while (i < n) {
+        var c = load8(s + i);
+        if (c < 0x80) {
+            i = i + 1;
+            continue;
+        }
+        if (c < 0xC2) { return 1; }
+        if (c > 0xF4) { return 2; }
+        var sz = 2;
+        if (c >= 0xF0) { sz = 4; } elif (c >= 0xE0) { sz = 3; }
+        if (n - i < sz) { return 3; }
+        var lo = 0x80;
+        var hi = 0xBF;
+        if (c == 0xE0) { lo = 0xA0; } elif (c == 0xED) { hi = 0x9F; } elif (c == 0xF0) { lo = 0x90; } elif (c == 0xF4) { hi = 0x8F; }
+        var b = load8(s + i + 1);
+        if (b < lo || b > hi) { return 1; }
+        var k = 2;
+        while (k < sz) {
+            b = load8(s + i + k);
+            if (b < 0x80 || b > 0xBF) { return 1; }
+            k = k + 1;
+        }
+        i = i + sz;
+    }
+    return 0;
+}
+
+#ifdef ZFS_WRITE_OPS
+# --- B5: agnos-gen-1, the op list's file content (scripts/smoke/lib/zfs-expect.py `gen`, byte for byte) -----------------
+# seed64(S) = FNV-1a-64 over the bytes of S; word(S, i) = splitmix64's i-th output, mix64(seed64(S) + (i + 1) x golden);
+# byte x = (word(S, x >> 3) >> 8 (x & 7)) & 0xff — words laid out little-endian, every >> logical, every product mod
+# 2^64 (Cyrius i64 arithmetic wraps; >> is logical). POSITION-ADDRESSABLE: a write at any file offset, in any chunking,
+# writes the same bytes, so zfs-expect.py's `write PATH OFF LEN SEED` predicts the file. Host-proven against the Python
+# generator (scripts/check/host-zfs-oracles.sh: tests/zfscodec defines ZFS_WRITE_OPS to compile this) — the kernel's
+# op list (ZFS_WRITE_OPS builds) is the only kernel caller.
+fn zfs_gen_seed(s, l) {
+    var h = 0xCBF29CE484222325;
+    var i = 0;
+    while (i < l) {
+        h = (h ^ load8(s + i)) * 0x100000001B3;
+        i = i + 1;
+    }
+    return h;
+}
+fn zfs_gen_word(h, i) {
+    var z = h + (i + 1) * 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+# Bytes [off, off + n) of the stream of seed hash h into dst. 0.
+fn zfs_gen_fill(h, off, dst, n) {
+    var k = 0;
+    while (k < n) {
+        var x = off + k;
+        if ((x & 7) == 0 && k + 8 <= n) {
+            store64(dst + k, zfs_gen_word(h, x >> 3));
+            k = k + 8;
+        } else {
+            store8(dst + k, (zfs_gen_word(h, x >> 3) >> ((x & 7) * 8)) & 0xFF);
+            k = k + 1;
+        }
+    }
+    return 0;
+}
+#endif

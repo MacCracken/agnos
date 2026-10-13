@@ -6,9 +6,250 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**; see the 1.57.11 block below). Previous: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
+> **Last refresh**: 2026-10-13 (**1.57.12 B12 gates — every flag build re-weighed, the § i.4 mutation table, the full sweep 71/71, k.134; the closeout tallies filled**; see the first 1.57.12 block below). Before that: 2026-10-13 (**1.57.12 closeout docs — B12: the ZFS write path written up for release; `architecture/zfs-read-only.md` → `architecture/zfs.md`**). Before that: 2026-10-13 (**the ZFS writer's B10 (log hygiene) and B11 (policy B, the deferral window, the crash cut), built in two parallel tracks, reviewed and merged**). Before that: 2026-10-12 (**the B8 / B9 / ROOM merge**). Before that: 2026-10-12 (**the B7 review: five findings fixed, and k.70, the free_bpobj budget its coverage found**). Before that: 2026-10-11 (**ZFS write bite B7 (unlink / rmdir / rename / link) and k.68, the space map histograms its gate found**). Previous: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**). Before that: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
 >
 >
+>
+> ### 1.57.12 (2026-10-13) — B12, the closeout gates: the tallies filled
+>
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — status **B0–B12 BUILT, B12 DONE**; § g's B12 re-weigh table (seven flag
+> builds, every figure equal to the merge's); § h's B12 row and its new gate record (flag builds, check / test, the
+> sweep row by row, the boot checkpoints, the version verify); § i.4's NEW "(B12) the mutation table" (74 rows + the
+> M1–M11 map + what stays unproven); NEW **k.134** — the sweep's 1500 s row ceiling against the ≈ 83 min ZFS write row.
+> ✅ **`CHANGELOG.md` 1.57.12** — Fixed: k.134 (`sweep.sh` `sweep_row_ceiling`, a smoke's `# sweep-row-timeout:`);
+> Closeout: the flag builds re-measured, the sweep 71/71 with what each non-first-attempt row was, the mutation proof's
+> summary, CLAUDE.md's dead checkpoint corrected.
+> ✅ **`CLAUDE.md`** — closeout step 1's sweep tally (71/71 and how the four non-first-attempt rows passed); step 2 and
+> work-loop step 5 no longer name `Memory isolation: PASS` (no kernel has printed it since its test left `main.cyr` on
+> 2026-05-15) and name the checkpoints that exist with the gate requiring each.
+> ✅ **`state.md`** — the Kernel-head row's sweep tally; the `build/agnos` row's flag builds marked as B12's re-measure
+> (no placeholder left). ✅ **`build.md`** — the `SWEEP_ROW_TIMEOUT` row names the per-smoke declaration (k.134).
+> ✅ Scripts: `sweep.sh` (k.134), `smoke/zfs-write-smoke.sh` (declares 7200 s). No kernel source changed.
+> ⚠ Open, harness: a worker copy's QEMU monitor socket path exceeds `sun_path` for `hid-mouse-deferred` and `pipeline`
+> (VOID in parallel, green on the serial retry — as at 1.57.11); `doom` / `naad-ring3` need `DOOM_ROOT` / `NAAD_ROOT`
+> from a worktree (`SIBLINGS_ROOT` is not read by either).
+>
+> ### 1.57.12 (2026-10-13) — B12, the closeout docs: the ZFS write path written up for release
+>
+> ✅ **`architecture/zfs-read-only.md` → `architecture/zfs.md`** ("ZFS — the invariants", read and write; section
+> numbers kept). Title and intro for both halves; § 7 rewritten from the pre-write checklist into the write path's rules
+> in one place (G1, the commit order and its two flushes, allocation before any write, the durability points, the
+> TXG_DEFER_SIZE window and the ghosts, kills, refusals at admission, bounded logs, the hold, the refusal list's pointer,
+> why the block cache needs no invalidation); § 3's "the write path must change this" answered. Every pointer in this
+> repo moved (the spec × 19, this ledger × 9, roadmap, state, ABI, the 1.57.11 CHANGELOG entry, two `zfs_write.cyr`
+> comments); the B12 row and the rename record keep the old name. Sibling pointers NOT edited (agnosticos
+> `prior-art/zfs-write-prior-art.md` :35 and :678 — :35 names the 1.57.11 file as it was).
+> ✅ **`CHANGELOG.md` 1.57.12** — title and the operator-rulings preamble; Added: the write path (verbs, the commit,
+> space and accounting, kills and the drain, snapshotted datasets, log hygiene, policy B, the deferral release, the
+> windowed hold, UTF-8 names, every refusal by name, the OpenZFS oracle and the host audits h1–h9, the gates); Changed:
+> the doc rename, the mount line, `statfs`'s `f_bavail`, the two ZFS sweep rows, the aarch64 stubs, `build.md`; Fixed:
+> the reader's gang-copy verification (k.120), `sync`#12's unlocked `ext2_sync` (k.129 (a)), and the writer's own
+> defects found by its gates and reviews, one line each; the BSP section's "final tree" figures relabelled as the
+> tree at bite B2 (the final ones are the Closeout's); NEW Closeout (2,754,592 B, LOAD end `0x3b06c0`, 325,952 B
+> under gate 34, every flag build; check.sh 38/38; the sweep tally and the § i.4 mutation proof left for the sweep
+> phase; the dead-code audit WAIVED by the standing rule; what stays open).
+> ✅ **`agnos-userland-abi.md`** § 3.6 — heading; the pointer to `zfs.md` § 7; `write`#1's hold figures (k.126's, the
+> windows, other CPUs wait) and the never-dropped pending txg; `close`#6's answer after a failed release (0) and
+> `SEEK_END`'s -1; `stat`#33 commits first and answers -1 on a failed commit; `readlink`#70 / `getdents` / `readdir`
+> commit only an aged txg; `statfs`'s -1; `unlink`'s "freed for the boot" → the TXG_DEFER_SIZE window.
+> ✅ **`roadmap.md`** — the ZFS section: the write path shipped (row removed, the intro names it), three follow-on rows
+> (the ownership lock; the sync thread and the tick-killed orphan; what stays refused), the zstd / snapshots rows
+> brought current; the dead-code row WAIVED until the rewrite; the iron-burn row gains 1.57.12's ZFS write + ROOM.
+> ✅ **`state.md`** — the Kernel-head row is 1.57.12's (it still described 1.57.11's reader under the 1.57.12 head) and the
+> `build/agnos` row the merged tree's measurements (the sweep's re-measure and tally marked to be filled); 120 lines.
+> ✅ **`CLAUDE.md`** closeout step 1 — check.sh 38/38 with gate 38 described, gate 37's 2,332 cases, 71 sweep rows and the
+> five 1.57.12 added (ktest, gpt-geometry, zfs write, klug spill ×2), the sweep tally left for the sweep; step 3 — the
+> dead-code audit WAIVED by the standing rule until the rewrite.
+> ✅ **`build.md`** — `ZFS_WRITE_SELFTEST` and `ZFS_WRITE_OPS` rows (they lived only in `build.sh`'s comment, which said
+> the op list was B2's ub-only commit — current now too). `sweep.sh`'s ZFS write row label names what it runs.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — status BUILT (B0–B11, B12 docs done; the sweep phase closes it); § h's B12
+> row "as built"; k.74 (e) points at the kashi issue below.
+> ✅ Sibling (the one write allowed): kashi `docs/development/issues/2026-10-13-font-arrays-declared-u64-for-byte-tables.md`
+> (NEW; k.74 (e)).
+>
+> ### 1.57.12 (2026-10-13) — ZFS write, bites B10 (log hygiene) and B11 (policy B), and the two-track merge
+>
+> ✅ **`architecture/zfs.md`** — NEW § 16 (B10: the flush's delta before T allocates, U before destroy, how
+> many flush, hygiene's own room, the ghosts, the flushed histogram, the 10 MiB writer area, the drain, MOS gangs, a
+> gang header copy against DVA[0]'s identity) and NEW § 17 (B11: policy B and its hooks, a continued txg never dropped,
+> the deferral window's release, the commit's hold windowed, the crash cut, UTF-8 names); the gates paragraph (B10's
+> hygiene checks, B11's ops and cut lanes, the merge's ghost bound). Both tracks wrote "§ 16": B11's is § 17 since the
+> merge, its two pointers moved. The merge's own: the ghost bullet (made only inside the window, retired by the
+> release, ≤ 3), the hold bullet (the publish's tail), the cut bullet (a flush cut mid-way).
+> ✅ **`agnos-userland-abi.md`** § 3.6 — B10's unlink#30 drain; B11's policy B (`write`#1 durable at close / sync / exit
+> / an observation), `close`#6 / `sync`#12 answers, UTF-8 names, ring-3 clauses 156–161.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — status; § c.2 / c.5 "(B10, as built)" and B11's § b.2 / b.3 notes; § g's
+> table (B10's two rows, B11's, the merge's) and the measurements after B10, its review, B11, its review and the
+> MERGE; § h's B10 / B11 rows, gate and review records and the merge record; § i.1 / i.2 (B10, B11); § k: B10
+> k.108–k.123, B11 k.124–k.132 (both tracks numbered from 108 — B11's renumbered at the merge, every cross-reference
+> with them), the merge's k.133.
+> ✅ `zfs-write-smoke.sh` (B10's drains / hygiene checks and B11's ops / cut lanes in one list; every read through
+> `slog`; the ghost bound; the cut lanes' hygiene line), `zfs-smoke.sh`, `zfs-fixture.sh` / `zfs-fixture-guest.sh`
+> (VERIFY half only: B10's A3y + host log count, B11's `--cut-labels`; RECIPE 8 unchanged, key
+> `r8-4ee74703473a-c579a04a`), `zfs-ring3-test.py` and `tests/zfs/zfsx.cyr` (B11's clauses 156–161, `RING3_TXGS` 44),
+> the host oracles (`zfs-wms-check.py` B10's replay of flushes / destroys; `zfs-room-check.py` B10's `--log` and B11's
+> window, together; `zfs-image-audit.py` `--cut-labels`; `zfs-sa-check.py`, `zfs-hole-check.py`), gate 37's vectors
+> (B11's UTF-8 classes). `state.md`'s `build/agnos` row (the merged headroom).
+>
+> ### 1.57.12 (2026-10-12) — ZFS write, bites B8 (fat ZAP) and B9 (snapshotted datasets), and the three-track merge
+>
+> ✅ **`architecture/zfs.md`** — NEW § 14 (fat ZAPs: the four resolvers, the kill-list switch, no swallowed
+> failure, accounting shaped at admission, the RDRAND salt) and NEW § 15 (snapshotted datasets: never freed, the
+> committed deadlist, the per-entry budget and path prediction, branch B's TXG_INITIAL condition, the refusals); § 10's
+> refusal bullets; the gates paragraph (h9, the deadlist checks). The two tracks each wrote "§ 14": B9's is § 15 since
+> the merge, its references moved.
+> ✅ **`agnos-userland-abi.md`** — the ZFS write-path status (B8 directories of any size, B9 snapshotted datasets and
+> livelist-free clones), `open`#7's create rules (fat parents, the 2^22-entry switch bound) and the truncation's
+> deadlist judgement, the B9 refusals, the ring-3 gate's clauses (B8 124 / 126 / 128 / 148–149, B9 150–155).
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — status; § a / § e / § f / § i "(B8, as built)" and "(B9, as built)"; § g's
+> measurements after B8, its review, B9, its review and the MERGE; § h's B8 / B9 rows and gate / review records; § j's
+> standing rule (ROOM's and B8's notes made one); § k: ROOM k.74, B8 k.75–k.90, B9 k.91–k.106 (each track had numbered
+> from 74 — renumbered at the merge, every cross-reference with them), the merge's k.107.
+> ✅ `zfs-fixture.sh` / `zfs-fixture-guest.sh` RECIPE 8 = one RECIPE 7 (B8's `fz`, B9's `snap2`, spread, `.snaps`) + B9's
+> 8 (`edge` / `edgec`); `zfs-write-smoke.sh`, `zfs-smoke.sh`, `zfs-ring3-test.py` (RING3_TXGS 35, 28 refusals),
+> `tests/zfs/zfsx.cyr` (B9's clauses renumbered past B8's), the host oracles (`zfs-fatzap.py`, `zfs-fatzap-check.py`,
+> `zfs-fz-ops.py`; `zfs-damage.py`'s `BP.gbirth`, `zfs-uacct-check.py`'s `dl_check`, `zfs-wms-check.py`'s
+> `owned_allocated`). The merge's own (k.107): `zfs-image-audit.py` h3's `--min-txgs` capped at the ring's slots, the
+> recipe's edgec `touch` (deterministic dnode-block births), `state.md`'s `build/agnos` row (the merged headroom).
+>
+> ### 1.57.12 (2026-10-12) — ROOM: eleven module arrays leave the image for a boot carve-out (grow before refactor)
+>
+> ✅ **NEW `architecture/kernel-image-room.md`** — the invariant (moved arrays are poison pointers into one 2 MB direct-map
+> carve-out, `core/room.cyr`), the prior art (Linux `setup_log_buf` / memblock / `LIST_POISON`, FreeBSD `msgbufp` via
+> `PHYS_TO_DMAP`, seL4, vidya), the mechanism, the klug early ring, the CR3 audit, what moved / what stayed and why, the
+> headroom table, how to move one more, the gates, the mutation record.
+> ✅ **`CLAUDE.md`** — the image-bound note: grow the room before anything else; where the moved bulk lives; how to add more.
+> ✅ **`architecture/dma-cpu-pointers.md`** (the room is CPU-only memory, its `dmash: room` arm) ·
+> **`architecture/kernel-stacks-and-preemption.md`** § Region 1 (room is made by moving bulk; no stack in the room).
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — § g "ROOM (2026-10-12)" (before / after headroom, every flag build), § j (the
+> standing rule supersedes D12's "stops and reports"), k.74 (defects found on the way, the open questions).
+> ✅ `image-layout-check.sh` header (10) and the stale pre-shim count in (8); `agnsh-smoke.sh`, `dma-shadow-smoke.sh`,
+> `qemu-dwell.sh` (`SMOKE_INVARIANT_DENY`) headers. `CHANGELOG.md` 1.57.12 § Changed (ROOM) and § Fixed (the CPL0 #PF line).
+> ✅ **The ROOM review (seven findings, all taken)** — `kernel-image-room.md`: § When (`room_init` after `fb_shadow_init`),
+> § Where, mechanism 6 (by name on a CPU dereference only; ext2's `p > 0`), the klug section (QEMU measured, iron
+> unmeasured; the klug-spill rows), NEW § The KEEP_GNOBOOT build (booted once; pre-existing no-mount), NEW § ext2's
+> direct DMA (no write caller since the room), the gates, headroom after the review. `CLAUDE.md` image-bound note: the
+> counts moved out (rule and mechanism stay). `state.md` `build/agnos` row: the ROOM numbers. Spec § g ROOM row and
+> § k.74 (i)–(o). `image-layout-check.sh` (10) header (the new order), `klug-spill-smoke.sh` (VOID retry, the moved
+> ring), `sweep.sh` (two klug-spill rows). `CHANGELOG.md` 1.57.12 ROOM entry.
+> ✅ **The second ROOM review (six findings, all taken)** — `kernel-image-room.md`: § Where (the whole-bitmap fallback),
+> mechanism 7 / 8 (the halt's new text; the boot line's declared vs page-rounded bytes), § The KEEP_GNOBOOT build (a
+> widened room there), the headroom table (a column after the second review), the gates (build.sh refuses a plain
+> contract FAIL; `smoke_require_image`'s `layout=`; the deny list applied by 31 of 67 rows), mutation rows N1a–N6.
+> `build.md` (the image guard's plain path, `agnos.flags`' `layout=`). `CLAUDE.md` image-bound note (build.sh refuses a
+> plain contract FAIL too). `state.md` `build/agnos` row (the per-build gains, after the second review). Spec § g, § j,
+> k.74 (a) (the deny-list claim), k.74 (p)–(v). `CHANGELOG.md` 1.57.12 ROOM entry and § Fixed.
+>
+> ### 1.57.12 (2026-10-12) — ZFS write, the B7 review (5 findings, all fixed; k.70 found on the way)
+>
+> ✅ **`agnos-userland-abi.md` §3.6** — `rename`#31 / `link`#32: a NEW name with a NUL byte, or non-ASCII on a `utf8only`
+> dataset, is -1; every ZFS path operand is copied once; a directory fd's `getdents` -1 once its directory is on the
+> DELETE_QUEUE.
+> ✅ **`architecture/zfs.md`** — § 10's refusal bullets current (gang / dedup / clone kills defer since B7);
+> § 13: `zfs_fd_live`, `zfs_wname`, `zfs_upath`.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — § a.3 two rows; § e.2, § f.4, § f.5 "(B7 review)"; § g's re-weigh after the
+> review; § h's B7 review record; new k.70–k.73.
+> ✅ `zfs-fixture.sh` RECIPE 6 (ashift9's `xd.txt`, an xattr directory); the guest's `ds_check` / A5 (k.72); the ring-3
+> harness's clauses 146–147.
+>
+> ### 1.57.12 (2026-10-11) — ZFS write, bite B7: unlink / rmdir / rename / link
+>
+> ✅ **`agnos-userland-abi.md`** — §3.2 rows 30 / 31 / 32 and §3.1 `rmdir` gain ZFS; §3.6: new rows `unlink`#30,
+> `rmdir`#10, `rename`#31, `link`#32 (one txg each, the named refusals: EXDEV, EPERM, ENOTEMPTY, ENOTDIR, EINVAL, the
+> grafts and virtual directories, IMMUTABLE / APPENDONLY / NOUNLINK), `read`'s D11 note (an fd across an unlink answers
+> -1), gang / dedup writes no longer refused (their kills defer to `free_bpobj`), the refusal-log list.
+> ✅ **`architecture/zfs.md`** — NEW § 13 (removals: the kill list frees an object, one `zfs_wd_defer`, object
+> numbers come back and the fd notices, PARENT never repaired, grafts judged on the resolver's canonical path, and the
+> space map histograms a txg lowers — k.68); § Gates (B7's oracle, h6's histogram rule).
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — the status header; § e.2 / f.2 / f.4 / f.5 "(B7, as built)"; § e.4's
+> histogram premise CORRECTED (OpenZFS's drift is downward only); § g's B7 re-weigh (RING3_SELFTEST 67,808 B binding);
+> § h's B7 row and gate record; k.10 / k.41 / k.50 / k.54 answered, k.64 extended (`full`'s order), new k.62–k.69.
+> ✅ Host oracles' headers (`zfs-wms-check.py`, `zfs-image-audit.py` h6) name the histogram rule; `zfs-damage.py`'s
+> zero-u header names the three-metaslab fallback (k.69).
+>
+> ### 1.57.12 (2026-10-11) — ZFS write, the B6 review (7 findings, all fixed)
+>
+> ✅ **`agnos-userland-abi.md`** — §3.1 `open`#7: a relative name of 255+ bytes is -1 (it was truncated to 254 and
+> opened); §3.2 `symlink`#63: a target holding a NUL is -1 (ext2 and ZFS); §3.6 `open`#7 / `symlink`#63 rows: the
+> `large_microzap` and grown-objset refusals, object / project quotas only once accounting is COMPLETE, and the
+> console's `zfs: <verb> refused (<why>)` line.
+> ✅ **`architecture/zfs.md`** § 12 — PROJID vs an objset OpenZFS grows in memory, `acl_trivial_access_masks`,
+> `zfs_wc_trivok`, every failed `AO_CREAT` lookup through `zfs_wcreate`, the `large_microzap` pre-check, the refusal log.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — § a.3 three rows + two notes, § e.3, § f.1 (PROJID rule, ACL masks), § g
+> (after the B6 review), § h (the B6 review record), § i.1 / § i.5 (the ring-3 form), k.2 / k.51 / k.55 updated, new
+> k.57–k.60.
+> ✅ **`CHANGELOG.md`** [1.57.12] Fixed — the relative-name truncation, the NUL symlink target, the image-layout gate's
+> prologue-anchored frame scan.
+>
+> ### 1.57.12 (2026-10-11) — ZFS write, bite B6: create / mkdir / symlink
+>
+> ✅ **`agnos-userland-abi.md` §3.6** — retitled (creates since B6); `open`#7's `AO_CREAT` now creates (mode `0100644`, its
+> own txg, never through a final symlink, a new file not truncated, the named refusals) and `AO_TRUNC` without write
+> access truncates (design § k.44, DECIDED); new rows `mkdir`#9 and `symlink`#63 (1..144-byte targets, a dataset that
+> already holds the symlink layout); `rmdir` / `unlink` / `rename` / `link` B7. §3.1 `mkdir` and §3.2 `symlink`#63 gain ZFS.
+> ✅ **`architecture/zfs.md`** — NEW § 12 (creates: the new object accounted by the commit's diff, first-fit
+> object reuse and GEN, the dataset's REGISTRY / LAYOUTS decide the bonus, the final component never followed); § Gates.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — the status header; § a.3 three B6 rows; § f.1 / f.2 "(B6, as built)"; § h's
+> B6 row and gate record; § k.2 ANSWERED (the fixtures' REGISTRY, LAYOUTS, flags, ACLs, modes), k.44 DECIDED, new B7
+> questions.
+>
+> ### 1.57.12 (2026-10-11) — ZFS write, the B5 review (9 findings, all fixed)
+>
+> ✅ **`agnos-userland-abi.md` §3.6** — `open`#7's `AO_TRUNC` (several txgs with `fs_lock` released between them; every
+> block judged before the first, a later txg's failure leaves the file partly freed, SIZE unchanged); `write`#1 (ENOSPC
+> also at the metaslabs agnos allocates in; EDQUOT also at user / group / project quotas; the hold is ONE commit — the
+> lock released between txgs, the fd re-checked; the calling CPU IF=0 throughout); `statfs`#103's `f_bavail` (the
+> writer's room on an rw pool, OpenZFS's slop on a read-only one — § a.4's delta, finally made).
+> ✅ **`architecture/zfs.md` § 11** — the lock held for one commit (the reserved fd slot of a truncating
+> open), "nothing may fail inside a commit that an op could have refused" (the extent list, log T's size, user data
+> charged before dirtying, the allocator's room, the pre-scan), quotas enforced, h8's new rules.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — § a.3 two rows (the allocator's room, user / group / project quotas); § h
+> the B5 review record; § k.8 (the commit hold re-measured without the op list's own console output), k.28 / k.40 /
+> k.43 (what failed, the fixes, on disk), k.45–k.49 new.
+>
+> ### 1.57.12 (2026-10-11) — ZFS write, bite B5: file data
+>
+> ✅ **`agnos-userland-abi.md` §3.6** — retitled (read-write since 1.57.12); the header names the write gate and what each
+> bite adds; `open`#7 (`AO_WRONLY` / `AO_RDWR` / `AO_TRUNC` / `AO_CREAT` on an existing file / `AO_EXCL` before
+> `AO_TRUNC`; `AO_APPEND` unhonoured), `read` / `lseek` (the SA size on every op, the generation check), `write`#1 (one txg
+> per call, durable at return until B11, short at ENOSPC / EDQUOT, the named -1s), `stat`, the namespace verbs (B6 / B7),
+> `sync`#12, the write refusals and the gates rows.
+> ✅ **`architecture/zfs.md`** — NEW § 11 (file data: the fd carries the generation, policy A in the syscall,
+> deferred kills in the data arena's upper half, read-on-partial only, hole births + h8); § Gates.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — the status header (it still said "pre-code"); § g's B5 re-weigh; § h's B5 row
+> and gate record (builds, smokes, hold times, the four negative proofs, the `wr@u0` forge fix); § i.1 / i.2 (h8) / i.5;
+> § k.12 / k.28 / k.31 / k.32 / k.36 answered or measured, k.38–k.44 new.
+> ⚠ CHANGELOG / roadmap / state carry the 1.57.12 write path at the B12 closeout, as the earlier bites did.
+>
+> ### 1.57.12 (2026-10-10) — the BSP stacks leave region 1 (operator: make room for the ZFS write path)
+>
+> ✅ **Region-1 layout, every site** (again — the bound is now `0x400000`, the top of region 1): `CLAUDE.md` (the image-wall
+> note; closeout step 1's gate-34 label and grant), `architecture/kernel-stacks-and-preemption.md` (§ Region 1 rewritten:
+> the `.bss` boot stack, the RSP0 slot, the alternatives weighed, the depth and the boot evidence; the region-7 table's
+> slot 0), `architecture/kernel-font-namespace.md` (a 1.57.12 pointer — its 1.57.7 narrative stays as history),
+> `build.md` (`KSTACK_HW` now paints the BSP stack; the image-layout guard), `state.md` (the size row's gate note),
+> `roadmap.md` (dead-code and iron-burn rows), the gate/smoke comments (`check.sh`, `sweep.sh`, `test.sh`, `build.sh`,
+> `ci.yml`, `release.yml`, `agnsh-smoke.sh`, `ap-stack-smoke.sh`, `qemu-dwell.sh`, `rbp-repro.sh`) and every kernel
+> comment that named the old windows or the deleted legacy multiboot1 shim. `CHANGELOG.md` 1.57.12 § Changed.
+> ✅ **The review pass** — the boot stack's red zone (`kernel-stacks-and-preemption.md` § Region 1, `build.md`'s
+> `KSTACK_HW` row, the `CLAUDE.md` image-wall note), the pre-shim enum stores (the `CLAUDE.md` boot-shim bullet and
+> `agnos.cyr`'s include comment said the shim was the first code emitted; the image says otherwise — now gate 34 (8)),
+> the iron trade (the image span's allocatability; `roadmap.md`'s iron row) and the KASLR re-derivation list
+> (`kernel-stacks-and-preemption.md`, `proposals/2026-05-11-kaslr-scope.md` addendum).
+> ✅ **Three pre-existing defects (CHANGELOG 1.57.12 § Fixed)** — `kernel-stacks-and-preemption.md` § Region 7 (no frame
+> may step over a guard page; gate 34 (9)), its red-zone paragraph and `proc.cyr`'s (largest frame 2,176 B, not 5,152);
+> `build.md`'s `KTEST` row (the rebuilt boot self-tests, the restored NVMe round-trips, `KTEST=1 sh scripts/ktest.sh`
+> 372/372); `ktest.sh`'s header (the test initrd exists only in a KTEST build — why plain runs 367/370).
+> ✅ **The review follow-ups (CHANGELOG 1.57.12 § Fixed, six bullets)** — `build.md` (`KTEST`, `AHCI_RW_DEMO`, `MSC_RW_DEMO`
+> rows: the write self-tests restore and write outside the GPT; the `ktest.sh` row: what it now scores, `KTEST_SMP`),
+> `kernel-stacks-and-preemption.md` § Region 7 (kthread pool slots are recycled), `build.sh`'s `AHCI_RW_DEMO` help,
+> the new `ktest-smoke.sh` / `gpt-geometry-smoke.sh` headers and their `sweep.sh` rows, `image-layout-check.sh`'s
+> Shipped record and the CHANGELOG BSP numbers (re-measured on the final tree; the BSP-step figures kept, labelled).
+> ✅ **The second review's five minors (M1–M5)** — `kernel-stacks-and-preemption.md` § Region 7 (a kthread is retired
+> by itself or through `kthread_retire`, under `sched_lock`), the GPT and kthread-slot bullets of CHANGELOG 1.57.12
+> § Fixed, `gpt-geometry-smoke.sh`'s header (lanes bad-primary / big / many), `gpt-image.py`'s usage (`damage`,
+> `--fill`, `expect` now models `gpt_init`), and the size figures (CHANGELOG § Changed table, `image-layout-check.sh`'s
+> Shipped record) re-measured.
 >
 > ### 1.57.11 (2026-10-09) — read-only ZFS (operator: read now, write 1.57.12)
 >
@@ -19,7 +260,7 @@ type: state
 > ✅ **`CLAUDE.md`** closeout step 1 — 37 gates (gate 37 described), 66 sweep rows, no known-red row; gate 34's bound and
 > the weighed-size grant re-stated (`0x3D0000`, `0x260000`).
 >
-> ✅ **NEW: `architecture/zfs-read-only.md`** — single walker, the 6 MiB area, the block-cache identity key, checksum word
+> ✅ **NEW: `architecture/zfs.md`** (then `zfs-read-only.md`; renamed at 1.57.12) — single walker, the 6 MiB area, the block-cache identity key, checksum word
 > order, the graft namespace, the refusals, and what the 1.57.12 write path must change first.
 >
 > ✅ **`agnos-userland-abi.md`** — NEW §3.6 (the ZFS mount contract on existing rows); `#104` backend 4; `#101`'s cursor is

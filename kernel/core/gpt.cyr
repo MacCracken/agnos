@@ -39,17 +39,42 @@
 # No-op if no block backend is registered (blk_active == 0), if LBA 1
 # read fails, or if the signature check fails (unpartitioned disk —
 # typical for archaemenid's NVMe at debut, where LBA 0 = all zeros).
+#
+# ⛔⛔ 1.57.12 — EVERY LBA FIELD IS IN UNITS OF THE DEVICE'S LOGICAL BLOCK, AND THE WALKERS ASSUMED 512 B. UEFI 2.10
+# §5.3: the header is at LBA 1 and PartitionEntryLBA / First/LastUsableLBA / the partition entries' Starting/
+# EndingLBA count LOGICAL BLOCKS — on a 4096 B-LBA ("4Kn") disk the header is at byte 4096 and the array starts at
+# LBA 2 = byte 8192. The four array walkers read each 4 KB chunk as `blk_read_sectors(entries_lba + chunk * 8, 8,
+# buf)`: on a 4Kn NVMe namespace (blk_lba_bytes_ok admits 4096 since 1.56.51) that asked for 8 x 4096 = 32 KB into
+# the ONE 4 KB page gpt_array_buf (nvme_blk_read_sectors' per-sector fallback copies each 4 KB LBA to buf + i x 4096:
+# 28 KB of whatever pages follow it, overwritten at boot), and chunk c started at LBA entries_lba + 8c instead of + c.
+# Now the backend's LBA size is read once (gpt_lba_bytes, from the backend gpt_init parses: gpt_tag) and a chunk is
+# 4096 / gpt_lba_bytes LBAs — 8 at 512 B, 1 at 4 KB — read by gpt_read_chunk, the walkers' one reader; the last
+# chunk reads only the LBAs the array still covers.
+# ⛔ AND THE WALK COVERED 16 KB AT MOST. `chunks` was capped at 4, so a spec-valid table larger than 128 x 128 B —
+# 128 x 256 B (32 KB) is the smallest — had its array CRC computed over half of it (arr-CRC-BAD on a good disk) and
+# its upper entries never listed. The walk now covers ceil(num x size / 4096) chunks, every entry < num and none past
+# it, up to GPT_ARRAY_MAX_BYTES (1 MiB): a larger array is walked TRUNCATED to its first 1 MiB, said on its own line,
+# its CRC32 unverifiable (gpt_decode_header). UEFI sets no bound on the entry count, so a big table keeps its GPT.
+# ⛔ AND SizeOfPartitionEntry MUST BE 128 x 2^n (UEFI 2.10 §5.3.2), not merely a multiple of 128: 384 B entries passed
+# the old check, 4096 / 384 = 10 entries per chunk, and every chunk after the first was walked 256 B out of phase.
+# The CPU pointers are direct-map aliases of their pages (dma_kva) — never the pool page's identity VA, which a
+# per-process CR3 may map to process memory (docs/architecture/dma-cpu-pointers.md).
 
 var GPT_SIG_LO         = 0x20494645;   # "EFI " (little-endian u32 view)
 var GPT_SIG_HI         = 0x54524150;   # "PART" (little-endian u32 view)
-var GPT_MAX_ENTRIES_P1 = 32;           # Phase 1 cap — first 4 KB of array
 var GPT_ENTRY_SIZE_STD = 128;          # spec default partition_entry_size
+var GPT_ARRAY_MAX_BYTES = 0x100000;    # 1 MiB: how much of the entry array the walkers read (gpt_decode_header)
+var GPT_BOOT_LIST_MAX  = 16;           # 1.57.12: used entries the BOOT dump lists (main.cyr; `parts` lists them all)
 
 # Public state — consumers read these directly (matching the existing
 # blk_active / vblk_capacity access pattern in the kernel).
 var gpt_present              = 0;
-var gpt_header_buf           = 0;
-var gpt_array_buf            = 0;
+var gpt_header_buf           = 0;    # CPU pointer (dma_kva) of a 4 KB page: one LBA, the header
+var gpt_array_buf            = 0;    # CPU pointer (dma_kva) of a 4 KB page: one 4 KB chunk of the entry array
+var gpt_tag                  = 0;    # 1.57.12: the backend the GPT was read from (blk_active at gpt_init)
+var gpt_lba_bytes            = 512;  # 1.57.12: its LBA size (512 / 4096) — the UNIT of every LBA field below
+var gpt_array_bytes          = 0;    # 1.57.12: the bytes of the array the walkers read: num x size, at most 1 MiB
+var gpt_array_truncated      = 0;    # 1.57.12: 1 = num x size is over GPT_ARRAY_MAX_BYTES (only the first 1 MiB is read)
 
 # Decoded GPT header fields (offsets per UEFI § 5.3.2 Table 5-6).
 var gpt_first_usable_lba      = 0;   # offset 40 u64
@@ -60,9 +85,21 @@ var gpt_partition_entries_lba = 0;   # offset 72 u64
 var gpt_num_partition_entries = 0;   # offset 80 u32
 var gpt_partition_entry_size  = 0;   # offset 84 u32
 
-# Walk result — number of non-empty entries observed in the first
-# 4 KB window. Bounded by GPT_MAX_ENTRIES_P1 in Phase 1.
+# Walk result — number of non-empty entries in the whole array (1.57.12; the first 16 KB before).
 var gpt_partition_count       = 0;
+
+# ⛔ 1.57.12 — THE USED-ENTRY LIST, THE FILESYSTEM PROBES' ONE ITERATOR (gpt_used_info). FAT, exFAT, ext2 and ZFS
+# looped `pi < gpt_partition_count` over gpt_partition_info(pi): the bound counts USED entries but the index was a
+# SLOT, so a sparse table was probed in slots 0..count-1 only. gpt-geometry-smoke's `sparse` disk, whose one partition
+# (an e2fsck-clean ext2) is slot [100], measured it: listed at boot (`parts=1/128`), probed in slot 0 (empty), never
+# mounted. And every probe re-read the array chunk of each slot it asked for, one 4 KB read per entry: on `many`
+# (4,096 used entries) the four probes took 2.5 s of boot. gpt_walk_all_partitions now records each used entry ONCE, at
+# gpt_init, in slot order — 32 B records (type GUID low / high, StartingLBA, EndingLBA), 128 to a kmalloc'd 4 KB page,
+# the pages' pointers in gpt_used_dir (512 of them: 65,536 records, past the 8,192 a 1 MiB walk can hold) — and
+# gpt_used_info(n) hands out the n-th without a read. The probes' bound stays `pi < gpt_partition_count`.
+var gpt_used_dir              = 0;     # kmalloc'd 4 KB: the record pages' pointers (0 = none allocated yet)
+var gpt_used_n                = 0;     # records in the list: gpt_partition_count, unless a page allocation failed
+var GPT_USED_PER_PAGE         = 128;   # 4096 / 32 B
 
 # --- Header validation -----------------------------------------------
 #
@@ -100,16 +137,68 @@ fn gpt_decode_header(buf) {
     # at two more, where an oversized value walks straight out of the 4 KB `gpt_array_buf`.
     # A GPT is attacker-controlled in the threat model this kernel already accepts — removable USB
     # mass storage, and the armed raw-block write band.
-    # ⚠ THE BOUNDS ARE THE UEFI SPEC'S, NOT INVENTED: §5.3 requires SizeOfPartitionEntry to be a
-    # multiple of 128 and at least 128; 128 is what every real formatter emits. Capping at one 4 KB
-    # chunk keeps `entries_per_chunk >= 1` so the chunk arithmetic below cannot divide to zero.
-    # NumberOfPartitionEntries is bounded by what the walk can actually read: 4 chunks of 4 KB.
-    if (gpt_partition_entry_size < 128)          { return 0 - 1; }
-    if (gpt_partition_entry_size > 4096)         { return 0 - 1; }
-    if ((gpt_partition_entry_size & 127) != 0)   { return 0 - 1; }
-    if (gpt_num_partition_entries < 1)           { return 0 - 1; }
-    if (gpt_num_partition_entries > 4096)        { return 0 - 1; }
+    # ⚠ THE BOUNDS ARE THE UEFI SPEC'S, NOT INVENTED: §5.3.2 requires SizeOfPartitionEntry to be
+    # 128 x 2^n (1.57.12: this checked only "a multiple of 128"); 128 is what every real formatter emits.
+    # Capping at one 4 KB chunk keeps `entries_per_chunk >= 1` and makes it divide 4096 exactly, so no
+    # entry straddles two chunks. gpt_geometry_ok has the count and size bounds.
+    # ⚠ 1.57.12: this verdict is NOT a reason to give up on its own — gpt_init checks the header's CRC32 first, and
+    # only a header whose CRC verifies is refused for its geometry; one that does not verify sends gpt_init to the
+    # backup, whatever field the damage hit (every field above is decoded before this check, the CRC's inputs too).
+    if (gpt_geometry_ok(gpt_num_partition_entries, gpt_partition_entry_size) == 0) { return 0 - 1; }
+    # The array cannot sit on the protective MBR (LBA 0) or the header (LBA 1).
+    if (gpt_partition_entries_lba < 2)           { return 0 - 1; }
+    # ⚠ 1.57.12: an array over GPT_ARRAY_MAX_BYTES is WALKED TRUNCATED, not refused (it was refused, and before
+    # 1.57.12 the first 16 KB was listed): UEFI 2.10 §5.3.2 sets no bound on NumberOfPartitionEntries, and a table
+    # that big must not cost the disk its GPT. Only the first 1 MiB is read, counted and listed — whole entries, since
+    # the size divides 4096 — and every walker stops there (gpt_read_chunk refuses a chunk at or past gpt_array_bytes),
+    # so nothing reads further than before. The array CRC32 covers ALL of it and so cannot be checked: gpt_init says
+    # so on its own line and the summary reads arr-CRC-UNVERIFIED.
+    gpt_array_bytes = gpt_num_partition_entries * gpt_partition_entry_size;   # u32 x <= 4096: < 2^44, no overflow
+    gpt_array_truncated = 0;
+    if (gpt_array_bytes > GPT_ARRAY_MAX_BYTES) {
+        gpt_array_bytes = GPT_ARRAY_MAX_BYTES;
+        gpt_array_truncated = 1;
+    }
     return 0;
+}
+
+# 1 = entries of `esize` bytes the walkers can step through, at least one of them; 0 = refuse the GPT. The size is
+# 128 x 2^n up to one 4 KB chunk (UEFI 2.10 §5.3.2), so it divides 4096 and no entry straddles two chunks. The count
+# has no upper bound here (UEFI sets none): the walkers read at most GPT_ARRAY_MAX_BYTES of the array (1 MiB — every
+# formatter writes 16 KB, 128 x 128 B; the bound keeps a hostile header from turning the boot's CRC and walk passes
+# into seconds of reads) and gpt_decode_header truncates a larger one to it.
+fn gpt_geometry_ok(num, esize) {
+    if (esize < 128)                           { return 0; }
+    if (esize > 4096)                          { return 0; }
+    if ((esize & (esize - 1)) != 0)            { return 0; }   # a power of two >= 128 = 128 x 2^n
+    if (num < 1)                               { return 0; }
+    return 1;
+}
+
+# --- 1.57.12: the entry array, one 4 KB chunk at a time ---------------
+# Chunk c is bytes [c x 4096, c x 4096 + 4096) of the array. 4096 is a multiple of both supported LBA sizes, so it
+# starts at LBA gpt_partition_entries_lba + c x 4096 / gpt_lba_bytes and spans 4096 / gpt_lba_bytes LBAs (8 / 1);
+# the last chunk reads only the LBAs the array still covers. Every read lands in the one page gpt_array_buf.
+fn gpt_chunk_count() {
+    return (gpt_array_bytes + 4095) / 4096;
+}
+# Entries held in chunk c (the last chunk may hold fewer than 4096 / size).
+fn gpt_chunk_entries(c) {
+    var ce_per = 4096 / gpt_partition_entry_size;
+    var ce_n = gpt_num_partition_entries - c * ce_per;
+    if (ce_n > ce_per) { ce_n = ce_per; }
+    if (ce_n < 0) { ce_n = 0; }
+    return ce_n;
+}
+# Read chunk c into gpt_array_buf. 0 = read, -1 = out of range or the read failed.
+fn gpt_read_chunk(c) {
+    var rc_off = c * 4096;
+    if (c < 0) { return 0 - 1; }
+    if (rc_off >= gpt_array_bytes) { return 0 - 1; }
+    var rc_len = gpt_array_bytes - rc_off;
+    if (rc_len > 4096) { rc_len = 4096; }
+    var rc_n = (rc_len + gpt_lba_bytes - 1) / gpt_lba_bytes;     # <= 8 at 512 B, 1 at 4 KB: never past the page
+    return blk_read_sectors_on(gpt_tag, gpt_partition_entries_lba + rc_off / gpt_lba_bytes, rc_n, gpt_array_buf);
 }
 
 # --- Phase 3: CRC32 (IEEE 802.3 polynomial 0xEDB88320) ---------------
@@ -167,8 +256,8 @@ fn gpt_crc32(buf, len) {
 # Returns 1 if computed CRC matches stored, 0 otherwise.
 
 fn gpt_validate_header_crc(buf) {
-    if (gpt_header_size < 92)   { return 0; }      # spec minimum
-    if (gpt_header_size > 4096) { return 0; }      # sanity ceiling (LBA size)
+    if (gpt_header_size < 92)            { return 0; }      # spec minimum
+    if (gpt_header_size > gpt_lba_bytes) { return 0; }      # spec maximum: one logical block (1.57.12: was 4096)
 
     # Save bytes 16-19, zero them, compute, restore.
     var saved = load32(buf + 16);
@@ -182,22 +271,19 @@ fn gpt_validate_header_crc(buf) {
 
 # --- Phase 3: partition array CRC validation -------------------------
 #
-# Stream the CRC across the 4 × 4 KB chunks we already iterate during
-# the walk. Returns 1 if computed CRC matches the header's
+# Stream the CRC across every 4 KB chunk of the array (1.57.12: the first
+# 4 only). Returns 1 if computed CRC matches the header's
 # partition_array_crc32, 0 otherwise.
 
 fn gpt_validate_array_crc() {
     if (gpt_array_buf == 0) { return 0; }
-    var entries_per_chunk = 4096 / gpt_partition_entry_size;
-    var chunks            = (gpt_num_partition_entries + entries_per_chunk - 1) / entries_per_chunk;
-    if (chunks > 4) { chunks = 4; }
-    var bytes_remaining   = gpt_num_partition_entries * gpt_partition_entry_size;
+    var chunks            = gpt_chunk_count();
+    var bytes_remaining   = gpt_array_bytes;
 
     var crc = gpt_crc32_init();
     var chunk_id = 0;
     while (chunk_id < chunks) {
-        var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
-        if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) { return 0; }
+        if (gpt_read_chunk(chunk_id) != 0) { return 0; }
         var chunk_len = 4096;
         if (chunk_len > bytes_remaining) { chunk_len = bytes_remaining; }
         crc = gpt_crc32_chunk(crc, gpt_array_buf, chunk_len);
@@ -265,30 +351,58 @@ fn gpt_print_type(lo, hi) {
 # high-half GUID would slip past, but no real GPT writer produces that
 # shape; CRC32-validation in Phase 3 will catch any tampering.
 #
-# Standard layout: 128 entries × 128 B = 16 KB = 32 LBAs = 4 × 4 KB
-# chunks. We loop over chunks because `pmm_alloc` returns single 4 KB
-# pages (no contiguous-multi-page allocator in the kernel yet); each
-# chunk re-reads into the same scratch buffer.
+# Standard layout: 128 entries × 128 B = 16 KB = 4 × 4 KB chunks (32
+# LBAs at 512 B, 4 at 4 KB). We loop over chunks because `pmm_alloc`
+# returns single 4 KB pages (no contiguous-multi-page allocator in the
+# kernel yet); each chunk re-reads into the same scratch buffer.
+# 1.57.12: the walk also builds the used-entry list (gpt_used_dir above) — gpt_init's one pass, and the probes' only.
 fn gpt_walk_all_partitions() {
     var count             = 0;
-    var entries_per_chunk = 4096 / gpt_partition_entry_size;
-    var chunks            = (gpt_num_partition_entries + entries_per_chunk - 1) / entries_per_chunk;
-    if (chunks > 4) { chunks = 4; }     # cap at 16 KB (standard array)
+    var chunks            = gpt_chunk_count();
+    var listing           = 1;      # 0 once a record page could not be allocated: the list stops, the count does not
+    gpt_used_n = 0;
     var chunk_id = 0;
     while (chunk_id < chunks) {
-        var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
-        if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) {
+        if (gpt_read_chunk(chunk_id) != 0) {
             return count;
         }
+        var in_chunk = gpt_chunk_entries(chunk_id);
         var i = 0;
-        while (i < entries_per_chunk) {
+        while (i < in_chunk) {
             var off = gpt_array_buf + (i * gpt_partition_entry_size);
-            if (load64(off + 0) != 0) { count = count + 1; }
+            if (load64(off + 0) != 0) {
+                count = count + 1;
+                if (listing == 1) { listing = gpt_used_add(off); }
+            }
             i = i + 1;
         }
         chunk_id = chunk_id + 1;
     }
     return count;
+}
+
+# Append the used entry at `e` to the list: its type GUID (+0, 16 B), StartingLBA (+32) and EndingLBA (+40).
+# 1 = added, 0 = no memory (the walk stops listing and gpt_init says so).
+fn gpt_used_add(e) {
+    var ua_pg = gpt_used_n / GPT_USED_PER_PAGE;
+    if (ua_pg >= 512) { return 0; }                  # unreachable: a 1 MiB walk holds at most 8,192 entries (64 pages)
+    if (gpt_used_dir == 0) {
+        gpt_used_dir = kmalloc(4096);                # zeroed (heap.cyr): no record page yet
+        if (gpt_used_dir == 0) { return 0; }
+    }
+    var ua_p = load64(gpt_used_dir + ua_pg * 8);
+    if (ua_p == 0) {
+        ua_p = kmalloc(4096);
+        if (ua_p == 0) { return 0; }
+        store64(gpt_used_dir + ua_pg * 8, ua_p);
+    }
+    var ua_r = ua_p + (gpt_used_n % GPT_USED_PER_PAGE) * 32;
+    store64(ua_r + 0,  load64(e + 0));               # PartitionTypeGUID, low 8 bytes
+    store64(ua_r + 8,  load64(e + 8));               # PartitionTypeGUID, high 8 bytes
+    store64(ua_r + 16, load64(e + 32));              # StartingLBA
+    store64(ua_r + 24, load64(e + 40));              # EndingLBA (inclusive)
+    gpt_used_n = gpt_used_n + 1;
+    return 1;
 }
 
 # --- Partition name printer ------------------------------------------
@@ -312,11 +426,19 @@ fn gpt_print_name(name_ptr) {
 
 # --- `parts` shell command implementation ----------------------------
 #
-# Iterate all 4 chunks of the partition array, print one line per
+# Iterate every chunk of the partition array, print one line per
 # non-empty entry: `  [idx] <name>  LBA <first>-<last> (<size> MiB)`.
 # Re-reads disk chunks rather than caching — one `parts` invocation =
-# 4 × 4 KB reads, fine for an infrequent command.
+# 4 × 4 KB reads on a standard array, fine for an infrequent command.
 fn gpt_print_all_partitions() {
+    return gpt_print_partitions_max(0);
+}
+# ⛔ 1.57.12 — THE BOOT DUMP IS BOUNDED. `max` > 0 lists the first `max` used entries and then ONE line naming how
+# many more there are; 0 lists every one (the `parts` verb). main.cyr's boot dump passes GPT_BOOT_LIST_MAX: every
+# console line is a framebuffer paint, and once the walk covered up to 1 MiB of array (8,192 entries of 128 B) a table
+# of 4,096 used entries printed 4,096 lines at boot — measured, see main.cyr's call. The walk stops at the cap, so
+# the boot reads only the chunks up to that entry.
+fn gpt_print_partitions_max(max) {
     if (gpt_present == 0) {
         kprintln("no GPT", 6);
         return 0;
@@ -328,26 +450,36 @@ fn gpt_print_all_partitions() {
     kprintln(" reserved):", 11);
 
     var entries_per_chunk = 4096 / gpt_partition_entry_size;
-    var chunks            = (gpt_num_partition_entries + entries_per_chunk - 1) / entries_per_chunk;
-    if (chunks > 4) { chunks = 4; }
+    var chunks            = gpt_chunk_count();
+    var shown             = 0;
     var chunk_id = 0;
     while (chunk_id < chunks) {
-        var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
-        if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) {
+        if (gpt_read_chunk(chunk_id) != 0) {
             kprintln("  array read failed", 19);
             return 0 - 1;
         }
+        var in_chunk = gpt_chunk_entries(chunk_id);
         var i = 0;
-        while (i < entries_per_chunk) {
+        while (i < in_chunk) {
             var off = gpt_array_buf + (i * gpt_partition_entry_size);
+            if (load64(off + 0) != 0 && max > 0 && shown >= max) {
+                # The cap: one line for the rest (gpt_partition_count counts the same entries this lists).
+                if (gpt_partition_count > shown) {
+                    kprint("  ... and ", 10);
+                    kprint_num(gpt_partition_count - shown);
+                    kprintln(" more -- the `parts` command lists every entry", 46);
+                }
+                return 0;
+            }
             if (load64(off + 0) != 0) {
+                shown = shown + 1;
                 var idx       = chunk_id * entries_per_chunk + i;
                 var type_lo   = load64(off + 0);
                 var type_hi   = load64(off + 8);
                 var first_lba = load64(off + 32);
                 var last_lba  = load64(off + 40);
                 var sectors   = last_lba - first_lba + 1;
-                var size_mib  = (sectors * blk_lba_bytes) / 1048576;
+                var size_mib  = (sectors * gpt_lba_bytes) / 1048576;
 
                 kprint("  [", 3);
                 kprint_num(idx);
@@ -366,18 +498,20 @@ fn gpt_print_all_partitions() {
         }
         chunk_id = chunk_id + 1;
     }
+    if (gpt_array_truncated == 1) {
+        kprint("  (table truncated: entries ", 28);
+        kprint_num(gpt_array_bytes / gpt_partition_entry_size);
+        kprintln(" and up are past the 1 MiB walk bound, not read)", 48);
+    }
     return 0;
 }
 
-# --- Partition-aware helpers (single-chunk reads) --------------------
+# --- Partition-aware helpers -----------------------------------------
 #
-# Query an entry by index. Returns 0 if idx is out of range or the
-# array read fails or the entry is empty. Callers should also check
-# `gpt_present == 1` before trusting these.
-#
-# Each helper costs one 4 KB read per invocation. If callers query
-# multiple fields of the same partition, batch via `gpt_partition_info`
-# instead (returns first_lba, sectors, type-guid-low in globals).
+# gpt_used_info(n): the n-th USED entry of the walked array (slot order,
+# 0 <= n < gpt_partition_count) into the gpt_q_* globals below, from the
+# used-entry list gpt_init built (1.57.12, gpt_used_dir) — no read.
+# Returns 0 if n is out of range or there is no GPT.
 
 var gpt_q_first_lba = 0;     # last queried partition's first_lba
 var gpt_q_last_lba  = 0;
@@ -397,35 +531,36 @@ var gpt_partition_array_crc32 = 0;     # offset 88 u32 — what the disk claims 
 var gpt_alt_lba               = 0;     # offset 32 u64 — backup header location
 var gpt_header_crc_ok         = 0;     # computed header CRC matches stored
 var gpt_array_crc_ok          = 0;     # computed array CRC matches stored
-var gpt_using_backup_header   = 0;     # 1 if primary failed and we recovered via alt_lba
+var gpt_using_backup_header   = 0;     # 1 if primary failed and we recovered via the backup (the device's last LBA)
 
-fn gpt_partition_info(idx) {
+fn gpt_used_info(n) {
     gpt_q_first_lba = 0;
     gpt_q_last_lba  = 0;
     gpt_q_sectors   = 0;
     gpt_q_type_lo   = 0;
     gpt_q_type_hi   = 0;
     if (gpt_present == 0) { return 0; }
-    if (idx < 0) { return 0; }
-    if (idx >= gpt_num_partition_entries) { return 0; }
-
-    var entries_per_chunk = 4096 / gpt_partition_entry_size;
-    var chunk_id          = idx / entries_per_chunk;
-    var slot              = idx % entries_per_chunk;
-    if (chunk_id >= 4) { return 0; }
-
-    var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
-    if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) { return 0; }
-
-    var off = gpt_array_buf + (slot * gpt_partition_entry_size);
-    if (load64(off + 0) == 0) { return 0; }     # empty entry
-
-    gpt_q_type_lo   = load64(off + 0);
-    gpt_q_type_hi   = load64(off + 8);
-    gpt_q_first_lba = load64(off + 32);
-    gpt_q_last_lba  = load64(off + 40);
+    if (n < 0) { return 0; }
+    if (n >= gpt_used_n) { return 0; }
+    var ui_r = load64(gpt_used_dir + (n / GPT_USED_PER_PAGE) * 8) + (n % GPT_USED_PER_PAGE) * 32;
+    gpt_q_type_lo   = load64(ui_r + 0);
+    gpt_q_type_hi   = load64(ui_r + 8);
+    gpt_q_first_lba = load64(ui_r + 16);
+    gpt_q_last_lba  = load64(ui_r + 24);
     gpt_q_sectors   = gpt_q_last_lba - gpt_q_first_lba + 1;
     return 1;
+}
+
+# 1.57.12: the last LBA of the device the GPT is read from (gpt_tag), in its LBAs — where UEFI 2.10 §5.3.2 puts the
+# backup header — or -1 when the block layer does not know that device's size. blk_capacity is the ACTIVE backend's
+# size in LBAs (every blk_register_* stores an LBA count: NVMe's NSZE, AHCI's LBA48 count, USB-MS's last LBA + 1,
+# virtio's and the RAM-disk's 512 B sectors) and there is no per-tag size, so it answers only while gpt_tag is the
+# active backend — as it is in gpt_init, which takes gpt_tag from blk_active. Under 3 LBAs there is no room for a
+# backup past the protective MBR and the primary (and 0 is a size nobody recorded): unknown.
+fn gpt_device_last_lba() {
+    if (gpt_tag != blk_active) { return 0 - 1; }
+    if (blk_capacity < 3) { return 0 - 1; }          # also a "size" >= 2^63, negative here
+    return blk_capacity - 1;
 }
 
 # --- Print summary ---------------------------------------------------
@@ -445,8 +580,12 @@ fn gpt_print_summary() {
     if (gpt_using_backup_header == 1) { kprint(" [backup hdr]", 13); }
     if (gpt_header_crc_ok == 1)        { kprint(" hdr-CRC-OK", 11); }
     else                                { kprint(" hdr-CRC-BAD", 12); }
-    if (gpt_array_crc_ok == 1)         { kprint(" arr-CRC-OK", 11); }
-    else                                { kprint(" arr-CRC-BAD", 12); }
+    # 1.57.12: a truncated array's CRC32 covers more than was read — neither OK nor BAD (gpt_decode_header).
+    if (gpt_array_truncated == 1)      { kprint(" arr-CRC-UNVERIFIED", 19); }
+    if (gpt_array_truncated == 0) {
+        if (gpt_array_crc_ok == 1)     { kprint(" arr-CRC-OK", 11); }
+        else                            { kprint(" arr-CRC-BAD", 12); }
+    }
     kprintln("", 0);
     return 0;
 }
@@ -460,11 +599,18 @@ fn gpt_print_summary() {
 # bad signature) — those are normal conditions, not errors.
 fn gpt_init() {
     if (blk_active == 0) { return 0; }
+    # 1.57.12: the backend and its LBA size, read ONCE — every LBA below is in its units (header above).
+    gpt_tag = blk_active;
+    gpt_lba_bytes = blk_lba_bytes_for(gpt_tag);
+    if (gpt_lba_bytes != 512) {
+        if (gpt_lba_bytes != 4096) { return 0; }   # blk_lba_bytes_ok's two sizes; no other divides a 4 KB chunk
+    }
 
-    gpt_header_buf = pmm_alloc();
-    if (gpt_header_buf == 0) { return 0; }
+    var gh_phys = pmm_alloc();
+    if (gh_phys == 0) { return 0; }
+    gpt_header_buf = dma_kva(gh_phys);
 
-    if (blk_read(1, gpt_header_buf) != 0) {
+    if (blk_read_on(gpt_tag, 1, gpt_header_buf) != 0) {
         return 0;
     }
 
@@ -475,55 +621,109 @@ fn gpt_init() {
     # ⚠ 1.56.51: the return is CHECKED now. gpt_decode_header validates the entry size and count it
     # just read (see its body); both call sites previously discarded that verdict, which made the
     # validation inert — the globals were already assigned by then and the walk used them anyway.
-    if (gpt_decode_header(gpt_header_buf) != 0) {
-        kprintln("gpt: header declares an unusable partition-entry geometry", 57);
-        return 0;
-    }
-    # CMOS kcp = 0x49 (GPT header signature valid + decoded).
-    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x49; 0xE6; 0x71; }
+    # ⛔ 1.57.12 — THE CRC FIRST, THEN THE GEOMETRY. The geometry verdict refused the GPT BEFORE the header CRC was
+    # checked, so a damaged primary whose damage hit SizeOfPartitionEntry / NumberOfPartitionEntries /
+    # PartitionEntryLBA never reached the backup — the one case the backup exists for. A header that fails its CRC is
+    # not trusted for any field (not AlternateLBA either — the backup is the last LBA, below), so its geometry verdict
+    # is moot: it goes to the backup. Only a header whose CRC VERIFIES and whose geometry is unusable is refused
+    # outright (it says what it means).
+    var gi_geo = gpt_decode_header(gpt_header_buf);
 
     # --- Phase 3: validate primary header CRC ---
     gpt_header_crc_ok = gpt_validate_header_crc(gpt_header_buf);
-    if (gpt_header_crc_ok == 0) {
-        # Try backup header at alt_lba. If alt_lba is bogus (0 or out
-        # of range) or backup also fails CRC, give up — the disk's GPT
-        # is unrecoverable and we shouldn't trust the field decode.
-        kprint("gpt: primary header CRC mismatch, trying backup @ LBA ", 54);
-        kprint_num(gpt_alt_lba);
-        kprintln("", 0);
-        if (gpt_alt_lba == 0) { return 0; }
-        if (blk_read(gpt_alt_lba, gpt_header_buf) != 0) { return 0; }
-        if (gpt_validate_signature(gpt_header_buf) == 0) { return 0; }
-        if (gpt_decode_header(gpt_header_buf) != 0) {
-            kprintln("gpt: backup header declares an unusable partition-entry geometry", 64);
+    if (gpt_header_crc_ok == 1) {
+        if (gi_geo != 0) {
+            kprintln("gpt: header declares an unusable partition-entry geometry", 57);
             return 0;
         }
+    }
+    if (gpt_header_crc_ok == 0) {
+        # ⛔ 1.57.12 — THE BACKUP IS THE DEVICE'S LAST LBA, NOT WHERE THE FAILED PRIMARY POINTS. This read the backup at
+        # the primary's AlternateLBA — a field of the very header whose CRC had just failed, so a damaged AlternateLBA
+        # sent the read anywhere: gpt-geometry-smoke's `bad-alt` disk (AlternateLBA 77777, the backup intact at 131071)
+        # printed "trying backup @ LBA 77777", read zeros there and booted with NO GPT. UEFI 2.10 §5.3.2: "If the
+        # primary GPT is invalid, the backup GPT is used instead and it is located on the last logical block on the
+        # disk." The last LBA is the block layer's size of gpt_tag's device minus one (gpt_device_last_lba); a device
+        # whose size is unknown cannot locate its backup and says so. The header found there must name itself (MyLBA =
+        # that LBA — UEFI's header validation and Linux's is_gpt_valid make the same check) and the primary
+        # (AlternateLBA = 1), or it is not this disk's backup header. Every refusal below names itself.
+        var gi_last = gpt_device_last_lba();
+        if (gi_last < 0) {
+            kprint("gpt: primary header CRC mismatch and the device's size is unknown -- ", 69);
+            kprintln("its backup (the last LBA) cannot be located; no GPT", 51);
+            return 0;
+        }
+        kprint("gpt: primary header CRC mismatch, trying backup @ LBA ", 54);
+        kprint_num(gi_last);
+        kprintln(" (the device's last LBA)", 24);
+        if (blk_read_on(gpt_tag, gi_last, gpt_header_buf) != 0) {
+            kprintln("gpt: the backup header could not be read -- no GPT", 50);
+            return 0;
+        }
+        if (gpt_validate_signature(gpt_header_buf) == 0) {
+            kprintln("gpt: no EFI PART signature at the last LBA -- no backup header; no GPT", 70);
+            return 0;
+        }
+        gi_geo = gpt_decode_header(gpt_header_buf);
         gpt_header_crc_ok = gpt_validate_header_crc(gpt_header_buf);
         if (gpt_header_crc_ok == 0) {
             kprintln("gpt: backup header CRC mismatch -- both copies bad", 50);
             return 0;
         }
+        if (load64(gpt_header_buf + 24) != gi_last) {
+            kprint("gpt: the backup header's MyLBA is ", 34);
+            kprint_num(load64(gpt_header_buf + 24));
+            kprintln(", not the LBA it was read from -- no GPT", 40);
+            return 0;
+        }
+        if (gpt_alt_lba != 1) {
+            kprint("gpt: the backup header's AlternateLBA is ", 41);
+            kprint_num(gpt_alt_lba);
+            kprintln(", not the primary's LBA 1 -- no GPT", 35);
+            return 0;
+        }
+        if (gi_geo != 0) {
+            kprintln("gpt: backup header declares an unusable partition-entry geometry", 64);
+            return 0;
+        }
         gpt_using_backup_header = 1;
         kprintln("gpt: recovered via backup header", 32);
     }
+    # CMOS kcp = 0x49 (GPT header signature valid + decoded; 1.57.12: and its CRC and geometry accepted).
+    # asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x49).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x49; 0xE6; 0x71; }
 
-    gpt_array_buf = pmm_alloc();
-    if (gpt_array_buf == 0) { return 0; }
+    var ga_phys = pmm_alloc();
+    if (ga_phys == 0) { return 0; }
+    gpt_array_buf = dma_kva(ga_phys);
 
     # --- Phase 3: validate partition array CRC (streams across chunks) ---
-    gpt_array_crc_ok = gpt_validate_array_crc();
-    if (gpt_array_crc_ok == 0) {
-        kprintln("gpt: partition array CRC mismatch -- proceeding (trust degraded)", 64);
+    # 1.57.12: not over a truncated array — its CRC32 covers entries the walk never reads (gpt_decode_header).
+    if (gpt_array_truncated == 1) {
+        gpt_array_crc_ok = 0;
+        kprint("gpt: table truncated -- the first ", 34);
+        kprint_num(gpt_array_bytes / gpt_partition_entry_size);
+        kprint(" of ", 4);
+        kprint_num(gpt_num_partition_entries);
+        kprintln(" entries are read (1 MiB walk bound); the array CRC32 covers them all and is NOT verified", 89);
+    }
+    if (gpt_array_truncated == 0) {
+        gpt_array_crc_ok = gpt_validate_array_crc();
+        if (gpt_array_crc_ok == 0) {
+            kprintln("gpt: partition array CRC mismatch -- proceeding (trust degraded)", 64);
+        }
     }
 
-    # Re-read first 4 KB of the array (validate_array_crc walked all 4
-    # chunks and left chunk 3 in scratch; re-prime to chunk 0 for the
-    # subsequent walk pass).
-    if (blk_read_sectors(gpt_partition_entries_lba, 8, gpt_array_buf) != 0) {
-        return 0;
-    }
-
+    # (The chunk-0 re-read that stood here is gone: gpt_walk_all_partitions reads every chunk it walks.)
     gpt_partition_count = gpt_walk_all_partitions();
+    if (gpt_used_n != gpt_partition_count) {
+        # 1.57.12: a record page of the used-entry list could not be allocated — the probes see only the first ones.
+        kprint("gpt: out of memory for the used-entry list -- the filesystem probes see ", 72);
+        kprint_num(gpt_used_n);
+        kprint(" of ", 4);
+        kprint_num(gpt_partition_count);
+        kprintln(" used entries", 13);
+    }
     # CMOS kcp = 0x4A (GPT partition array fully walked — Phase 2).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4A; 0xE6; 0x71; }
 
@@ -536,3 +736,151 @@ fn gpt_init() {
     gpt_print_summary();
     return 1;
 }
+
+# === 1.57.12 — where a boot WRITE self-test may write ===
+# nvme_ktest_rw (KTEST), ahci_write_demo (AHCI_RW_DEMO) and msc_write_demo (MSC_RW_DEMO) write LBAs on a disk and
+# put them back. NVMe and AHCI wrote LBA 5 (and NVMe LBAs 20..) — on a 512 B-LBA GPT disk inside the primary
+# partition-entry array (LBAs 2-33), and on a 4Kn GPT disk LBA 5 is the array's last LBA — so a crash between a write
+# and its restore left the GPT damaged; the AHCI and MSC demos never restored at all (MSC wrote LBA 100: on an MBR
+# stick, the post-MBR gap a GRUB core.img lives in). gpt_scratch_lbas_on picks `need` consecutive LBAs that are none
+# of: the protective MBR, the primary header, the primary entry array, any LBA a primary-array entry covers, anything
+# outside First..LastUsableLBA (so not the backup array or header either). On most layouts that is the gap after
+# the array and before the first partition (LBAs 34..2047 at 512 B with 1 MiB alignment); where FirstUsableLBA IS the
+# first partition's LBA (sfdisk on a 4Kn disk: both 256) it is the first free run past the partitions. It reads
+# LBA 1 and the array through the block layer, on backend `tag` and in units of ITS LBA size, into two pages of its
+# own, and changes no gpt_* state (it runs before gpt_init for NVMe). Returns the first LBA of the window; -1 = the
+# disk has a GPT but no such window, or its primary header or entry array does not verify (the caller writes
+# NOTHING); -2 = LBA 1 holds no "EFI PART" (no GPT: the caller keeps its own LBAs, saved and restored). Built only
+# where a write self-test is.
+# ⛔ 1.57.12 (review) — ONE READ OF THE ARRAY, AND ONLY A VERIFIED ONE. The scan re-read the whole array once per
+# window move: an array listing its partitions in descending LBA order moved the window past one partition per pass,
+# so num passes x ceil(num x size / 4096) chunk reads — 4,096 entries in reverse order is 4,097 x 128 reads. And it
+# took the primary array on trust: a damaged array (CRC32 mismatch) could hide the partition the window then landed
+# in. Now the array is read ONCE: its CRC32 streamed (a mismatch, or an array over GPT_ARRAY_MAX_BYTES whose CRC
+# cannot be checked, is -1 with a line saying so) and every used entry's [first, last] LBA range collected into the
+# header page, whose fields are in locals by then — up to 256 ranges. The window search then runs over those ranges in
+# memory: at most ranges + 1 sweeps, no disk read. More than 256 used entries: the first window if none of them
+# overlaps it, else past the highest LBA any of them covers — outside every one (verified, just not the lowest run).
+#ifdef KTEST
+#define GPT_SCRATCH_WINDOW
+#endif
+#ifdef AHCI_RW_DEMO
+#define GPT_SCRATCH_WINDOW
+#endif
+#ifdef MSC_RW_DEMO
+#define GPT_SCRATCH_WINDOW
+#endif
+#ifdef GPT_SCRATCH_WINDOW
+fn gpt_scratch_lbas_on(tag, need) {
+    if (need < 1) { return 0 - 1; }
+    if (blk_is_registered(tag) == 0) { return 0 - 1; }
+    var sw_lb = blk_lba_bytes_for(tag);
+    if (sw_lb != 512) { if (sw_lb != 4096) { return 0 - 1; } }
+    var sw_hp = pmm_alloc();
+    if (sw_hp == 0) { return 0 - 1; }
+    var sw_ap = pmm_alloc();
+    if (sw_ap == 0) { pmm_free(sw_hp); return 0 - 1; }
+    var sw_r = gpt_scratch_scan(tag, need, sw_lb, dma_kva(sw_hp), dma_kva(sw_ap));
+    pmm_free(sw_ap);
+    pmm_free(sw_hp);
+    return sw_r;
+}
+# The scan behind gpt_scratch_lbas_on: `hk` / `ak` are the CPU pointers of its two pages.
+fn gpt_scratch_scan(tag, need, lb, hk, ak) {
+    if (blk_read_on(tag, 1, hk) != 0) { return 0 - 1; }
+    if (gpt_validate_signature(hk) == 0) { return 0 - 2; }
+    var ss_hs = load32(hk + 12);
+    if (ss_hs < 92) { return 0 - 1; }
+    if (ss_hs > lb) { return 0 - 1; }
+    var ss_crc = load32(hk + 16);
+    store32(hk + 16, 0);
+    if (gpt_crc32(hk, ss_hs) != ss_crc) { return 0 - 1; }   # a header that does not verify is no map to write by
+    var ss_first = load64(hk + 40);
+    var ss_last = load64(hk + 48);
+    var ss_elba = load64(hk + 72);
+    var ss_num = load32(hk + 80);
+    var ss_esz = load32(hk + 84);
+    var ss_acrc = load32(hk + 88);
+    if (gpt_geometry_ok(ss_num, ss_esz) == 0) { return 0 - 1; }
+    if (ss_elba < 2) { return 0 - 1; }
+    var ss_bytes = ss_num * ss_esz;                          # u32 x <= 4096: no overflow
+    if (ss_bytes > GPT_ARRAY_MAX_BYTES) {
+        kprintln("gpt: no write window -- the entry array is over the 1 MiB walk bound, its CRC32 uncheckable", 91);
+        return 0 - 1;
+    }
+    var ss_cand = ss_elba + (ss_bytes + lb - 1) / lb;        # the first LBA past the primary entry array
+    if (ss_cand < ss_first) { ss_cand = ss_first; }
+    # The ONE read: CRC32 over every chunk, each used entry's range [lo, hi] into hk (16 B each, the first 256).
+    var ss_chunks = (ss_bytes + 4095) / 4096;
+    var ss_acc = gpt_crc32_init();
+    var ss_n = 0;                                            # used entries seen
+    var ss_top = 0;                                          # the highest LBA any used entry covers
+    var ss_hit = 0;                                          # 1 = a used entry overlaps the first window [ss_cand, +need)
+    var ss_lo = 0;
+    var ss_hi = 0;
+    var ss_t = 0;
+    var ss_c = 0;
+    while (ss_c < ss_chunks) {
+        var ss_len = ss_bytes - ss_c * 4096;
+        if (ss_len > 4096) { ss_len = 4096; }
+        if (blk_read_sectors_on(tag, ss_elba + ss_c * 4096 / lb, (ss_len + lb - 1) / lb, ak) != 0) { return 0 - 1; }
+        ss_acc = gpt_crc32_chunk(ss_acc, ak, ss_len);
+        var ss_i = 0;
+        var ss_in = ss_len / ss_esz;
+        while (ss_i < ss_in) {
+            var ss_e = ak + ss_i * ss_esz;
+            if ((load64(ss_e) | load64(ss_e + 8)) != 0) {              # a used entry (type GUID != 0)
+                ss_lo = load64(ss_e + 32);
+                ss_hi = load64(ss_e + 40);
+                if (ss_lo > ss_hi) { ss_t = ss_lo; ss_lo = ss_hi; ss_hi = ss_t; }   # a reversed entry still covers both
+                if (ss_lo < 0) { return 0 - 1; }                       # an LBA >= 2^63: no map to write by
+                if (ss_hi > ss_top) { ss_top = ss_hi; }
+                if (ss_lo <= ss_cand + need - 1) { if (ss_hi >= ss_cand) { ss_hit = 1; } }
+                if (ss_n < 256) {
+                    store64(hk + ss_n * 16, ss_lo);
+                    store64(hk + ss_n * 16 + 8, ss_hi);
+                }
+                ss_n = ss_n + 1;
+            }
+            ss_i = ss_i + 1;
+        }
+        ss_c = ss_c + 1;
+    }
+    if (gpt_crc32_finalize(ss_acc) != ss_acrc) {
+        kprintln("gpt: no write window -- the entry array's CRC32 does not verify", 63);
+        return 0 - 1;
+    }
+    if (ss_n > 256) {
+        # Too many ranges to keep: the first window if no used entry overlaps it, else past the highest of them (every
+        # used entry ends at or below ss_top).
+        if (ss_hit == 1) {
+            if (ss_top >= ss_last) { return 0 - 1; }
+            ss_cand = ss_top + 1;
+        }
+    }
+    if (ss_n <= 256) {
+        # The lowest free run at or past ss_cand. The window only moves forward, and each sweep that moves it moves it
+        # past one more range, so ss_n + 1 sweeps settle it. A range reaching LastUsableLBA leaves no room past it.
+        var ss_moved = 1;
+        while (ss_moved == 1) {
+            ss_moved = 0;
+            if (ss_cand + need - 1 > ss_last) { return 0 - 1; }
+            var ss_r = 0;
+            while (ss_r < ss_n) {
+                ss_lo = load64(hk + ss_r * 16);
+                ss_hi = load64(hk + ss_r * 16 + 8);
+                if (ss_lo <= ss_cand + need - 1) {
+                    if (ss_hi >= ss_cand) {
+                        if (ss_hi >= ss_last) { return 0 - 1; }
+                        ss_cand = ss_hi + 1;
+                        ss_moved = 1;
+                    }
+                }
+                ss_r = ss_r + 1;
+            }
+        }
+    }
+    if (ss_cand + need - 1 > ss_last) { return 0 - 1; }
+    return ss_cand;
+}
+#endif

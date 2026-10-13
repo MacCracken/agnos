@@ -477,7 +477,8 @@ fn pmm_init() {
     memset(pmm_bitmap_ptr, 0, 8192);              # zero the full 256 MB bootstrap bitmap
     pmm_total = 65536;                            # 256 MB
     pmm_used = 0;
-    # Mark the first 4 MB as used: kernel image + page tables + stacks.
+    # Mark the first 4 MB as used: kernel image + page tables (+ the BSP boot stack, inside the image's .bss
+    # since 1.57.12; a fixed region-1 window before).
     # 1.40.9: was 2 MB (pages 0-511), but the kernel image (LOAD MemSiz) now
     # reaches 0x20F540 — it CROSSED the 2 MB line, so pages 512-527
     # (0x200000-0x210000) are live .bss the old reservation left "free." On iron
@@ -488,9 +489,11 @@ fn pmm_init() {
     # ran on a stack not identity-mapped under the user CR3 → corrupted ret → wild
     # #PF (the 1.40.x ring-3 iron reset: RIP=0x22220202 / CR2 >= 4 GB). Reserving
     # the first two 2 MB regions (pages 0-1023 = 4 MB) covers the >2 MB kernel AND
-    # region 1, which holds the now-FIXED syscall kstack (see syscall_kstack_reserve).
-    # 128 bytes of bitmap = 1024 bits, all 0xFF. NOTE: bump this if the kernel
-    # image ever crosses 4 MB (check `readelf -l build/agnos` LOAD MemSiz).
+    # region 1, which then held the FIXED syscall kstack (see syscall_kstack_reserve; it left
+    # region 1 for region 7 at 1.46.x/1.51.x, and since 1.57.12 region 1 holds only the image).
+    # 128 bytes of bitmap = 1024 bits, all 0xFF. This reservation is exactly the image's ceiling: since
+    # 1.57.12 scripts/check/image-layout-check.sh (check.sh gate 34, build.sh after every build) refuses any
+    # image whose LOAD MemSiz end passes 0x400000 — the top of region 1, below ring-3 code at VA 0x400000.
     memset(pmm_bitmap_ptr, 0xFF, 128);
     pmm_used = 1024;
     # 1.46.1 (per-process kernel stacks): also reserve region 7 — pages 3584-4095 =
@@ -655,8 +658,18 @@ fn pmm_alloc_2mb() {
 # invariant sys_mmap's pmm_alloc_2mb relies on), so a free run is always physically present.
 # Allocated once at boot; never freed. ⛔ A caller must never dereference the returned phys.
 fn pmm_alloc_2mb_run(n) {
+    return pmm_alloc_2mb_run_under(n, 128);         # 256 MB: historical, see the banner (no longer an addressability bound)
+}
+
+# The same top-down search with the ceiling as an argument: regions below `ceil_region`, clamped to the live bitmap.
+# ⭐ 1.57.12 (the second ROOM review, 2026-10-12): room_init's FALLBACK passes pmm_2mb_top_region — the whole live
+# bitmap, every RAM-backed region after pmm_migrate_bitmap — when pmm_alloc_2mb_run finds no free region below 256 MB
+# (fragmented low memory, or a full sub-256 MB pool). The room is CPU-only and reached only through the direct map, so
+# the 256 MB ceiling buys it nothing; top-down keeps it away from the low regions sys_mmap's pmm_alloc_2mb scans first.
+# Every other caller keeps pmm_alloc_2mb_run's ceiling (the banner above says why that is an operator call).
+fn pmm_alloc_2mb_run_under(n, ceil_region) {
     if (n < 1) { return 0; }
-    var ceil = 128;                                  # 256 MB: historical, see the banner (no longer an addressability bound)
+    var ceil = ceil_region;
     if (pmm_2mb_top_region < ceil) { ceil = pmm_2mb_top_region; }
     pmm_spin_lock();
     # `top` = highest region of a candidate run; try the top-most window first.

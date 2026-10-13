@@ -13,7 +13,8 @@
 #
 # ⭐⭐ 1.57.9 (SIZEGATE) — OPERATOR RULING: THIS GATE "IS NOT A HARD LIMIT — IT CAN BE EXPANDED". The
 # hard limit is the layout: image-layout-check.sh (check.sh gate 34, build.sh after every build, CI)
-# — LOAD end <= CEIL = BSP_BOOT_TOP - 64 KB = 0x3D0000 (0x390000 until 1.57.11). Before 1.57.9 the 2 MiB grant here (2,097,152)
+# — LOAD end <= CEIL = REGION1_TOP = 0x400000 (1.57.12; BSP_BOOT_TOP - 64 KB = 0x3D0000 at 1.57.11, 0x390000 before).
+# Before 1.57.9 the 2 MiB grant here (2,097,152)
 # was an arbitrary absolute ceiling that fired FIRST: at 1.57.8 the plain image weighed 2,092,452 B,
 # 4,700 B under the grant, while its LOAD end 0x373108 still had 118,520 B to the wall. A taste
 # number binding ~114 KB before the physical one is the inversion the ruling removes.
@@ -48,15 +49,19 @@
 #     LOAD end = 0x100000 + p_memsz                 flat single PT_LOAD at 0x100000 (gate 34 asserts it)
 #     p_memsz  = p_filesz + ZF                      ZF = cycc's zero-fill, 65,536 (2,568,456 - 2,502,920)
 #     SZ       = p_filesz + TR                      TR = trailing shdrs + shstrtab, 352 (2,503,272 - 2,502,920)
-#     LOAD end <= 0x3D0000 <=> p_memsz <= 0x2D0000 <=> p_filesz <= 0x2C0000 (2,883,584)
-#                          <=> SZ <= 2,883,936 <=> SZK = SZ - FACE <= 2,883,936 - 410,820 = 2,473,116 (WALL)
-#     GRANT    = 0x260000 = 2,490,368 (2.375 MiB) = WALL + 17,252
-#     (1.57.11: the wall moved with the BSP stack, 0x390000 -> 0x3D0000, so GRANT was re-derived from
-#     0x220000 by exactly the 0x40000 the wall moved — the case this header names as the legitimate raise.)
+#     LOAD end <= 0x400000 <=> p_memsz <= 0x300000 <=> p_filesz <= 0x2F0000 (3,080,192)
+#                          <=> SZ <= 3,080,544 <=> SZK = SZ - FACE <= 3,080,544 - 410,820 = 2,669,724 (WALL)
+#     GRANT    = 0x290000 = 2,686,976 (2.5625 MiB) = WALL + 17,252
+#     (1.57.12: the wall moved to the top of region 1, 0x3D0000 -> 0x400000, when the BSP stacks left region 1
+#     — the boot stack is image .bss now, so it is INSIDE the weighed size, and the wall above already counts
+#     it — so GRANT was re-derived from 0x260000 by exactly the 0x30000 the wall moved. 1.57.11 did the same:
+#     0x390000 -> 0x3D0000, GRANT 0x220000 -> 0x260000. Both are the case this header names as the legitimate
+#     raise. 0x400000 is the last wall this layout allows — image-layout-check.sh's header says why.)
 # Between WALL and GRANT the plain image fails gate 34 while this row still passes — gate 34 binds
 # first, by construction; at and above GRANT both are red. So below WALL this row never fails on size:
 # it REPORTS the headroom (~115 KB to the wall at 1.57.9) and gate 34 is what goes red on growth.
-# ⛔ A RAISE IS LEGITIMATE ONLY WHEN THE WALL MOVES (BSP_BOOT_TOP moves, as at 1.57.7, or the face or
+# ⛔ A RAISE IS LEGITIMATE ONLY WHEN THE WALL MOVES (REGION1_TOP / CEIL move — the BSP stack moves of 1.57.7,
+# 1.57.11 and 1.57.12 — or the face or
 # the zero-fill changes). Recompute with the arithmetic above; never nudge GRANT past a red row.
 # ⛔ ORDERING CHECK: the wall depends on FACE, ZF and TR. A SMALLER face (a subset rekha: FACE <=
 # 393,568 B at today's GRANT; at equality this row trips at a weight gate 34 still passes) or a smaller
@@ -65,7 +70,7 @@
 # image-layout-check.sh, the one source; p_filesz/p_memsz from the ELF; FACE from rekha) and the row
 # FAILS if GRANT <= WALL, telling the next editor to re-derive rather than letting the inversion come
 # back silently (the analogue of image-layout-check.sh's "constants inconsistent" assert).
-# Scope: the PLAIN build only. Flag builds are refused past 0x3D0000 by build.sh's per-build layout run
+# Scope: the PLAIN build only. Flag builds are refused past 0x400000 by build.sh's per-build layout run
 # and carry selftest code by design.
 #
 # Mutation record (1.57.9 SIZEGATE; each RED, then restored GREEN on the same image):
@@ -83,7 +88,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 IMG="${1:-}"
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
 LAYOUT="$ROOT/scripts/check/image-layout-check.sh"
-GRANT=2490368   # 0x260000 — derived above (0x220000 until 1.57.11); the ordering check re-proves GRANT > WALL on every run
+GRANT=2686976   # 0x290000 — derived above (0x260000 at 1.57.11, 0x220000 before); the ordering check re-proves GRANT > WALL on every run
 
 [ -n "$IMG" ] && [ -f "$IMG" ] || { echo "no image to weigh ('$IMG')"; echo "FAIL: image '$IMG' not found"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 unavailable"; echo "FAIL: python3 not available — the ELF cannot be parsed, the wall cannot be derived"; exit 1; }
@@ -105,13 +110,15 @@ try:
     src = open(layout, encoding='utf-8').read()
 except OSError:
     src = ''
-top = re.findall(r'(?m)^BSP_BOOT_TOP = (0x[0-9A-Fa-f]+)\b', src)
-bud = re.findall(r'(?m)^CEIL = BSP_BOOT_TOP - (0x[0-9A-Fa-f]+)\b', src)
+# 1.57.12: `REGION1_TOP = 0x...` and `CEIL = REGION1_TOP` (until then `BSP_BOOT_TOP = 0x...` and
+# `CEIL = BSP_BOOT_TOP - 0x10000` — the boot stack's budget under its fixed top).
+top = re.findall(r'(?m)^REGION1_TOP = (0x[0-9A-Fa-f]+)\b', src)
+bud = re.findall(r'(?m)^CEIL = REGION1_TOP\s', src)
 CEIL = None
 if len(top) != 1 or len(bud) != 1:
-    fails.append("FAIL: %s: expected one `BSP_BOOT_TOP = 0x...` and one `CEIL = BSP_BOOT_TOP - 0x...`, found %d/%d — teach this gate the new shape rather than dropping the ordering check" % (layout, len(top), len(bud)))
+    fails.append("FAIL: %s: expected one `REGION1_TOP = 0x...` and one `CEIL = REGION1_TOP`, found %d/%d — teach this gate the new shape rather than dropping the ordering check" % (layout, len(top), len(bud)))
 else:
-    CEIL = int(top[0], 16) - int(bud[0], 16)
+    CEIL = int(top[0], 16)
 # The image's single flat PT_LOAD (gate 34 asserts the same shape).
 loads = []
 if d[:4] == b'\x7fELF' and len(d) > 64 and d[4] == 2:

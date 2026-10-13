@@ -20,6 +20,727 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.12] — 2026-10-09 — the ZFS write path, and the kernel image makes room for it
+
+The roadmap's top item, second half. Operator rulings: 2026-10-09 **read in 1.57.11, write in 1.57.12**; 2026-10-10
+the write design ruled (`docs/development/proposals/2026-10-09-zfs-write.md` § j): **D1 (b) — a write is durable at
+close / sync**, **D2 (a) — snapshotted datasets are written** (deadlists), **D7 (a) — exported pools only**, **D12 —
+full scope, and make room at the wall**, every other decision its recommendation; 2026-10-10 **make room** by moving
+the BSP stacks out of region 1 (compiler DCE blocked on a cyrius bug); 2026-10-11 the standing rule **grow before
+refactor** — a build near the wall moves bulk out of the image, never trims (§ Changed: the BSP move, ROOM). Grounded
+in agnosticos `docs/development/prior-art/zfs-write-prior-art.md` (OpenZFS 2.4, FreeBSD 15.1) and `zfs-prior-art.md`.
+No syscall number minted. **Built, gated, NOT burned.**
+
+### Added
+
+- **The ZFS write path** (`kernel/core/zfs_write.cyr`, `kernel/core/zfs_wenc.cyr`; ABI §3.6;
+  `docs/architecture/zfs.md` § 7 — the rules — and §§ 8–17; the design and every bite's gate / review record in
+  `docs/development/proposals/2026-10-09-zfs-write.md`). On a pool OpenZFS created and EXPORTED — one top-level disk /
+  file vdev, every active feature on the writer's list (design § a.2) — agnos writes transaction groups OpenZFS takes as
+  its own: `zdb -bcc` no leaks, import, scrub clean, `zfs list` accounting exact, OpenZFS writing on top, and
+  `zfs destroy` leaving `freeing` / `leaked` at 0. The mount says `zfs: <pool> rw` or `zfs: <pool> read-only (<why>)`,
+  and `zfs: <pool>/<ds> read-only (<why>)` per refused dataset; **a read-only mount writes not one byte** (G1). Memory: a
+  second, lazy 10 MiB direct-mapped writer area (5 × 2 MiB runs), taken only once the pool's gate passes.
+- **Verbs on `/mnt/zfs`** (no new numbers; ABI §3.6): `open`#7 `AO_WRONLY` / `AO_RDWR` → a writable fd; `AO_CREAT` — a
+  new SA znode, mode `0100644`, uid 0, the parent's gid, the trivial NFSv4 ACL, the final component never followed;
+  `AO_EXCL` tested before `AO_TRUNC`; `AO_TRUNC` to 0 at any size, in as many txgs as its frees need, every block judged
+  before the first. `write`#1 — overwrite, append, extend, sparse (holes), RMW through the reader, an all-zero block a
+  hole on a compressing dataset, OpenZFS's single-block growth and `dnode_increase_indirection`. `lseek`#58 `SEEK_END`
+  reads the ZPL `SIZE`. `mkdir`#9 (a 512 B microzap), `rmdir`#10 (empty only), `unlink`#30, `rename`#31 (one dataset;
+  over an existing name; a directory with its subtree, never under itself), `link`#32 (same dataset, never a
+  directory), `symlink`#63 (1..144-byte targets in the SA bonus). `sync`#12 and `close`#6 commit (policy B, below).
+  Directories of any size: microzaps (512 B growth), the microzap → fat upgrade (a 50..255-byte name, or 128 KiB full),
+  fat ZAPs (leaf splits, the pointer table embedded → external and its doubling across txgs). A dataset's first symlink
+  registers its SA layout in the same txg (`sa_add_layout_entry`; refused until bite B8 — design k.79). An fd carries
+  `ZPL_GEN`: an fd whose object was unlinked or whose number a later create reused answers -1 (D11 (a)).
+- **The commit** (design § d): the dataset phase (data and dataset metadata copy-on-write, born / kill as
+  `dsl_dataset_block_born` / `_kill`), the MOS phase (a new log space map per txg in OpenZFS's format holding every
+  ALLOC and FREE of the txg, `U[]`, the log ZAP with its 512 B growth, refcounts), the MOS chain bottom-up, FLUSH,
+  uberblock T into slot `T % N` of all four labels (a label's own bytes are never written), FLUSH, publish. Checksums
+  are OpenZFS's choice (fletcher4 / sha256 / sha512, D5), `copies` honoured (data `copies`, dataset metadata + 1, MOS 3 —
+  D6), data written uncompressed and metadata ZLE (D4). A failed write or flush makes the pool read-only until reboot,
+  by name (`zfs: commit txg N failed: <why> - pool read-only until reboot`).
+- **Space and accounting.** Per-metaslab allocated + deferred bitmaps rebuilt from the metaslab and log space maps
+  (strict: an inconsistency leaves the pool read-only, named), loaded on demand with eviction; OpenZFS's slop, quota
+  and refquota predicates with in-flight bytes (ERESTART); allocation only in metaslabs with a space map; a txg lowers
+  the space-map histograms its allocations would leave above the true weight (design k.68). Exact deltas for every
+  dataset (`referenced` / `compressed` / `uncompressed` / `unique`), the dsl_dir chain with `parent_delta`
+  (reservations, refreservations), `$MOS`, `$FREE`, user / group / project used (bytes and objects, D3) and feature
+  refcounts. User / group / project quotas are ENFORCED — a write ends SHORT at EDQUOT (object and project quotas once
+  the dataset's accounting upgrade is COMPLETE, as OpenZFS).
+- **Kills and removals.** A last unlink frees its object in the txg; one too big for a txg (≈ 3,400 blocks) goes on the
+  dataset's DELETE_QUEUE (links 0) and **the same call drains it in later txgs** (bite B10, design k.63 / k.111 —
+  FreeBSD's `zfs_rmnode`; one holding an extended-attribute directory stays queued for OpenZFS's next writable mount).
+  A gang / dedup / cloned block — and every kill while `block_cloning` or `fast_dedup` is active — is appended to
+  `free_bpobj` and charged to `$FREE` for OpenZFS's async destroy (D15).
+- **Snapshotted datasets** (bite B9, D2): a block a snapshot (or a clone's origin) still owns goes onto the dataset's
+  deadlist entry by its birth (materialised from the shared `empty_bpobj`), prev-unique and HEAD → SNAP move with it;
+  clones without a livelist are written; the old one-bpobj deadlist format is built. `zfs destroy` of the snapshots
+  afterwards is clean and `usedbysnapshots` exact.
+- **Log hygiene** (bite B10, D10): every txg bumps the clean metaslabs, flushes the dirty one of least U into its space
+  map (OpenZFS's `metaslab_flush`) and destroys the logs older than every U — at most 16 logs alive after any txg on
+  every lane, where without it every txg left one until OpenZFS imported. A MOS gang predecessor is freed in its txg
+  (design k.110).
+- **Policy B — per-fd write coalescing** (bite B11, D1 (b), design k.124): a `write`#1 joins its file's open txg and is
+  **durable at `close`#6, `sync`#12, the death of its process** (committed before the death is published — before the
+  parent can see it exit, reaped or not), **`power_flush`**, a threshold (the 4 MiB data arena, the metadata arena,
+  OpenZFS's in-flight reserve), the 5 s age bound seen at a ZFS entry, and **before any entry that would observe it** —
+  a read / `SEEK_END` / `stat` / `open` / exec of that file, `statfs`, every mutation, a write to another file; a read of
+  another file, `getdents`, `readdir` and `readlink` commit nothing. A ZFS → ZFS `cp` in 64 KiB writes is ONE txg per
+  file (8 × 64 KiB through one fd: 8 txgs under policy A, 1 under B). Nothing commits inside an interrupt handler (owed
+  to the next B1, `zfs_wp_owed`).
+- **Deferred frees released after TXG_DEFER_SIZE = 2 txgs** (design k.125, OpenZFS's `metaslab_sync_done`): a free of txg
+  T is allocatable from T + 3, so space freed during a boot comes back (it stayed deferred for the whole boot before
+  B11), and T − 1 .. T − 3 stay whole whatever T's writes did before its uberblock — OpenZFS's rewind window. A log
+  destroyed inside the window is a GHOST until its txg leaves it (at most 3).
+- **The commit's hold, measured and windowed** (design k.126): by the commit's own clock `fs_lock` is held 15.8–70.6 ms
+  a txg on QEMU/KVM NVMe (ashift9, mean 24.6; main mean 24.0), mean 93.8 ms on AHCI, tails to 2.3 s that are the host's
+  `fdatasync` under load. `kirqw_point` (`io.cyr`) opens a one-instruction interrupt window (`pushfq; clac; sti; nop; cli;
+  popfq` — the caller's exact IF / AC restored) at every device command of the commit and inside the NVMe / AHCI
+  completion polls, at most every 20 µs, on the committing CPU once the scheduler is live — never inside an interrupt
+  handler, never on USB mass storage or virtio-blk: the longest stretch between two windows ≤ 2.94 ms; measured from
+  ring 3 around a 2 MiB close, the committing CPU missed 9 timer ticks without them and none with them. Other CPUs that
+  want `fs_lock` still wait for the whole commit (the ZFS ownership lock is open, design k.132).
+- **UTF-8 names** (design k.128): every new name on a `utf8only` dataset is validated as FreeBSD's `u8_validate` does
+  (`zfs_wenc.cyr` `zfs_u8_valid`) — `café.txt` and a 4-byte character are created; an overlong form, a surrogate, a
+  code point past U+10FFFF, a 0xF5+ lead or a truncated sequence is refused with its class (until B11 any non-ASCII
+  byte was refused).
+- **Refused by name, never silently** (design § a.3; every refused verb also logs `zfs: <verb> refused (<why>)` on the
+  console). The pool stays read-only for: a non-exported pool (a FreeBSD root pool), multihost, a checkpoint, removal /
+  indirect vdevs, mirror / raidz / dRAID / more than one top-level vdev, `ub_version < 5000`, no `log_spacemap`, an
+  unlisted active feature, an unreadable gate input, a write-protected device. A dataset stays read-only when it is
+  encrypted, a clone WITH a livelist, holds bookmarks, is ZPL < 5, normalised / case-insensitive, `readonly=on`, needs
+  ZIL replay or is redacted. An op answers -1 for a name of 256+ bytes or holding a NUL, a symlink target over 144 bytes
+  or holding a NUL, a spill-held SA attribute, a parent microzap past 128 KiB, an SA REGISTRY gap, inheritable ACEs, an
+  xattr / immutable parent, a cross-dataset rename / link (EXDEV), a partial overwrite of a zstd / skein / edonr / blake3
+  block, a data block over 1 MiB, a deadlist agnos cannot write (the `empty_bpobj`'s last reference, a fat deadlist ZAP,
+  256+ keys) and a block whose deadlist appends no txg can hold. ENOSPC (the slop, or the metaslabs with a space map)
+  and EDQUOT end a `write` SHORT.
+- **The write oracle — OpenZFS itself** (design § i). `scripts/tool/zfs-fixture.sh --verify` boots the FreeBSD 15.1
+  guest on the written images: phase A zdb from userland (labels, uberblocks, `-bcc` leaks and DVA errors, `-mmmm`
+  space maps, `-y` the log set, the rewinds `-t T−1` / `-t T−2`, every dataset's objects, the MOS), B import + the
+  expected manifest, `stat`, ACLs and the accounting identities (snapshot accounting against `zfs destroy -n`), C scrub,
+  OpenZFS writing on top and a round trip, D destroying every child one at a time with `freeing` / `leaked` at 0, H the
+  host's space replay in the guest. Host audits h1–h9: `scripts/smoke/lib/zfs-image-audit.py` (h1–h5: labels and the
+  boot region untouched, only the txgs' ring slots changed, refused lanes byte-identical), `zfs-wms-check.py` (h6: the
+  space record replayed in OpenZFS's model), `zfs-uacct-check.py` (h7: `dn_used`, referenced, the dsl_dir breakdowns,
+  deadlists and the accounting ZAPs recounted), `zfs-hole-check.py` (h8: hole births), `zfs-fatzap-check.py` (h9: every
+  ZAP's structure and hashes); with `zfs-sa-check.py` (every touched object against `zfs_mknode` and a FreeBSD twin),
+  `zfs-room-check.py` (a short write against the space record), `zfs-expect.py` (the expected manifest),
+  `zfs-fz-ops.py` / `zfs-orig.py`, and `scripts/tool/zfs-damage.py` (forged pool states for the lanes and the negative
+  proofs). Fixture RECIPE 8 (`r8-4ee74703473a-c579a04a`): the read lanes plus `wr` (snapshots, a clone, quota /
+  reservation / utf8only / copies=2 children), `fz` (fat ZAPs), `edge` / `edgec` (blocks born at every boundary a kill
+  compares), `logs`, `full` (one bitmap slot, at the slop).
+- **Gates.** `scripts/smoke/zfs-write-smoke.sh` (new sweep row, `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 ZFS_WRITE_OPS=1`):
+  the op list (`zfs_wtest`) on 21 lanes — eight read-write pools (ashift9, wr, wr@u0, main, full, full@pre, logs, fz),
+  ashift9 torn / on a grown partition / on AHCI / on usb-storage (each byte-identical to the NVMe lane), a write-error
+  lane, **four crash-cut lanes** (`\boot\cmdline` `zfs_cut=[CLASS:]N` halts the machine after N device writes of a txg:
+  OpenZFS must open the txg before it exactly, or — once one copy of its uberblock landed — the txg itself), and the
+  refused lanes byte-identical; every rw lane through h1–h9 and the host checks, 12 lanes verified by OpenZFS (37 steps
+  each). `zfs-smoke.sh` (row now `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1`) adds the write-gate verdict lines, G1, the
+  metaslab replay against `zfs-wms-check.py` and the in-memory `zfs-wb3:` exercises. `zfs-ring3-smoke` +
+  `tests/zfs/zfsx.cyr` write from ring 3 (clauses 100–161: data, creates, removals and renames, a fat directory, the
+  snapshotted root, policy B; exit 95, 28 refusals by name and in order, the exact final txg, OpenZFS 37/37). check.sh
+  gate 37 grows from 249 to **2,332** host cases — `zfs_wenc.cyr`'s block pointers, ZLE decision, space-map entries,
+  fat ZAP (OpenZFS's own `agnoswr/fat` and `dir3000` histories replayed byte for byte, guard-paged) and UTF-8 validator
+  (`scripts/check/zfs-fatzap.py` the independent model). Build flags `ZFS_WRITE_SELFTEST` (in-memory exercises at every
+  rw mount) and `ZFS_WRITE_OPS` (the op list — test builds only), `build.md`.
+- **check.sh gate 38 — braces balanced (kernel/)** (`scripts/check/brace-balance-check.sh`): cycc 6.6.6 accepts a stray
+  top-level `}` without a diagnostic and silently drops every declaration after it, building `OK` (filed:
+  `cyrius/docs/development/issues/2026-10-11-stray-top-level-brace-silently-ends-the-unit.md`); in the kernel the dropped
+  definitions surfaced as 62 "undefined variable" errors in other files and cost the ZFS writer's B4 a bisect. A pure
+  text walk like gate 35 (strings and `#` comments skipped; each `#ifdef` branch must balance on its own); 97 files
+  balance; a stray `}` appended to `vfs.cyr` turns it red at the exact line.
+
+### Changed
+
+- **kashi 1.0.10 → 1.1.0** (the clone-fallback `KASHI_REF` in `build.sh` / `test.sh` / `bench.sh`, moved together;
+  the sibling path already supplies 1.1.0 to a local build). Additive minor, still on cyrius 6.6.6: a Unicode → CP437
+  map (`kashi_cp437_from_unicode`) and two extension glyphs (U+2026 '…', U+FFFD); cells `0x20..0xFF` of all three
+  fonts are byte-identical to 1.0.10, so the console draws exactly what it drew. The first kashi bump that changes
+  `src/font_data.cyr`: the plain image is **+5,744 B** (2,621,208 → 2,626,952 B; LOAD end `0x38fdb8` → `0x391428`,
+  256,984 B under gate 34), exactly kashi's own measurement. `agnsh-smoke` PASS on it.
+- **The BSP stacks left region 1; the kernel image bound is now the top of region 1, `LOAD end <= 0x400000`**
+  (was `0x3D0000`). Operator ruling 2026-10-10: make room for the ZFS write path (compiler DCE blocked on a cyrius
+  bug). The three fixed region-1 windows — boot stack `[0x3D0000, 0x3E0000)`, guard gap `[0x3E0000, 0x3F0000)`,
+  BSP TSS.RSP0 `[0x3F0000, 0x400000)` — are vacated; region 1 holds only the image. `0x400000` is the last bound
+  this layout allows (VA `0x400000` is ring-3 code in every process; `pmm_init` reserves `[0, 4 MB)`).
+  - **BSP boot stack = `var bsp_boot_stack[8192]`, 64 KB of the image's own `.bss`** (`boot_shim.cyr`). The shim
+    loads it through the statement `bsp_boot_stack_lo = &bsp_boot_stack;` (`48 B8 imm64` / `48 B9 imm64` /
+    `48 89 01`) and the asm block `add rax, 0x10000` / `and rax, -16` / `mov rsp, rax` / `mov rbp, rsp`
+    (`48 05 00 00 01 00` `48 83 E0 F0` `48 89 C4` `48 89 E5`; clobbers RAX, RCX, RFLAGS; RDI preserved). Plain
+    build: `[0x318720, 0x328720)` in the 1.57.12 tree at bite B2 (`[0x30d630, 0x31d630)` at the BSP step — the array moves
+    with the image). No guard page — the lowest 8 KB is a canary red zone (below).
+  - **The boot stack's RED ZONE** (review fix). The array sits inside the image's RW 2 MB identity pages, so an
+    overflow would write the `.bss` global declared just before it, silently — in the BSP step's plain build
+    `syscall.cyr`'s `blk_rw_armed` 48 B below the array (the raw-disk-write gate tests `blk_rw_armed == 0`: garbage arms it), then
+    `BLK_RW_ARM_MAGIC`, `blk_rw_arm_pid` and the 4 KB `blk_sc_bounce` DMA buffer; the neighbour changes with unrelated
+    edits. Linux's `init_stack` has the same shape and carries `STACK_END_MAGIC`, re-read by `schedule_debug()`. Here
+    the lowest `BSP_REDZONE` = 8 KB holds `0x57AC6E9D57AC6E9D` (`proc.cyr` `bsp_stack_redzone_arm`, right after
+    `klog_tsc_boot` in `main.cyr`), and `bsp_stack_redzone_check` re-reads all of it whenever a context leaves the
+    boot stack — `sched_leave_old` (every switch-out of kmain) and `sched_assert_oob` (the boot-only `exec_and_wait` /
+    `kernel_resume`): one changed qword prints `PANIC: BSP boot stack red zone overwritten at 0x… (depth 0x… of
+    0x10000, check 0x…) -- halting` (klug + COM1, in `SMOKE_INVARIANT_DENY`) and halts that CPU, as
+    `stack_canary_check` does. Detection at the next exit, not prevention. 8 KB because a frame larger than the zone
+    could straddle it unseen; gate 34 (7) holds every `.text` frame below `BSP_REDZONE` (and (9), under Fixed, below
+    `0xC00`). 56 KB usable. Proven at run time: a 1 KB-frame recursion to depth `0xf248` (R6), and one ~3 KB
+    PAST the array's floor (R6b), each `PANIC`ked at kmain's first switch-out and failed agnsh-smoke on the deny line.
+  - **BSP TSS.RSP0 = region-7 slot 0** `[0xFC0000, 0xFD0000)`, top `DIRECTMAP_BASE + 0xFD0000` = `0x200fd0000`:
+    `tss_get_cpu_stack` is one formula for every CPU (the `cpu_id == 0` case and `var tss_kernel_stack = 0x400000`
+    are gone); `proc_rsp0_top`'s unassigned-slot fallback is `tss_get_cpu_stack(0)` (was `0x400000`).
+  - **The legacy ELF32 multiboot1 shim is deleted** (`#ifndef ELF64_KERNEL`, unbuildable: every builder defines
+    `ELF64_KERNEL`); it carried two of the three fixed `0x3E0000` stack immediates.
+  - **Boot evidence** (`main.cyr`; `mbi.cyr` `uefi_span_check(bi, lo, hi, mode)` replaces `bootstack_window_check`):
+    `boot: BSP boot stack [0x…, 0x…) inside the loader-pinned image (EfiLoaderCode) OK` (the image span
+    `[0x100000, LOAD end)` is all type 1, and kmain's frame is inside the array) and `boot: region 7 [0xE00000,
+    0x1000000) is free RAM in the UEFI map OK` (types 3/4/7 — every kernel stack; nothing checked it before).
+    `agnsh-smoke` requires both; `SMOKE_INVARIANT_DENY` denies `boot: BSP boot stack not loader-pinned`,
+    `boot: BSP not on its boot stack`, `boot: region 7 not free RAM` in place of `boot: BSP stack window not free RAM`.
+    `SMP_STACK_SELFTEST` prints `smpstk: bsp rsp0=0x200fd0000` (`ap-stack-smoke` asserts it). `KSTACK_HW` paints the
+    BSP stack above its red zone and prints `kstack-hw: bsp boot stack max=0x… of 0xe000 usable`.
+  - **Gate 34** (`scripts/check/image-layout-check.sh`, row `kernel image vs region-1 top (LOAD end <= 0x400000)`):
+    LOAD end `<= 0x400000`; the shim's stack load decoded from the image right after the CP1 stamp, the array inside
+    `.bss` and the stored-to cell exactly the array's end (ties the immediate to `bsp_boot_stack` itself); the source's
+    `var bsp_boot_stack[8192]` and byte-line comments; no `mov esp/rsp, imm` byte line or mnemonic anywhere in
+    `kernel/`, and no `mov rsp, imm64` / `mov esp, imm32` / `mov rsp, simm32` in `.text` loading a value in
+    `[0x100000, 0x400000]`; the RSP0 sites; main.cyr's two spans; (7) the red zone (`BSP_REDZONE`, every frame smaller,
+    the arm and both checks wired); (8) between the entry `jmp` and the shim's first byte only stack-free constant
+    stores — cycc emits the top-level ENUM initialisations there (201 at the BSP step, 228 in the tree at bite B2), ahead of
+    the shim, on gnoboot's stack (CLAUDE.md
+    and `agnos.cyr` said the shim was the first code emitted; both corrected). `--bsp-stack-span IMAGE`
+    (`rbp-repro.sh`'s kmain window). Mutations M1–M9 and R1–R6 each RED (script header): R1 is the review's
+    unaligned `mov rsp, 0x3DFFF0` in `gdt.cyr`, which the first gate passed. `weighed-size-check.sh` parses
+    `REGION1_TOP` / `CEIL`; **GRANT `0x260000` → `0x290000`** (WALL 2,669,724 weighed bytes, +17,252).
+  - Prior art: Linux x86_64 `head_64.S` / `init_stack` (`INIT_TASK_DATA`, `.data`), FreeBSD amd64 `locore.S`
+    `bootstack` (`.bss`), seL4 x86_64 `kernel_stack_alloc` (`.bss`), vidya `boot_and_startup` — the first stack is
+    an image symbol. `docs/architecture/kernel-stacks-and-preemption.md` § Region 1.
+  - **Size:** the BSP step itself: plain image 2,626,952 → 2,695,568 B (+68,616: the 64 KB array + 3,080 B of
+    boot-evidence and red-zone code); LOAD end `0x391428` → `0x3a2030`. The 1.57.12 tree at bite B2 (with the ZFS write
+    bites B0–B2 and every § Fixed item): **2,746,168 B, LOAD end `0x3ae5d8`**. **Headroom under gate 34** (kashi 1.1.0
+    / rekha 0.9.0 siblings) — before the step, after it (pre-ZFS-write, pre-fix figures, kept), and the tree at bite B2 (the final figures: § Closeout):
+
+    | Build | Before (`<= 0x3D0000`) | After the step (`<= 0x400000`) | 1.57.12 at bite B2 |
+    |---|---|---|---|
+    | plain | 256,984 B | 384,976 B | **334,376 B** |
+    | `TEST=1 KTEST=1` | 203,224 B | 331,224 B | **273,728 B** |
+    | `ZFS_SELFTEST=1` | 253,184 B | 381,176 B | **330,576 B** |
+    | `RING3_SELFTEST=1` (the binding sweep build) | 175,120 B | 303,120 B | **252,520 B** |
+    | `EDGE_ABI_SELFTEST=1` | 193,032 B | 321,048 B | **270,432 B** |
+
+    At the step all 38 builds measured passed the gate — plain, `TEST=1 KTEST=1`, every `sweep.sh` row's flag set and the
+    smokes' own (`SMP_STACK_SELFTEST`, `KSTACK_SELFTEST`, `KSTACK_HW`, `FORK_SELFTEST`, `FAULT_SELFTEST`,
+    `BOOTCR3_KEEP_GNOBOOT_CR3`): +127,224 – 128,016 B each (the `KSTACK_HW` / `SMP_STACK_SELFTEST` builds carry the new
+    BSP lines). In the tree at bite B2 all 42 measured pass — the same set with the sweep's ZFS rows now `ZFS_SELFTEST=1
+    ZFS_WRITE_SELFTEST=1` (329,592 B) and `… ZFS_WRITE_OPS=1` (327,056 B), plus `ZFS_SELFTEST=1`, `AHCI_RW_DEMO=1`
+    (330,528 B), `MSC_RW_DEMO=1 MSC_BOUNCE_SELFTEST=1` (326,608 B) and `TEST=1 KTEST=1 THREAD_SELFTEST=1
+    KSTACK_SELFTEST=1` (227,008 B, the least).
+  - **BSP boot-stack depth** (`KSTACK_HW`, a lower bound; measured at the BSP step): 2,040 – 2,280 B to the agnsh
+    prompt (`0x7f8`, `0x888`, `0x8e8` over three boots); `0x638` / `0x688` (1,592 / 1,672 B) through kstack-smoke
+    `-smp 1` / `-smp 4` (the same on the tree at bite B2, re-measured); 3,544 B at most across the seven zfs-smoke lanes
+    (`ZFS_SELFTEST` + `KSTACK_HW`); 5,288 B through doom-smoke's pre-scheduler run (1.57.7, measured from outside) — of
+    the 56 KB usable above the 8 KB red zone.
+- **ROOM — eleven large module arrays left the kernel image for a boot carve-out: +285,040 to +285,056 B of gate-34 headroom on
+  every build** (2026-10-12, after the step's second review). Operator standing rule (2026-10-11), **grow before refactor**: a build near the wall
+  MOVES bulk out of the image — never trims, `#ifdef`s out or dead-code-audits code (`CYRIUS_DCE` is blocked on a cycc
+  bug). The LOAD image's `memsz` counts `.bss`; after the ZFS writer's B7 review the binding build (`ZFS_SELFTEST
+  ZFS_WRITE_SELFTEST ZFS_WRITE_OPS`) had 60,216 B left. `kernel/core/room.cyr` `room_init()` — one call in `main.cyr`,
+  once the direct map is live in kmain's context (after `fb_shadow_init`, whose contiguous run it must not split, and
+  before `pci_scan`) — takes
+  ONE 2 MB pmm region (`pmm_alloc_2mb_run(1)`, top-down below 256 MB; when none is free there, the whole live bitmap,
+  top-down — the second review), reaches it only through the direct map (`dma_kva`, asserted
+  with `dma_kva_ok`: present under `0x1000`, every per-process CR3, the APs and the selftests' shadow CR3s), zeroes it
+  and points each moved array's POINTER at a page-aligned slot after a header page: `pcpu_spawn_elf_buf` 64 KB,
+  `klug_buf` 64 KB, `pci_bar_phys` 48 KB, `pci_devs` 32 KB, `pci_class` and `pci_busfunc` 8 KB each, `sec_wfile_buf`
+  17 KB, `pcpu_elf_hdr_buf` and `pcpu_sc_gpuop` 16 KB each, `lo_ring` 12 KB, `exfat_upcase_buf` 8 KB — 300,064 B, all
+  first touched after the carve-out, all CPU-only. Prior art: Linux `setup_log_buf` / memblock, FreeBSD `msgbufp`
+  carved from `phys_avail` and reached through `PHYS_TO_DMAP`, Linux `LIST_POISON`; `docs/architecture/kernel-image-room.md`.
+  - **Poison pointers, a named failure.** A moved array is `var NAME = 0xFFFFA0SS00000000;` (`ROOM_POISON`, PML4[0x140]
+    in the upper canonical half — mapped under no CR3 — plus slot `SS << 32`); every `&NAME + off` became `NAME + off`.
+    A use before `room_init` is a CPL0 #PF at the poison, and the #PF report (§ Fixed) decodes it: `PANIC: room:
+    lo_ring used before the carve-out -- its pointer is still the poison (room_init, main.cyr) -- halting`.
+    `room_take` refuses a pointer that is not its poison; no free region in the whole bitmap, a pointer outside the
+    direct map, more than 2 MB: each its own `PANIC: room:` line and a halt.
+  - **klug keeps an 8 KB early ring in the image** (`klug_early`, written linearly while `klug_early_mode` is 1, a byte
+    that does not fit counted in `klug_early_lost`) and `klug_move_to_room` moves it into the room ring under the klug
+    lock, IRQs off — Linux's `setup_log_buf`; readers keep the 64 KB geometry. QEMU reaches the move with 1,573 B; an
+    iron boot's pre-move count is unmeasured (the move's line reports it, and any `B LOST`).
+  - **Boot evidence**: `boot: room carve-out [0xea00000, 0xea4b000) at 0x20ea00000 -- 11 arrays, 300064 B moved out of
+    the image (303104 B of page-rounded slots) OK` and `klug: log ring moved to the room carve-out (65536 B); the early
+    ring held 1572 of 8192 B`, both REQUIRED by `agnsh-smoke` (the carve-out's VA must be the direct map, >=
+    `0x200000000`; its counts must equal `room.cyr`'s `room_take` lines); `PANIC: room` and `PANIC: kernel page fault`
+    join `SMOKE_INVARIANT_DENY` (applied by 31 of the 67 smoke scripts the sweep names — spec § k.74 (a), (p));
+    `dma-shadow-smoke` gains `dmash: room PASS` — the room's header and `klug_buf` read, and a word written, under a CR3
+    whose whole pmm identity window is shadowed (the per-process-CR3 property) — and `room.cyr` in its `*_phys` grep.
+  - **Gate 34 (10)** (`image-layout-check.sh`, so also `build.sh` after every build and CI): every `room_take` slot,
+    poison and `room_say` name agree; no `&NAME` is left in `kernel/` (it would now be the address of the 8-byte pointer
+    cell — compiles, corrupts silently); no moved array is declared back (`var NAME[N]`); `room_init();` comes after
+    `pmm_bitmap_use_directmap();` and `fb_shadow_init();` and before the first `pci_scan();`; the #PF stub calls
+    `exc_pf_report` → `room_pf_say`. (1)'s failure text now says grow the room, not shrink the image.
+  - **What the room changed elsewhere, and the review's fixes** (seven findings, all taken; spec § k.74 (i)–(o)):
+    `room_init` runs AFTER `fb_shadow_init` — the console shadow's n contiguous regions are taken first, so the room
+    (one region) cannot split the only free run on fragmented iron (QEMU: shadow `[0xEC00000, 0xFC00000)`, room
+    `0xEA00000`). ext2's coalesced direct-DMA write (1.47.7, `ext2_write_at_dma`) has **no caller** since the room — klug's
+    spill was the only one and `klug_buf` is a direct-map VA its identity bound never admits; the room is CPU-only, so
+    the spill now calls `ext2_write_at` and the dead path is kept and labelled (no dead-code removal before the rewrite).
+    Both ext2 direct-DMA gates require `p > 0`: a poison is a negative i64 their signed bound would have handed to the
+    NVMe as a PRP, a silent bad DMA instead of the named #PF. A `BOOTCR3_KEEP_GNOBOOT_CR3` build's room is at its
+    identity VA — weaker than the image (a ring-3 PT_LOAD can own that slot under its CR3); booted once: no ext2 mount,
+    agnsh exec rc=-1, the emergency shell — exactly as the pre-room tree does (pre-existing; repair or retire is open).
+    The counts left CLAUDE.md for `kernel-image-room.md` and `state.md`.
+  - **Stayed, with the reason** (the doc's table): DMA buffers — `gpu_psp_ring`, `vnet_rx_buf`, `vblk_dma_buf` (the room
+    is CPU-only; they need their driver's own granted pmm pages); arrays used before the pmm — `idt`, `fpu_state`,
+    `pmm_bitmap`; stacks — `bsp_boot_stack`, the kthread / sched-stress pools; `proc_table` (94 hot-path sites for
+    22 KB); kashi's font arrays (sibling repo); the `RING3_SELFTEST` spawn payloads (not the binding build).
+  - **Headroom under gate 34, before → after** (the same tree; the review's fixes cost 128–144 B, the second review's
+    488–504 B): plain 145,520 → **430,560 B** · `TEST=1 KTEST=1` 84,872 → **369,928** · `RING3_SELFTEST=1` 63,664 →
+    **348,704** · `KTEST=1 THREAD_SELFTEST=1 KSTACK_SELFTEST=1 KSTACK_HW=1` 84,272 → **369,312** · `ZFS_SELFTEST=1
+    ZFS_WRITE_SELFTEST=1` 101,216 → **386,264** · `… ZFS_WRITE_OPS=1` 60,216 → **345,256** (the binding build) ·
+    `EDGE_ABI_SELFTEST=1` 81,576 → **366,616**. Plain image after the step: `.bss` −291,728 B, `.text` +5,168 B,
+    `.rodata` +894 B. aarch64 unchanged (32 undefined functions, 17 variables).
+  - **Proven:** ten mutations on a scratch copy, each RED and restored byte-identical (the doc's record): a moved
+    array touched before `room_init` on the kernel CR3 (M1a, `PANIC: room: lo_ring used before the carve-out`) and on
+    gnoboot's (M1b, `pci_devs`); the identity VA of the run (M2, the direct-map assert; M3, past it — `dmash: room FAIL
+    bad=15001`, and agnsh-smoke, which PASSED M3 until its VA check was added); no region (M4); `var pci_class[1024]`
+    back (M5: gate (10), and a `RING3_SELFTEST` build refused); a leftover `&lo_ring` (M6); a wrong poison (M7: gate (10),
+    and `room_take`'s PANIC at boot); the #PF report unwired (M8); a 1 KB early klug ring (M9: `549 B LOST`). GREEN:
+    check.sh 38/38, test.sh 4/4, agnsh-smoke, `KTEST=1 ktest.sh` 372/372, and the 30 sweep rows that own a moved array
+    or a binding build (`SWEEP_JOBS=1 SWEEP_ONLY`), the ZFS write row on the binding build among them — 30 passed.
+    **After the review's fixes:** three more mutations RED (MR1 / MR2: `room_init();` before `fb_shadow_init();` or
+    after `pci_scan();` — gate (10); MR3: a klug move of 0 B — the linear klug-spill row 6 / 2, which the line-agreement
+    check alone and agnsh-smoke's old `held [0-9]+` would both have passed); GREEN: check.sh 38/38, test.sh 4/4,
+    `ktest.sh` plain 367/370 (the three initrd checks), agnsh-smoke, and 21 sweep rows serially (921 s) — the two new
+    klug-spill rows (8/8: 93 lines compared, 31 of them the moved early ring; wrapped 7/7) and the rows whose code the
+    fixes touched or that boot through the new allocation order (DMA shadow `dmash: room PASS` -smp 1 + 4, ext2 WRITE,
+    the ext2 probe, exec-from-disk, spawn, loopback, FAT / exFAT, kstack, VT-d …) — 21 passed. NOT re-run on that source
+    (spec § k.74 (o)): the three ZFS rows, lifecycle, the TCP / socket / ICMP rows, ring-3, threads and the #92 ABI
+    battery (the only owner of `pcpu_sc_gpuop`); and fault-kill, the only row that drives the #PF stub's CPL3 arm, had no
+    recorded ROOM run at all. The second review then ran the ABI battery, TCP hermetic (62/62), fault-kill and fg
+    recovery `-smp 1` on that source — all PASS — and the final-source run below covers the first three again.
+  - **The second review (six findings, all taken; spec § k.74 (p)–(v)).** (1) `build.sh` refused a FLAG image that
+    failed the layout gate but only WARNED for a plain one and left it in `build/agnos`, where every plain-image smoke
+    booted it — harmless while the gate measured only the LOAD end, not for (10)'s class: a leftover `&NAME + off`
+    compiles to the address of the 8-byte pointer cell and corrupts the `.bss` after it, silently (§ Fixed). (2)
+    `room_init` halted the boot when no 2 MB region below 256 MB was free, while every other boot carve-out degrades
+    (`fb_shadow` → direct paint, `kfont` → no `/fonts`, the chan band → `CH_E_NOREGION`); the room cannot degrade but
+    needs no identity VA, so it now searches the whole live bitmap top-down (`pmm_alloc_2mb_run_under`, pmm.cyr) and
+    says so on COM1, halting only when the whole bitmap has no free region. (3) The spec claimed the new `PANIC: kernel
+    page fault` line is denied by every smoke; 31 of the 67 smoke scripts the sweep names apply the list — reworded,
+    with what the other 36 still catch. (4) `state.md` kept the pre-review "+285,544 B on every build". (5) The
+    sentence above claimed its 21 rows were every row that owns a moved array or a changed path; it now says what that
+    run left out. (6) The boot line printed the page-rounded slot bytes (303,104) as the bytes "moved out of the image"
+    while the docs quote the arrays' 300,064; it prints both now, labelled, and agnsh-smoke checks them against
+    `room.cyr`. Found on the way: gate (10) printed its "no `&NAME` left" summary above the very FAIL that said one was
+    left; the summary is a PASS line now. Mutations (scratch copy, each restored byte-identical): N1a (M6 on a plain
+    build: refused, rc 1), N1b (check.sh on N1a's tree: gate 34 `REFUSED:` + the (10) FAIL), N1c (448,000 B of `.bss`,
+    over the bound only: kept with `layout=over-bound`; agnsh, console-line, ext2, hda and shutdown smokes REFUSED),
+    N2a (= M4, `room_phys = 0;`: agnsh-smoke PASS on a room at `0x1dc00000`, VA `0x21dc00000`, the fallback line
+    printed), N2a-dsh (`dmash: room PASS` -smp 1 + 4 on a widened room), N2b (both searches fail: `PANIC: room: no free
+    2 MB region in the whole pmm bitmap …`), N6 (`room_moved` not summed: agnsh-smoke FAIL `'11 0 303104'` vs
+    `'11 300064 303104'`). GREEN on the final source: check.sh 38/38, test.sh 4/4, agnsh-smoke (both room lines; the
+    line's counts `11 300064 303104` equal `room_take`'s), `ktest.sh` plain 367/370 (the three documented initrd
+    checks), `KTEST=1 ktest.sh` 372/372 (13/13 boot self-tests), and 33 sweep rows serially (`SWEEP_JOBS=1 SWEEP_ONLY`,
+    6,103 s of rows): ktest-smoke (-smp 1 + 4), FAT write, exFAT read / write, chain-cycle, the ZFS read + write gate
+    (8/8 lanes), ZFS write on the binding `ZFS_WRITE_OPS` build (16/16 lanes, 7/7 rw pools accepted by OpenZFS), ZFS
+    ring 3, the kernel-embedded face, AP stacks, spawn, lifecycle, virtio-net under KVM, TCP hermetic (62/62), loopback,
+    exec_redirect, ext2 WRITE, both klug-spill rows (8/8, 93 lines compared; wrapped 7/7), the ext2 probe, FS syscalls,
+    exec-from-disk, fault-kill, ring-3 procs, kstack, fg default, DMA shadow (`dmash: room PASS` -smp 1 + 4), VT-d,
+    kernel threads, the #92 ABI battery (177 cases), HDA, console live line, shutdown — 33 passed, 0 failed.
+- **`docs/architecture/zfs-read-only.md` → `docs/architecture/zfs.md`** ("ZFS — the invariants", read and write; its
+  section numbers kept). New § 7 states the write path's rules in one place — G1, the commit order and its two
+  flushes, every allocation made before any write, the durability points, the deferral window, kills, refusals at
+  admission, the hold — in place of the pre-write checklist it held; every pointer in this repo moved with it.
+- **The `zfs: pool …` mount line no longer says "read-only"**: the access verdict is the write gate's
+  (`zfs: <pool> rw` / `zfs: <pool> read-only (<why>)`, then one line per refused dataset).
+- **`statfs`#103 `f_bavail` on a writable pool** is the writer's room — OpenZFS's slop, the deferral window's frees and
+  the metaslabs agnos allocates in — less the pool's allocated bytes (1/32 slop as before on a read-only pool).
+- `sweep.sh`'s ZFS read row is the **ZFS read + write-gate** row (`ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1`: the verdict
+  lines, G1, the metaslab replay, the in-memory exercises); the ZFS write row's label names what it runs since B11.
+- `arch/aarch64/stubs.cyr`: `zfs_fd_write`, `zfs_fd_size`, `zfs_wr_lit` / `zfs_wr_say`, `zfs_wp_close` (shared
+  `vfs.cyr` / `syscall.cyr` reach them; `core/zfs_write.cyr` is x86-only like the reader) — the aarch64 compile debt
+  stays at 32 functions / 17 variables, the identical set.
+- `build.md` documents `ZFS_WRITE_SELFTEST` and `ZFS_WRITE_OPS` (they were in `build.sh` only).
+
+### Fixed
+
+- **A ZFS gang block whose DVA[0] header copy is lost is read from its ditto copy** (`zfs_gang_read`, the 1.57.11
+  reader; found by the ZFS writer's B10 review, design k.120). Every header copy was verified against its OWN vdev and
+  offset; OpenZFS's `zio_checksum_gang_verifier` uses DVA[0]'s identity and the physical birth for every copy
+  (`BP_IDENTITY`, and `dmu_write_policy` gives a gang header ≥ 2 copies), so an intact ditto copy never verified and a
+  lost DVA[0] header failed the read. Proven in memory on main's `gang/gang.bin`: `2 header copies verified against
+  DVA[0]'s identity (1 against their own)` — the copy at DVA[1] verifies only under DVA[0]'s.
+- **`sync`#12 runs ext2's sync under `fs_lock`** (design k.129 (a)). It called `ext2_sync` with no lock — the ext2
+  scratch buffers and the superblock every other ext2 path reaches only under `fs_lock`, as `power_flush` already
+  takes it. Now locked, with the ZFS commit (`zfs_wp_sync`) in the same bracket.
+- **A plain image that fails a layout CONTRACT is refused, not left to boot** (2026-10-12, the second ROOM review).
+  `build.sh` ran `image-layout-check.sh` after every x86_64 build but refused only FLAG images; a plain image that
+  failed got a `WARNING` and stayed in `build/agnos`, so check.sh gate 34 could score it — and every plain-image smoke
+  booted it. That was tolerable while the gate measured only the LOAD end. Since the ROOM step it also holds source
+  contracts whose violation is silent at runtime (gate (10): a leftover `&NAME + off` for a moved array compiles to the
+  address of its 8-byte pointer cell and writes the `.bss` that follows). Now any FAIL other than the bound itself — or
+  a gate that dies without a FAIL line — refuses the plain image like a flag build (`build/agnos.layout-refused`, exit
+  1), and check.sh gate 34 scores the refused image (`REFUSED:` + the FAIL block). A plain image that is only over the
+  bound is still kept for gate 34, but `build/agnos.flags` records `layout=over-bound` (`pass` / `unmeasured`
+  otherwise) and `smoke_require_image` refuses anything but `pass` (`bench.sh` writes `layout=pass` after gating its
+  bench kernel). Gate (10) also stopped printing its "no `&NAME` left" summary above the FAIL that says one is left.
+- **`klug-spill-smoke` is a sweep gate, and a firmware VOID no longer fails it** (2026-10-12, the ROOM review). It had
+  no `sweep.sh` row since it shipped (1.56.10) — yet since 1.57.12 it is the one gate that reads the klug ring byte for
+  byte after the ROOM moved it — and it called the bare `qemu_dwell`, so a `gnoboot: fail @ EBS` attempt sat at the
+  OVMF menu for the whole budget and then failed every assertion against an empty log (the review needed three
+  launches by hand). Two rows now (linear, `KLUG_SPILL_WRAPTEST`); `qemu_dwell_kernel` + `QEMU_DWELL_VOID`, VOID =
+  exit 2; and the moved early ring is a named, counted check (the move's line in the spill, ≥ 10 serial-matched lines
+  before it). agnsh-smoke's klug line requires a non-zero move (`held [1-9]…`).
+- **ext2's direct-DMA gates refuse a non-positive pointer** (2026-10-12, the ROOM review; latent). `(p & 0xFFF) == 0
+  && p + bs <= 0x10000000` is a signed test, so a page-aligned NEGATIVE pointer — every ROOM poison — passed it and
+  would have reached the NVMe as a PRP: a silent bad DMA, not the room's named #PF. Both gates require `p > 0` now.
+  Unreachable before the fix (ext2 mounts long after `room_init`, and klug — the write gate's only caller — no longer
+  opts in), so no behaviour changed.
+- **A kernel-mode page fault says so on COM1** (2026-10-12, found by the ROOM step). Until here the vector-14 stub
+  stamped CMOS 0x54–0x66 and the framebuffer bar for a CPL0 #PF and halted with NOTHING on serial — a silent wedge
+  under every serial-only harness, the class 1.57.6's `exc_df_report` ended for #DF. The stub now calls
+  `exc_pf_report` (idt.cyr) for a CPL0 fault — the same 22-byte call the #DF stub makes, after the CPL3 kill block
+  (`exc_stub` 1,232 of 1,280 B): `PANIC: kernel page fault (#PF at CPL0) rip=… cr2=… err=…`, lock-free (serial only),
+  then the ROOM decode (`room_pf_say`). `PANIC: kernel page fault` is in `SMOKE_INVARIANT_DENY`.
+- **A fallback clone of kashi / rekha is now held to the pin** (`dep_pin_sync` in `build.sh` / `test.sh` /
+  `bench.sh`). From a `.claude/worktrees/<x>` checkout, `$ROOT/../kashi` is not the dev sibling but the clone an
+  earlier build left there — one sat at **kashi 1.0.3** from July while the pin moved to 1.0.10 and 1.1.0, and every
+  worktree build used it. Harmless only while `font_data.cyr` stayed byte-identical (it did, so 1.57.11's image is
+  what its pin says); 1.1.0 ends that. A shallow, clean clone at the wrong `VERSION` is moved to the pinned tag in
+  place (fetch + checkout — never `rm -rf`, the rekha rule); a dirty one is refused; a full checkout (the dev
+  sibling) is used as is, with a note. Proven on a copy of the stale clone (moved 1.0.3 → 1.1.0, then refused
+  once dirtied).
+- **A USB stick with no SYNCHRONIZE CACHE no longer fails every flush** (`msc_blk_flush`). Since 1.33.5 its comment
+  called the CHECK CONDITION / INVALID OPCODE answer "benign (nothing to flush)" while the code returned -1, so every
+  caller that checks a flush (`modeset_latch`, and the ZFS commit, which fails the txg on one) failed on such a
+  device. Now a failed SYNCHRONIZE CACHE with the transport intact is followed by REQUEST SENSE; ILLEGAL REQUEST +
+  ASC 0x20 records "no write cache" in the device's row (+86) and that flush and every later one answer 0 without a
+  command — flush-cache-prior-art.md's "Accept" rule, Linux's `sd_sync_cache`, OpenZFS's `vdev_nowritecache`. Any
+  other failure is still -1. Proven with a scratch build that sent an opcode QEMU's scsi-disk lacks (found by the
+  ZFS write bite B2's review).
+- **No kernel stack frame can step over a region-7 guard page.** `sh_exec` (`user/shell.cyr`) had a 5,152 B frame
+  in every build — the `blkread` verb's `var rbuf[4096]` — larger than the 4 KB not-present guard page at the bottom of
+  each region-7 kernel-stack slot (`kstack_guard_init`), so a frame entered near a slot's bottom put the buffer in the
+  top of the slot below (another live stack) and `blk_read` wrote it without a fault. The verb is now
+  `sh_cmd_blkread`, with a per-call `kmalloc(4096)` buffer (reentrant; every block backend fills a caller buffer by CPU
+  copy from its own bounce page); `sh_exec` is 1,024 B. **Gate 34 check (9)** (`image-layout-check.sh`, also run by
+  `build.sh` after every x86_64 build): every `sub rsp, imm32` in `.text` `<= 0xC00` (the `0x1000` guard less a
+  `0x400` margin; the strict bound is `0x1000 - 32`: the saved rbp and return address above the frame, the next push
+  below it), and `kstack_guard_init`'s one-not-present-page-per-64 KB-slot shape (`(k & 15) == 0`) re-read from
+  `vmm.cyr`; a flag build that fails it is refused. Largest frame now `ksyscall`, 2,176 B, in all 38 builds measured
+  (then `ext2_write_selftest` 1,552, `dhcp_init` 1,328). Mutations G0 (the unfixed tree), G1 (a 5,120 B local; G1f
+  the same under `TCP_SELFTEST=1`: image refused), G2 (a 3,248 B frame — under the guard, over the bound) and G3 (two
+  guard pages per slot) each RED. `docs/architecture/kernel-stacks-and-preemption.md` § Region 7.
+- **`KTEST=1 sh scripts/ktest.sh` reaches its TOTAL: 372 passed, 0 failed** (it stopped after `Syscall write
+  works!`). The KTEST boot self-tests in `core/main.cyr` predated the 1.56.x–1.57.7 process model:
+  - the Syscall test called exit#0 on kmain — the death chain, which never returns: the boot parked in
+    `sched_exit_tail`'s `sti; hlt`. Removed; exit#0 is tested by the Userland Exec test.
+  - the Context Switch test made two ring-0 procs on stacks at `0x810000` / `0x820000` (region 4, PMM-owned memory)
+    whose bodies returned into garbage, and compiled the production proc-table bootstrap out (`#ifndef KTEST`: no
+    idle, no `on_cpu` fences, no kmain pin); the Scheduler test then set `sched_active = 0` for the rest of the boot;
+    the Userland Exec test spawned a READY child with ring-0 selectors and never ran it. With exit#0 removed alone the
+    boot stopped after `smp: cpus online: 1`.
+  - Now the bootstrap runs in every build; `test_proc_a` / `test_proc_b` (`user/test_procs.cyr`) are kthreads (pool
+    stacks, guard pages) that make 10 hlt rounds each and retire (state 0, `sched_exit_tail`); the Scheduler test
+    waits for both, bounded at 500 ticks (`ctxsw: A=10 B=10 of 10 rounds ... -- both threads ran and retired OK`), and
+    leaves the scheduler on; `user_test_proc` runs in ring 3 as kmain's child through `kernel_exec_foreground`:
+    `UUUUUUUUUU` (write#1 from its own stack — it passed a kernel `.rodata` pointer, which write#1 refuses),
+    `Exit code: 42`, `Userland exec complete`. `spawn_user_proc_claim` (`ring3.cyr`) returns the child CLAIMING for
+    that launcher; `spawn_user_proc` is claim + publish, unchanged for its callers.
+  - Tally: plain `ktest.sh` executes 370 and passes 367 — the three `[initrd]` checks need the test initrd, which only
+    a KTEST build creates (`0x6000`); `KTEST=1` passes them and runs two more in `test_initrd`'s open branch: 372/372.
+  - `ktest.sh`'s plain restore build unsets every `build.sh` flag variable: under `KTEST=1` it rebuilt `build/agnos`
+    with `flags=KTEST`, which every plain smoke refuses.
+- **KTEST builds no longer overwrite the boot disk's GPT partition array.** `nvme_rw_demo`'s KTEST round-trips wrote
+  LBA 5 (`CYRIUS!!`) and LBAs 20–27 (a byte ramp) before `gpt_init` — entries 12–15 and 72–103 of the array at LBAs
+  2–33 on a 512 B-LBA GPT disk — so every KTEST boot from `ktest.sh`'s disk printed `parts=34/128 hdr-CRC-OK
+  arr-CRC-BAD` and 33 `(unknown type)` entries (`[12]`, `[72]`–`[103]`). The disk `ktest.sh` builds is a valid GPT
+  (one ESP entry, header and array CRC32 both verify) and `gpt.cyr` decodes the written bytes exactly. Each round-trip
+  now saves its LBAs into a page of its own and afterwards writes them back and re-reads them (`nvme_ktest_restore`;
+  a mismatch prints `nvme: KTEST restore of LBA … FAILED`): `parts=1/128 hdr-CRC-OK arr-CRC-OK`, both round-trips
+  `PASS (original restored)`. The multi-LBA count is one page of LBAs (8 at 512 B, 1 at 4 KB — the fixed 8 was 32 KB
+  of DMA through the 4 KB scratch page on a 4K-LBA namespace). **`ktest.sh` fails a run that changes LBAs 0–33**
+  (0–2047 since the round-trips moved outside the GPT, below; copied out before and after the boot to
+  `build/ktest-logs/gpt-{before,after}.bin`); with the restore disabled the check fails the run on LBAs 5 and 20–27
+  at 372/0.
+- **`ktest.sh` scores the KTEST boot self-tests.** It scored only the suite's `TOTAL:` line, so a KTEST self-test
+  that printed FAIL — or never ran — still ended `RESULT: ALL TESTS PASSED`, rc 0 (measured: the ring-3 child exiting
+  41, `Userland exec FAIL`; thread B stopping at 5 rounds, `ctxsw: A=10 B=5 ... -- FAIL`). When the TEST kernel's
+  `build/agnos.flags` names `KTEST`, 13 pass lines are required — `Syscall write works!`, `HW syscall test: HW-OK`,
+  `ctxsw: … -- both threads ran and retired OK`, `VFS write: OK`, `Initrd: 2 files`, `initrd hello.txt: Hello, AGNOS!`,
+  `initrd test: PASS`, `VFS memfile read: HELLO`, `Exit code: 42`, `Userland exec complete`, the NVMe window line and
+  both NVMe `PASS (original restored)` lines — and their FAIL lines are denied; the NVMe window must lie in LBAs
+  34–2047 (the gap between `ktest.sh`'s entry array and its ESP). Every build must print the intact-GPT summary
+  (`gpt: present, first=34 … parts=1/128 hdr-CRC-OK arr-CRC-OK`), and the disk comparison covers LBAs 0–2047 (was
+  0–33). `KTEST_SMP=N` boots `-smp N` (`smoke_accel` above 1; the `accel:` line). Mutations, each RED: M1 exit 41 and
+  M2 B at 5 rounds (the old script: rc 0 on both), M3 no NVMe write-back (caught at LBA 34; the old 0–33 comparison
+  passed it), M4 the window at LBA 5 (restored, so only the window check sees it), M5 the array CRC forced bad.
+- **GPT on a 4096 B-LBA disk, entry arrays over 16 KB, and the entry size** (`gpt.cyr`). Every GPT LBA field counts
+  logical blocks (UEFI 2.10 §5.3: on a 4Kn disk the array starts at LBA 2 = byte 8192), and the four array walkers
+  read each 4 KB chunk as 8 LBAs at `entries_lba + 8 × chunk`. On a 4Kn NVMe namespace (`blk_lba_bytes_ok` admits
+  4096) that read 32 KB into the 4 KB `gpt_array_buf`, measured: the pages after it — the NVMe queues — overwritten,
+  63 `nvme: I/O stray CID 0 discarded`, two 5 s poll timeouts, `nvme: late completion lost`, the controller disabled,
+  `array read failed`, no partition listed, kybernet 20 s late. `gpt_init` now takes the backend's LBA size
+  (`gpt_lba_bytes`; `gpt_tag` = `blk_active`) and `gpt_read_chunk` reads `4096 / gpt_lba_bytes` LBAs per chunk (8 / 1;
+  the last chunk only the LBAs the array covers). The walk covers `ceil(num × size / 4096)` chunks and stops at entry
+  `num` (it stopped at 4 chunks: a 128 × 256 B table was `arr-CRC-BAD` with entries ≥ 64 never listed);
+  `SizeOfPartitionEntry` must be 128 × 2^n (384 B passed "a multiple of 128" and was walked out of phase),
+  `PartitionEntryLBA` ≥ 2, `HeaderSize` ≤ one LBA (was 4096); `gpt_header_buf` / `gpt_array_buf` are direct-map
+  aliases (`dma_kva`). A second review of this fix found three regressions in it, each measured on the kernel before
+  their fix (TCG, the test disk as the registered NVMe namespace) and fixed: **(M2)** the geometry verdict came BEFORE
+  the header CRC, so a primary whose damage hit `SizeOfPartitionEntry` or `NumberOfPartitionEntries` (CRC not
+  recomputed, backup intact) read `gpt: header declares an unusable partition-entry geometry` and lost its GPT —
+  `gpt_init` now checks the CRC first and only a CRC-VALID header with an unusable geometry is refused (the 384 B lane
+  still is); a failing one goes to the backup: `recovered via backup header`, both partitions. **(M3)** an array over
+  the 1 MiB walk bound was refused outright (UEFI sets no bound on the entry count; before this fix the first 16 KB
+  was listed) — it is now walked TRUNCATED to its first 1 MiB with `gpt: table truncated -- the first N of M entries
+  are read …; the array CRC32 covers them all and is NOT verified` and `arr-CRC-UNVERIFIED` (16,384 × 128 B:
+  refused before; `[0] [1] [8191]` listed after, `[8192]` and up not read). **(M1)** with the walk at up to 1 MiB the
+  boot dump printed one console line per used entry — 4,096 entries: the framebuffer console's backlog paint took
+  149 s and kybernet started at 155 s (157.5 s wall). The boot dump (`gpt_print_partitions_max(GPT_BOOT_LIST_MAX)`)
+  lists the first 16 and `... and 4080 more -- the `parts` command lists every entry` (`parts` lists all): kybernet
+  at 11 s (14.8 s wall). Same class, fixed with it: the FAT, exFAT and ext2 probes read one device LBA into
+  512 B / 1 KB buffers before checking anything — 3,584 bytes past `fatfs_boot_buf`, `exfat_boot_buf` and
+  `ext2_sb_buf` on every 4096 B-LBA backend at every boot; each now refuses a non-512 B backend before its first read
+  (those readers are 512 B-only; a 4Kn device mounts none of the three). `blk_mark_registered(tag, lba_bytes)` (the
+  secondary AHCI and USB-MS registrations) records the backend's LBA size: `blk_lba_bytes_for` fell back to the
+  primary's, so a 512 B secondary behind a 4Kn NVMe was copied out by `blk_read`#77 as 4096 B — 3,584 stale bytes of
+  `blk_sc_bounce`. `nvme_register_block_dev` no longer prints `registered` after a refusal. **New
+  `scripts/smoke/gpt-geometry-smoke.sh`** + sweep row: the test disk on the first of two NVMe controllers (the one agnos
+  registers), the boot ESP on the second; lanes 4Kn (sfdisk `--sector-size 4096`, 3 partitions), 4Kn with 64 × 512 B
+  entries (entry [63]), 512 B with 128 × 256 B entries (entry [100]), and a 384 B table refused (`gpt: header declares
+  an unusable partition-entry geometry` — its CRC verifies); each disk verified on the host first by
+  `scripts/smoke/lib/gpt-image.py verify` and `sfdisk -d`; the pre-fix kernel fails all four lanes (17 checks). The
+  second review added three lanes, RED on the kernel before M1–M3 (the boots above): `bad-primary` (SizeOfPartitionEntry
+  damaged by `gpt-image.py damage`, CRC not recomputed; the host verify must then fail on the primary's CRC and
+  `sfdisk -d` recover the same partitions from the backup), `big` (16,384 × 128 B, truncated) and `many` (4,096 used
+  entries, 16 listed; the 60 s dwell is the bound); `gpt-image.py expect` now models `gpt_init` (CRC before geometry,
+  backup, truncation, the 16-line cap). 51/51, 80 s. An OpenZFS pool (agnostank, ashift 12) on a 4Kn GPT partition
+  mounts all 15 datasets the 512 B lane does (none before).
+- **The filesystem probes reach every used GPT entry, not the first `parts` slots** (`gpt.cyr` `gpt_used_info`;
+  `fatfs.cyr`, `exfat.cyr`, `ext2.cyr`, `zfs.cyr`). The FAT, exFAT, ext2 and ZFS partition probes looped
+  `pi < gpt_partition_count` — the number of USED entries — over `gpt_partition_info(pi)`, which took a SLOT index, so
+  a sparse table was probed in slots 0..count−1 only. Measured: a one-entry table whose partition is slot [100] (an
+  e2fsck-clean ext2, LBAs 2048–34815) printed `parts=1/128` and listed `[100]`, and nothing mounted. `gpt_init`'s walk
+  now records every used entry once (32 B: type GUID, StartingLBA, EndingLBA; 128 to a `kmalloc`'d 4 KB page, the
+  pages' pointers in one more), and `gpt_used_info(n)` — the n-th used entry, in slot order, no read — is the probes'
+  one iterator; the slot-indexed `gpt_partition_info` is gone (its aarch64 stub renamed: 32 undefined functions / 17
+  variables at 47 sites before and after, names unchanged). The probes also re-read the array chunk of every entry
+  they asked for: with 4,096 used entries the gap from `VFS initialized` to the next boot line was 2.51 s, now 1.06 s
+  (TCG; the rest is the ext2 and ZFS probes reading each partition). A list page that cannot be allocated is said:
+  `gpt: out of memory for the used-entry list -- the filesystem probes see N of M used entries`. After:
+  `ext2: probe matched backend=2 partition_lba=2048`, `ext2: mounted (blocksize=4096, …)`. New `gpt-geometry-smoke`
+  lane `sparse` (the ext2 built by `mke2fs` on its own file, `e2fsck -fn`-clean, copied in and compared back): 2 checks
+  RED before, green after.
+- **A primary GPT header that fails its CRC is recovered from the device's LAST LBA** (`gpt.cyr` `gpt_init`,
+  `gpt_device_last_lba`). The backup was read at the primary's AlternateLBA — a field of the header whose CRC had just
+  failed. Measured: AlternateLBA damaged to 77777 (CRC not recomputed, the backup intact at LBA 131071) printed
+  `gpt: primary header CRC mismatch, trying backup @ LBA 77777`, read zeros, and the disk booted with no GPT. UEFI 2.10
+  §5.3.2 puts the backup on the last logical block: it is now read at `blk_capacity − 1` of `gpt_tag`'s device —
+  `gpt: primary header CRC mismatch, trying backup @ LBA 131071 (the device's last LBA)`, `gpt: recovered via backup
+  header`, both partitions — and must carry MyLBA = that LBA and AlternateLBA = 1, else `gpt: the backup header's
+  MyLBA is N, not the LBA it was read from -- no GPT` / `gpt: the backup header's AlternateLBA is N, not the primary's
+  LBA 1 -- no GPT`. A device whose size the block layer does not know (`blk_capacity` < 3, or `gpt_tag` no longer the
+  active backend) refuses recovery by name: `gpt: primary header CRC mismatch and the device's size is unknown -- its
+  backup (the last LBA) cannot be located; no GPT`; the two silent refusals (the backup unreadable, no `EFI PART`
+  there) now say so. `gpt-image.py expect` models the same. New `gpt-geometry-smoke` lane `bad-alt` (`gpt-image.py
+  damage --at 32`; the host verify must fail on the primary's CRC and `sfdisk -d` recover both partitions): 8 checks RED
+  before (and `bad-primary`'s backup line, whose text gained the suffix, 1), green after; the smoke is 69/69 over nine
+  lanes, ~130 s of boots.
+- **The write self-tests write outside the GPT and put back what they wrote.** `gpt_scratch_lbas_on(tag, need)`
+  (`gpt.cyr`, built only with `KTEST`, `AHCI_RW_DEMO` or `MSC_RW_DEMO`) returns `need` consecutive LBAs on a backend
+  that are none of the protective MBR, the primary header and entry array, any partition the array lists, or outside
+  First..LastUsableLBA — read through the block layer in that backend's LBA units; -1 = a GPT but no such window or a
+  header or entry array that does not verify (nothing is written), -2 = no GPT (the caller's own LBA, saved and
+  restored). It reads the array ONCE (review M4): it re-read the whole array per window move, and an array listing
+  its partitions in descending LBA order moves the window one partition per pass — 4,096 such entries (KTEST, TCG)
+  took 56.5 s before the round-trip line, now 0.12 s, same window — and it took the array on trust: a primary array
+  whose entry [0] (LBAs 34–4095 in the CRC'd copy and the backup) was zeroed got `LBAs 34 and 35..42`, inside that
+  partition; now `gpt: no write window -- the entry array's CRC32 does not verify` and the round-trips are skipped.
+  One pass streams the CRC32 and keeps up to 256 used ranges in memory (the lowest free run, ≤ 257 sweeps, no disk
+  read); more → the first window if no entry overlaps it, else past the highest; an array over 1 MiB → -1. KTEST's
+  NVMe round-trips moved from `nvme_rw_demo` into `nvme_ktest_rw`, after `nvme_register_block_dev`:
+  `nvme: KTEST round-trip LBAs 34 and 35..42 (outside the GPT and every partition)` on `ktest.sh`'s disk, a crash
+  between a write and its restore no longer touches the GPT. `ahci_write_demo` wrote its sentinel to LBA 5 (GPT
+  entries 12–15) and left it (measured: `sgdisk -v` "Main partition table CRC mismatch"); it now runs after
+  `ahci_register_block_dev`, saves the LBA and restores it verified (`ahci_demo_restore`): LBA 34, the SATA disk
+  byte-identical after the boot, `sgdisk -v` clean. `msc_write_demo` (LBA 100, never restored — on an MBR stick the
+  post-MBR gap a GRUB core.img lives in) the same: LBA 34 on a GPT stick (byte-identical after), LBA 100 on
+  `msc-cdb-smoke`'s stick, which has no GPT — its expected line is now `msc: LBA100 write-then-read round-trip PASS
+  (original restored)` (49/49).
+- **A dead kthread's pool slot is handed out again** (`proc.cyr` `kthread_slot_free`). `kthread_create` advanced a
+  cursor, so the 4-slot pool held 4 kthreads per boot: KTEST + `THREAD_SELFTEST` printed `Process B (pid=-1)`,
+  `ctxsw: A=10 B=0 ... -- FAIL` and failed the suite's flock T9b (2 failures); with `KSTACK_SELFTEST` at -smp 4 also
+  `kstack: FAIL preempt rmw: no kthread slot (free=0)`. Each slot records its kthread as pid + 1 and `proc_epoch[pid]`;
+  it is free again when the epoch moved or the kthread is state 0 with `on_cpu == -1` (the switch tail's release,
+  after the CPU left the stack). The KTEST context-switch threads are created by the Scheduler Test on the live
+  scheduler, after the other self-tests retired theirs, both before the first console line (`ktest_kthread_create`,
+  with a 20-tick retry), and the test waits until both left their CPUs. A kthread is retired by ITSELF (state 0 on its
+  own CPU, then `sched_exit_tail`) or through `kthread_retire`, which stores the 0 under `sched_lock`, and
+  `kthread_slot_free` reads state and `on_cpu` as one snapshot under `sched_lock` (review M5, latent: THREAD_SELFTEST
+  and KSTACK_SELFTEST's rmw pair were retired by kmain with a bare `proc_set_state(pid, 0)`, which can land inside
+  another CPU's `do_context_switch` revive of a running `old` — two loads, then the store of 1 — and be lost; an
+  unlocked reader that saw that 0 and then the switch-away's `on_cpu = -1` would hand out the stack of a READY
+  thread). KTEST + `THREAD_SELFTEST` + `KSTACK_SELFTEST` at -smp 4: `kstack: preempt rmw OK`
+  (`kthread_free_before=3`), `ctxsw: A=10 B=10 ... OK` (interleaved), flock T9b PASS, 367/0 and 13/13; KTEST +
+  `THREAD_SELFTEST` at -smp 1: 372/0.
+- **aarch64 stub `spawn_user_proc_claim`** (`arch/aarch64/stubs.cyr`; -1, as `spawn_user_proc`). Measured: the aarch64
+  compile reads 32 undefined functions / 17 variables before and after, plain and with `KTEST` (a `#define` prep —
+  `build.sh --aarch64` takes no flags), names unchanged: the one caller is `core/main.cyr`, which aarch64 does not
+  include. With `TEST` it reads 78 / 17 before and after (`user/test.cyr`'s x86 references, pre-existing).
+- **Sweep rows for `ktest.sh` and the GPT geometry.** No row anywhere ran `scripts/ktest.sh`.
+  `scripts/smoke/ktest-smoke.sh` runs `KTEST=1 sh scripts/ktest.sh` at -smp 1 and -smp 4 (372/0 and 13/13 at both;
+  62 s); `gpt-geometry-smoke.sh` 49 s (80 s with the second review's three lanes); `sweep.sh` has 69 rows (67
+  before). The § Changed BSP numbers and
+  `image-layout-check.sh`'s Shipped record now carry this tree's measurements, the BSP-step figures kept and labelled.
+- **The full sweep no longer kills the ZFS write row at 25 min** (`sweep.sh` `sweep_row_ceiling`; found by B12's full
+  sweep, design k.134). Every parallel row ran under the one `SWEEP_ROW_TIMEOUT` (1500 s), and `zfs-write-smoke` takes
+  ≈ 81 min (4,875 s alone at the B10 / B11 merge), so the documented `sh scripts/sweep.sh` could only score it
+  `ROW TIMEOUT` and re-run it serially after the parallel phase: a red row and ≈ 80 min of tail on a green kernel. A
+  smoke now declares its own ceiling in its header (`# sweep-row-timeout: <s>`; kselftest's per-collection `settings`
+  `timeout=`, Bazel's `timeout = "long"`), and its row runs under max(`SWEEP_ROW_TIMEOUT`, `<s>`) — a declaration only
+  raises the ceiling. `zfs-write-smoke.sh` declares 7200 s.
+- **A relative `open`#7 name of 255+ bytes is refused** (`syscall.cyr`; found by the ZFS writer's B6 review). The
+  relative → absolute normalisation (1.54.11: `/` + the name, into a 256-byte per-CPU slice) copied at most 254 bytes
+  and opened THAT, so `AO_CREAT` on a long relative name created a different, truncated name — on ext2 since 1.54.11,
+  on ZFS once B6 made creates. Now -1 (ABI §3.1); tests/zfs's exerciser asserts both the -1 and that the truncated name
+  does not appear.
+- **`symlink`#63 refuses a target holding a NUL byte** (`ext2_symlink`; ZFS's `zfs_wcreate` the same, by name). The
+  target is length-delimited text, but every other writer takes a C string, so no FreeBSD / Linux filesystem carries
+  one and a lookup stops at it (ABI §3.2).
+- **The image-layout gate's frame scan is anchored on cycc's prologue** (`image-layout-check.sh` (7) / (9)). A bare
+  `48 81 EC` byte search also matched the rel32 of a `call` whose displacement happened to be `0xFFEC8148`, and refused
+  the `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1` build for a 6 MB "frame" that does not exist. Frames are now the
+  `push rbp; mov rbp, rsp; sub rsp, imm32` prologues (2,374 of 2,374 `sub rsp` in that build); any other `48 81 EC`
+  must be inside a `call` / `jmp rel32` landing on a prologue, or the gate fails. A 5,168 B frame still fails (9).
+- **The ZFS writer's own defects, found by its gates and reviews before this release shipped it** (design § h's records
+  and § k; one line each, the effect first):
+  - **(B11 review, CRITICAL — k.131 (a)) Another process's acknowledged policy-B writes could be DROPPED on SMP**: a
+    multi-txg `write`#1 or truncation released `fs_lock` between txgs, another CPU's write left a pending txg in the gap,
+    the next txg's refusal threw it away and its close answered 0. The entry rule re-runs after every yield, every op
+    that opens a txg commits a pending one first (`zfs_wp_own`), and a drop is never silent (named; EIO at close).
+  - (k.131 (b)) "Durable at exit" held only for orphans and processes reaped at once — a zombie's pending txg waited for
+    a `waitpid` that might never come; it now commits at the DEATH (`zfs_release_pid` in `proc_death_release`).
+  - (k.131 (c)) A killed orphan's pending txg committed INSIDE the timer ISR (IF=0, up to a whole commit); it is owed to
+    the next B1 instead (`zfs_wp_owed`).
+  - (k.131 (e)) `power_flush`'s final commit opened interrupt windows over `power_stop_final`'s deliberate IF=0
+    (`zfs_wirq_no`).
+  - (k.131 (f), (g)) A dirty set could outlive its op and be dropped by the next one; a continued txg's grown block 0
+    could commit charged at its OLD size — both fixed (the fresh txg dropped; `zfs_wf_gsz` charges before it applies).
+  - (k.131 (h), (i)) `stat` / `lstat`, `SEEK_END` and `statfs` returned the pre-write size or space when their
+    commit-before-observe failed (now -1); a failed deferral release after the uberblock was durable made close / sync
+    answer EIO for writes that were on disk (now 0, the pool read-only by name).
+  - (k.129 (b)) A write meeting ERESTART at its first block after a block-0 growth answered -1 near the slop; the growth
+    now commits and the write goes on in the next txg.
+  - (B10 / B11 merge, k.133 (a), major) A destroyed log's GHOST outlived its blocks once B11 released frees: a metaslab
+    load could walk reallocated blocks (a failed load, the pool read-only) and released units were re-deferred. Ghosts
+    are made only inside the deferral window and retired with it (≤ 3).
+  - (k.122 → k.133 (a)) Ghosts were never retired: after ≈ 2,000 txgs a boot's hygiene stopped for good, the logs climbed
+    to `ZWK_MAXLOG` and every later commit was refused. Gone with the window's retirement.
+  - (k.133 (b), (c), (d)) The SM-append deferral rule (B11's form) could re-defer released units until an eviction; the
+    publish's tail (the release, hygiene's dry flush — a metaslab load) ran outside the hold and its interrupt windows;
+    B11's admission predicate reached hygiene's reserved arena. All three reconciled at the merge.
+  - (k.108 / k.117 (1)) The deferred bitmap's SM-append rule was wrong once logs are destroyed: a reload could hand out a
+    range T − 1 / T − 2 still reference. Replaced by ghosts.
+  - (k.119, B10 review) A txg its admissions filled skipped hygiene's first flush; a long truncation or drain could carry
+    the logs to `ZWK_MAXLOG`, then every commit was refused — a write lockout for the boot. Hygiene owns 384 KiB of the
+    metadata arena (`ZWL_HAR`) and the extent list's share; the log limit is judged after the plan.
+  - (k.121) A refused log destroy left an obsolete log both oracles reject; it is now a named commit failure.
+  - (k.117 (3), (4), (6)) The flush's fit ignored admission reserves (18 logs alive); a txg could move a U past a log and
+    lack the room to destroy it; the destroy's room check counted the dataset phase twice and refused every destroy on
+    2 MiB write txgs. Each fixed and pinned by the smoke's log bound.
+  - (k.107 (a)–(f), the ROOM / B8 / B9 merge) The fat-accounting ZAPs' deadlist count covered one BP; B8's commit
+    reserve fell out of five of B9's sums; a fat accounting ZAP's growth past its first indirect in a snapshotted dataset
+    was deadlisted uncounted in the commit (now refused at admission); the op list's name table overlapped the deadlist
+    tables (122 of `dir3000`'s 187 unlinks failed — test state, its own region now).
+  - (B9 review, k.99–k.102) A truncation's deadlist refusals ran in whichever later txg first reached a block (the pool
+    read-only from inside a commit); every deadlist load and refusal is now an op's, at admission, predicted per block
+    path (`zfs_wdl_path`); branch B tests `ds_prev_snap_txg ≥ TXG_INITIAL` itself; a rolled-back free restores the
+    deadlist counts.
+  - (k.96) A deadlist append of an embedded BP took the payload length as its PSIZE (OpenZFS counts 0).
+  - (B8 review, k.88, major) A pointer-table doubling's last step could swallow a failed free and commit a header OpenZFS
+    never writes — its next `zap_table_grow` would copy a LEAF over the new table and lose entries. The old table is
+    freed first, through the kill list, all or nothing; a doubling's switch no longer dirties every old block (a 128-block
+    switch stayed mid-grow for good); MOS ZAP growth refused before anything changes (k.85); production's ZAP salt is
+    RDRAND-mixed, not computable from the objset and txg.
+  - (k.89) A foreign accounting ZAP shape (`zap_flags`, a normalised microzap) was refused INSIDE the commit — the pool
+    read-only on the first op of every boot; now judged at admission.
+  - (k.87 (a), (b)) The fat accounting reservation over-reserved 256 KiB, refusing every create in a dataset with fat
+    user and group ZAPs (`a create does not fit a txg`); the op list's name buffer was 64 BYTES for 255-byte names (a
+    stack overwrite in test code).
+  - (k.70, B7 review) A truncation or unlink deferring kills to `free_bpobj` (any `block_cloning` / `fast_dedup` pool,
+    gang / dedup objects) ran the commit out of metadata (`dirty metadata full`, the pool read-only); `free_bpobj`'s
+    appends are budgeted at admission.
+  - (k.68, B7 gate) A txg's allocations could leave a metaslab's stored space-map histogram above its true weight — a
+    debug OpenZFS import panics loading it, `zdb -mmmm` aborts; the txg now lowers those histograms.
+  - (B7 review (1), k.71) A link's or rename's NEW name was never judged: a NUL in it made a microzap OpenZFS VERIFYs on
+    (`mzap_open`), a non-ASCII one passed on `utf8only`; and path operands were read several times (a second thread
+    could change the name kept after the name checked). One name check (`zfs_wname`); every operand copied once
+    (`zfs_upath`).
+  - (B6 review) The trivial-ACL masks were right for modes 0644 / 0755 only (the ABI's only ones); a create on a 2 KiB
+    objset OpenZFS grows in memory would lack PROJID; object / project quotas were enforced before the dataset's upgrade
+    COMPLETED — each now as OpenZFS.
+  - (B5 review, four majors) A truncation's kill list overflowed the extent list, log T was sized from dirty blocks alone,
+    the room counted metaslabs agnos never allocates in — each a commit failure that left the pool read-only — and one
+    `write`#1 held `fs_lock` across all its txgs (≈ 2.5 min for 1 GiB); now measured, bounded and released between txgs.
+  - (B4 review) Policy refusals (a gang / dedup / snapshot-owned accounting ZAP block, a full microzap) fired INSIDE the
+    commit; judged when dirtied. (B2 review) One crash mid-commit (a torn T0 + 1 slot) left the pool read-only for agnos
+    for good — the gate scored a native slot on its magic alone; now only when its eck verifies, as OpenZFS.
+    (B3a review) A metaslab load inside an allocation overwrote the dnode slots its caller held (the loader has its own,
+    `ZWA_LDN`); a free of a dedup or crypt-bit BP was not refused.
+  - The oracle's own (each found because a correct pool went red, or a broken one green): h3 passed a re-published MOS
+    (B3b review); B-acct's allocated identity ignored reservations, and a wrong refreservation split was invisible until
+    phase D (B4 review: h7 reads every dsl_dir's breakdown, identity 6); h6 / h7 compared logical births, not
+    `BP_GET_BIRTH` (k.105); the clone identity assumed `referenced − usedbydataset` constant (k.106); the smoke read the
+    serial log through `strings`, cutting every UTF-8 op line (k.129 (c)); the guest verify's 8-lane cap (k.129 (h): two
+    batches); the host audit asked a ring for more txgs than it holds (k.107 (e)).
+- **Size:** plain image 2,695,568 → 2,695,624 B; LOAD end `0x3a2030` → `0x3a2068` (headroom 384,920 B) for the three
+  defect fixes above the ktest-scoring bullet, measured before the ZFS write bites (B0–B2) merged — pre-fix figures,
+  kept. This tree (B0–B2 and every fix above, the second review's M1–M5 included): **2,746,168 B, LOAD end
+  `0x3ae5d8`, headroom 334,376 B** under gate 34 (2,744,608 B / `0x3adfc0` / 335,936 B before M1–M5). With the GPT
+  used-entry list and last-LBA backup (the two bullets after the GPT geometry one): **2,748,056 B, LOAD end
+  `0x3aed38`, headroom 332,488 B**.
+
+### Closeout
+
+- `build/agnos` **2,754,592 B** (+133,384 B over 1.57.11's 2,621,208 B: the ZFS writer, the BSP move's 64 KB array and
+  red zone, every § Fixed item; the ROOM's 300,064 B left `.bss`, which the file never held). LOAD end **`0x3b06c0`** —
+  **325,952 B** under gate 34's `0x400000` (262,728 B under 1.57.11's `0x3D0000`). Every flag build through
+  image-layout (headroom; re-measured at B12 on the swept tree — every figure equal to the B10 / B11 merge's):
+  plain 325,952 · `TEST=1 KTEST=1` 265,320 · `RING3_SELFTEST=1` 244,096 · `KTEST=1 THREAD_SELFTEST=1 KSTACK_SELFTEST=1
+  KSTACK_HW=1` 264,704 · `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1` 267,008 · **`… ZFS_WRITE_OPS=1` 183,904 (binding)** ·
+  `EDGE_ABI_SELFTEST=1` 262,008. The writer area is pmm memory (10 MiB, only on an rw mount), not image.
+- **Gates on the final tree:** `check.sh` **38/38** · `test.sh` (x86) **4/4** (`--aarch64` 0/1: the compile, 32
+  undefined functions / 17 undefined variables at 47 sites, the same set as 1.57.11) · `sweep.sh` (PARALLEL, 4 workers,
+  **5,485 s** wall clock, parallel phase 4,961 s) **71/71**: 69 in the run; `doom` and `naad-ring3` failed in 6–7 s
+  because the run's environment named no `DOOM_ROOT` / `NAAD_ROOT` and a worktree's `$ROOT/..` holds neither sibling,
+  and each PASSED on its one re-run (`SWEEP_ONLY`, `SWEEP_JOBS=1`, the sibling paths set — naad's a scratch copy, so
+  its `build/naadex` never touched the sibling repo); two rows passed on the serial retry, `hid-mouse-deferred` and
+  `pipeline`, VOID in the parallel phase because their worker copy's QEMU monitor socket path exceeds the 108-byte
+  `sun_path` (as at 1.57.11; environmental). The ZFS write row **PASSED in 4,953 s** under the ceiling it now declares
+  (§ Fixed, k.134): 21/21 lanes, OpenZFS verify 12/12 (37 steps each); `zfs-smoke` 8/8 (139 s), `zfs-ring3-smoke` PASS
+  (303 s, OpenZFS 37/37), `ktest-smoke` 372/0 at `-smp 1` and `-smp 4` (banner, both `boot: … OK` layout lines,
+  `Userland exec complete`), `agnsh-smoke` PASS (82 s, outside the sweep). At the B10 / B11 merge: `zfs-write-smoke`
+  4,875 s, `ktest.sh` 367/370 (the three initrd checks). The oracle's one-time mutation proof (design § i.4, its
+  74-row table): every planned mutant RUN went red in the phase the plan named — M1, M2, M3, M5, M6 (both forms, now
+  from the kernel), M7, M8 (one txg early, on the merged `zfs_wdef_rel`), M9, M11 run at B12 on the final writer, M10
+  standing on B6's N4 (`zfs_wd_uacct` unchanged since); no oracle gap. Since B10 the kernel itself sees a missing log
+  record first (M1 at the next reload, M2 at the next flush), and `zfs_wr`'s backstop refuses M9's / M11's writes
+  before a byte lands (the proof removed it). Not shown red: M4 as a KERNEL mutant (no fixture's op list rewrites a
+  dataset that holds a ZIL; the forged M4 proves the oracle's half) and M8's literal same-txg form.
+- **CLAUDE.md closeout step 3 (dead-code audit) is WAIVED** by the operator's standing rule *grow before refactor*
+  (2026-10-11), until the planned rewrite: nothing was trimmed, `#ifdef`-ed out or removed for room (cycc reports 210
+  unreachable functions, 165,580 B, in the plain build — none removed).
+- **Open** (design § h's merge record, § k.130 / k.132): the ZFS OWNERSHIP lock — another CPU that wants `fs_lock` waits
+  for a whole commit; no sync thread (an idle process's coalesced writes wait for its next ZFS entry, close, sync or
+  exit); a tick-killed orphan still spins on `fs_lock` in the ISR for its pipes (pre-existing); interrupt windows on
+  USB mass storage / virtio-blk; zstd read and write (a follow-on); mirror pools, forced (ACTIVE) pools, `ftruncate`,
+  `AO_APPEND`, livelists, bookmarks, spill creation, `large_microzap`, UTF-8 normalisation; the hold on iron. kashi's three glyph tables reserve 8× the bytes they use — 88,592 B of this image (k.74 (e); filed:
+  `kashi/docs/development/issues/2026-10-13-font-arrays-declared-u64-for-byte-tables.md`).
+- CLAUDE.md's closeout step 2 (and work-loop step 5) named `Memory isolation: PASS` as a boot checkpoint; the test
+  that printed it left `main.cyr` on 2026-05-15, so no kernel has printed it since. The step now names the checkpoints
+  that exist and the gate that requires each.
+- **Not burned** to hardware this cut.
+
+
 ## [1.57.11] — 2026-10-09 — read-only ZFS, and the BSP stacks move up to make room
 
 The roadmap's top item. Operator rulings 2026-10-09: **read in 1.57.11, write in 1.57.12**; zstd file data is
@@ -31,7 +752,7 @@ No syscall number minted. **Built, gated, NOT burned.**
 ### Added
 
 - **Read-only ZFS** (`kernel/core/zfs.cyr`, `kernel/core/zfs_codec.cyr`; ABI §3.6;
-  `docs/architecture/zfs-read-only.md`). The kernel probes every registered block device (whole disk, then each
+  `docs/architecture/zfs.md`). The kernel probes every registered block device (whole disk, then each
   non-ESP GPT partition of the active one) for a vdev label, imports the first pool it can read and mounts it as
   `FsBackend` **`FS_ZFS = 4`** at **`/mnt/zfs`** (at `/` only when no ext2/FAT/exFAT took it). Labels (4 × 256 KiB,
   XDR nvlist, embedded SHA-256), the best uberblock (txg, timestamp, MMP seq), the MOS, the `features_for_read`

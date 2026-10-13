@@ -14,7 +14,7 @@ var arp_pending_ip = 0;  # Security: track which IP we sent an ARP request for
 # 1.49.0 loopback (lo) — frames destined to 127.0.0.0/8 or our own net_ip are queued here by net_tx
 # and drained through net_demux_frame by net_lo_drain on the poll loop, instead of hitting the wire
 # via nic_send. 8 slots × 1536 B (module-global var[N] = N×u64 = 8N bytes, so lo_ring = 8×1536).
-var lo_ring[1536];
+var lo_ring = 0xFFFFA00A00000000;   # ROOM slot 10 (1.57.12, core/room.cyr) — 12 KB; its poison until room_init
 var lo_lens[8];
 var lo_head = 0;
 var lo_tail = 0;
@@ -330,7 +330,7 @@ fn net_lo_enqueue(buf, len) {
     } else {
         var le_len = len;
         if (le_len > 1536) { le_len = 1536; }
-        var slot = &lo_ring + lo_tail * 1536;
+        var slot = lo_ring + lo_tail * 1536;
         memcpy(slot, buf, le_len);
         store64(&lo_lens + lo_tail * 8, le_len);
         lo_tail = (lo_tail + 1) & 7;
@@ -361,7 +361,7 @@ fn net_lo_drain() {
             ld_budget = ld_budget - 1;
             var ld_f = lo_q_begin();
             if (lo_count == 0) { lo_q_end(ld_f); break; }
-            var slot = &lo_ring + lo_head * 1536;
+            var slot = lo_ring + lo_head * 1536;
             var slen = load64(&lo_lens + lo_head * 8);
             lo_q_end(ld_f);
             net_demux_frame(slot, slen);           # IN PLACE: the slot still counts as occupied

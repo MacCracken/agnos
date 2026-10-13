@@ -16,16 +16,41 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.10 — matching ../kashi/VERSION and its 1.0.10 tag as of 2026-09-21 (agnos 1.57.5; 1.0.8 at 1.57.4, 1.0.6 as of
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.1.0 — matching ../kashi/VERSION and its 1.1.0 tag as of 2026-10-09 (agnos 1.57.12; 1.0.10 at 1.57.5, 1.0.8 at 1.57.4, 1.0.6 as of
 # 2026-08-28. Bump it as kashi cuts new 1.x releases. Affects ONLY the clone fallback: cyrius.cyml
 # declares `[deps.kashi] path`, and the path wins, so a box with the sibling checkout never reads
 # this value. That is exactly why it rots unnoticed.
 # ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — all three
 # had diverged by 1.56.51 (1.0.6 / 1.0.4 / 1.0.4). See the measured note at test.sh's KASHI_REF.
-# (The freestanding font_data.cyr has been byte-identical across the 1.0.x bumps, which is what
-# has kept the divergence from producing a visible symptom — not a reason to tolerate it.)
+# (The freestanding font_data.cyr was byte-identical across the 1.0.x bumps, which is what kept the
+# divergence from producing a visible symptom. 1.1.0 is the first bump that CHANGES it: +~6 KB — the
+# Unicode->CP437 map and two extension glyphs, cells 0x20..0xFF byte-identical — so from here a
+# stale default builds a different kernel image than the sibling path does.)
+# ⭐ 1.57.12 — a fallback clone is a CACHE of the pinned tag, and a cache has to match its key. From a
+# .claude/worktrees/<x> checkout, $ROOT/../kashi is not the dev sibling but the clone an earlier build left
+# behind: one sat at kashi 1.0.3 from July to 2026-10-09 while the pin moved to 1.0.10 and then 1.1.0 —
+# harmless only while font_data.cyr stayed byte-identical, which 1.1.0 ends. A SHALLOW, CLEAN clone whose
+# VERSION is not the pin is moved to the pinned tag IN PLACE (fetch + checkout — never rm -rf, see the rekha
+# note); a dirty one is refused; a full checkout (the dev sibling) is used as is, with a note.
+# ⚠ build.sh, test.sh and bench.sh carry this function verbatim — move them together.
+dep_pin_sync() { # <name> <dir> <ref>
+    _dv=$(cat "$2/VERSION" 2>/dev/null)
+    if [ -z "$_dv" ] || [ "$_dv" = "$3" ]; then return 0; fi
+    if [ "$(git -C "$2" rev-parse --is-shallow-repository 2>/dev/null)" != "true" ]; then
+        echo "  note: $1 at $2 is $_dv (a full checkout, used as is); the pin is $3" >&2
+        return 0
+    fi
+    if [ -n "$(git -C "$2" status --porcelain 2>/dev/null)" ]; then
+        echo "ERROR: the $1 fallback clone at $2 is $_dv WITH LOCAL CHANGES; the pin is $3 — refusing to touch it." >&2
+        exit 1
+    fi
+    echo "  the $1 fallback clone at $2 is $_dv, the pin is $3 — moving it to the tag..." >&2
+    git -C "$2" fetch --quiet --depth 1 origin tag "$3" >&2 \
+        && git -C "$2" -c advice.detachedHead=false checkout --quiet "$3" >&2 \
+        || { echo "ERROR: could not move the $1 fallback clone at $2 to $3" >&2; exit 1; }
+}
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.10}"
+KASHI_REF="${KASHI_REF:-1.1.0}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Same guard as the rekha block below (2026-09-13): the fallback replaces an ABSENT sibling
     # only, never a checkout that happens to lack the file — see the note there.
@@ -42,6 +67,7 @@ if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
         exit 1
     }
 fi
+dep_pin_sync kashi "$KASHI_DIR" "$KASHI_REF"
 # rekha freestanding default-face data (1.57.2 — the kernel-embedded TrueType face behind
 # /fonts, core/kfont.cyr). SAME contract as kashi above, mirrored line for line: sibling checkout
 # by default, clone the pinned tag when absent (override via REKHA_REF=<tag-or-branch>). Pinned at
@@ -76,6 +102,7 @@ if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
         exit 1
     }
 fi
+dep_pin_sync rekha "$REKHA_DIR" "$REKHA_REF"
 # ⚠ The aarch64 backend was renamed cc5_aarch64 -> cycc_aarch64 at cyrius v6.0.0; the back-compat
 # symlink lived through the v6.0.x window and DROPPED at v6.1.0. This probed only the old name, so
 # from v6.1.0 on the aarch64 build died with "cross-compiler not in toolchain" while the compiler
@@ -223,15 +250,18 @@ else
     #                     lines (halted/reset clean, dev_notifications,
     #                     controller running, port N connected, error
     #                     cases) stay unconditional.
-    #   AHCI_RW_DEMO=1  — boot-time LBA-5 sentinel write + read-back on
-    #                     the first initialized SATA port. DEFAULT OFF
-    #                     in production iron builds: LBA 5 of a GPT disk
-    #                     sits inside the partition-entry array, and a
-    #                     write there is recoverable but not the right
-    #                     default posture. Enable for QEMU smoke or
-    #                     known-scratch drives to validate the WRITE
-    #                     DMA EXT path; ahci_read_demo (LBA 0 readback)
-    #                     runs unconditionally either way.
+    #   AHCI_RW_DEMO=1  — boot-time sentinel write + read-back on the
+    #                     first initialized SATA port, the original
+    #                     sector saved first and written back after
+    #                     (1.57.12). DEFAULT OFF in production iron
+    #                     builds: it WRITES the disk. On a GPT disk the
+    #                     LBA is one outside the GPT and every partition
+    #                     (gpt_scratch_lbas_on; LBA 5, inside the entry
+    #                     array, until 1.57.12), LBA 5 on a disk with no
+    #                     GPT. Enable for QEMU smoke or known-scratch
+    #                     drives to validate the WRITE DMA EXT path;
+    #                     ahci_read_demo (LBA 0 readback) runs
+    #                     unconditionally either way.
     #   NET_VERBOSE=1   — boot net diagnostics: the 1.1.1.1:80 outbound-TCP
     #                     smoke + the r8169 silicon tally readback
     #                     (rx_uc/rx_bc/rx_mc/missed). Off by default — the
@@ -251,6 +281,28 @@ else
     #                     symlink and regular file of the grafted pool, each file
     #                     SHA-256'd through the read#5 path; diffed against the
     #                     OpenZFS manifest by scripts/smoke/zfs-smoke.sh.
+    #   ZFS_WRITE_SELFTEST=1 — the ZFS writer's selftest (1.57.12): B1 replays
+    #                     EVERY metaslab strictly at mount (production loads
+    #                     bitmaps on first use) and dumps the allocator state
+    #                     (zfs-wms per metaslab, zfs-wlog per log space map,
+    #                     zfs-wpool, zfs-wzil, zfs-wds) to SERIAL; zfs-smoke.sh
+    #                     (built with ZFS_SELFTEST=1 too) diffs it against a
+    #                     host replay (scripts/smoke/lib/zfs-wms-check.py);
+    #                     since B3a it also runs the in-memory exercises
+    #                     (zfs-wb3: lines — the writer's code on each rw pool's
+    #                     real state, every change undone) at every rw mount.
+    #   ZFS_WRITE_OPS=1 — the ZFS writer's op list (1.57.12, core/zfs_write.cyr
+    #                     zfs_wtest): after mount, right before the ZFS_SELFTEST
+    #                     walk, every rw fixture pool gets the op list (B2's
+    #                     uberblock-only commit, then B3-B11: null txgs, dataset
+    #                     COWs, creates, file data, removals and renames, fat
+    #                     ZAPs, snapshotted datasets, log hygiene, policy B, the
+    #                     crash cut), each op read back from the device; a
+    #                     read-only pool must refuse every op. Deterministic ub
+    #                     timestamps. Gated by scripts/smoke/zfs-write-smoke.sh
+    #                     (built ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 with it),
+    #                     which has OpenZFS judge the pools. ⛔ WRITES TO THE
+    #                     POOL: a test-image flag, never an iron build.
     #   EXFAT_WRITE_SELFTEST=1 — boot-time exFAT write self-test (1.34.1
     #                     bite 3): create a file by writing its dir-set
     #                     (0x85/0xC0/0xC1 + SetChecksum + NameHash). Gated
@@ -457,6 +509,8 @@ else
         [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'
         [ -n "$EXFAT_WRITE_SELFTEST" ] && echo '#define EXFAT_WRITE_SELFTEST'
         [ -n "$ZFS_SELFTEST" ] && echo '#define ZFS_SELFTEST'
+        [ -n "$ZFS_WRITE_SELFTEST" ] && echo '#define ZFS_WRITE_SELFTEST'
+        [ -n "$ZFS_WRITE_OPS" ] && echo '#define ZFS_WRITE_OPS'
         [ -n "$FAT_ALLOW_ESP_WRITE" ] && echo '#define FAT_ALLOW_ESP_WRITE'
         [ -n "$DNS_SELFTEST" ]   && echo '#define DNS_SELFTEST'
         [ -n "$ICMP_SELFTEST" ]  && echo '#define ICMP_SELFTEST'
@@ -894,7 +948,9 @@ print('  entry: 0x{:x}'.format(entry))
     # sweep's ring3-smoke row; EDGE_ABI_SELFTEST=1 0x371260 — sweep's edge-abi-smoke row; EXEC+EXT2_WRITE+RING3
     # 0x37B288 — exec-smoke's ring-3 variant): every sweep booted a kernel whose BSP boot stack could grow down
     # into its .rodata, and nothing said so. So EVERY x86_64 build now runs scripts/check/image-layout-check.sh
-    # on the image it just wrote:
+    # on the image it just wrote (⭐ 1.57.12: the bound is LOAD end <= 0x400000, the top of region 1 — the BSP
+    # stacks left region 1, the boot stack for the image's own .bss — and the gate also decodes the shim's
+    # stack load from the image; the "PASS: LOAD end ... — headroom" line grepped below is unchanged):
     #   · a build that set ANY flag FAILS when the image is over the bound (non-zero, the gate's output on
     #     stderr, the image moved to build/agnos.layout-refused) — a smoke then dies at build time, loudly,
     #     instead of booting a stack-overlapped image. ⭐ (IMG-fix, review B4) it also fails CLOSED when
@@ -906,35 +962,58 @@ print('  entry: 0x{:x}'.format(entry))
     #     flag test and used to go unmeasured. Over the bound it prints the gate's FAIL block on stderr as a loud
     #     WARNING and leaves build/agnos in place, so check.sh gate 34 still builds and SCORES it (the M1 mutation
     #     record lives there) and CI's explicit `image-layout-check.sh` step (ci.yml, release.yml) fails the push.
+    #   · ⭐ 1.57.12 (the second ROOM review, 2026-10-12): ONLY the bound itself is warn-only for a plain build. Any
+    #     OTHER failure — a source/image CONTRACT check, (2)-(10), or the gate dying without a FAIL line — refuses the
+    #     plain image exactly like a flag build (moved to build/agnos.layout-refused, exit 1). WHY: the warn-only plain
+    #     path was written when the gate measured only the LOAD end, whose violation is at least measured and loud in
+    #     the gate; (10)'s class is silent at runtime — a leftover `&NAME + off` for a ROOM array compiles to the
+    #     address of its 8-byte pointer cell and corrupts the .bss after it — and every plain-image smoke booted
+    #     whatever build.sh left (the room's mutation M6, `&lo_ring`: "build warns, gate rc 1"). check.sh gate 34
+    #     scores the REFUSED image when build.sh refused this run's, so its row still prints the gate's FAIL block.
+    #   · the over-bound plain image that stays is recorded `layout=over-bound` in build/agnos.flags, and
+    #     smoke_require_image refuses any record whose layout is not `pass` — so the plain smokes that check
+    #     provenance (agnsh, console-line, ext2, gpt-geometry, hda, shutdown) refuse it as well.
     # ⭐ (IMG-fix, reviews A6/B6) every image that survives gets a provenance record, build/agnos.flags
-    # ("flags=<the #defines beyond ARCH_X86_64/ELF64_KERNEL>", "md5=<the image>"): smoke_require_image
-    # (scripts/smoke/lib/qemu-dwell.sh) refuses to boot a kernel a smoke was not written for — shutdown-smoke
-    # booted doom-smoke's leftover DOOM_SELFTEST image and scored PASS in the IMG run.
+    # ("flags=<the #defines beyond ARCH_X86_64/ELF64_KERNEL>", "md5=<the image>", and since the second ROOM review
+    # "layout=pass|over-bound|unmeasured"): smoke_require_image (scripts/smoke/lib/qemu-dwell.sh) refuses to boot a
+    # kernel a smoke was not written for — shutdown-smoke booted doom-smoke's leftover DOOM_SELFTEST image and scored
+    # PASS in the IMG run — and, since that review, one whose layout verdict is not `pass`.
     rm -f "$ROOT/build/agnos.layout-refused" "$ROOT/build/image-layout-flag.log" "$ROOT/build/agnos.flags"
+    LAYOUT=pass
     if ! command -v python3 >/dev/null 2>&1; then
         if [ -n "$BUILD_FLAGS" ]; then
             mv -f "$ROOT/build/agnos" "$ROOT/build/agnos.layout-refused"
             echo "ERROR: python3 not available — the image-layout guard cannot measure this flag build [$BUILD_FLAGS]; refused (moved to build/agnos.layout-refused), it must not be booted unmeasured" >&2
             exit 1
         fi
-        echo "WARNING: python3 not available — the plain image was NOT measured against the BSP boot stack bound (check.sh gate 34 / CI will)" >&2
+        echo "WARNING: python3 not available — the plain image was NOT measured against the region-1 bound (check.sh gate 34 / CI will); recorded layout=unmeasured, which smoke_require_image refuses" >&2
+        LAYOUT=unmeasured
     else
         sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > "$ROOT/build/image-layout-flag.log" 2>&1 && IRC=0 || IRC=$?
         if [ "$IRC" != "0" ]; then
             cat "$ROOT/build/image-layout-flag.log" >&2
-            if [ -n "$BUILD_FLAGS" ]; then
+            # The bound's own FAIL line vs every other one. A non-zero exit with no FAIL line at all (a traceback, an
+            # assert) counts as a contract failure: an unmeasured image is not an over-bound one.
+            ILC_BOUND=$(grep -c '^FAIL: LOAD end 0x[0-9a-f]* exceeds ' "$ROOT/build/image-layout-flag.log" || true)
+            ILC_OTHER=$(grep '^FAIL' "$ROOT/build/image-layout-flag.log" | grep -v '^FAIL: LOAD end 0x[0-9a-f]* exceeds ' || true)
+            if [ -n "$BUILD_FLAGS" ] || [ -n "$ILC_OTHER" ] || [ "${ILC_BOUND:-0}" = "0" ]; then
                 # Moved aside, not left in place: a caller that ignores this status must find NO kernel
                 # rather than boot this one (the image is kept for inspection).
                 mv -f "$ROOT/build/agnos" "$ROOT/build/agnos.layout-refused"
-                echo "ERROR: flag build [$BUILD_FLAGS] fails the image-layout gate (above) — moved to build/agnos.layout-refused; it must not be booted" >&2
+                if [ -n "$BUILD_FLAGS" ]; then
+                    echo "ERROR: flag build [$BUILD_FLAGS] fails the image-layout gate (above) — moved to build/agnos.layout-refused; it must not be booted" >&2
+                else
+                    echo "ERROR: this PLAIN image fails a source/image CONTRACT of the image-layout gate (above: a FAIL other than the LOAD-end bound, or the gate died without a FAIL line) — moved to build/agnos.layout-refused; it must not be booted (check.sh gate 34 scores the refused image)" >&2
+                fi
                 exit 1
             fi
-            echo "WARNING: this PLAIN image fails the image-layout gate (above) — left in build/agnos for check.sh gate 34 to score; do NOT boot or ship it" >&2
+            echo "WARNING: this PLAIN image is over the region-1 bound (above) and passes every other check — left in build/agnos for check.sh gate 34 to score, recorded layout=over-bound (smoke_require_image refuses it); do NOT boot or ship it" >&2
+            LAYOUT=over-bound
         else
             echo "  image-layout (${BUILD_FLAGS:-plain}): $(grep -o 'PASS: LOAD end 0x[0-9a-f]* <= 0x[0-9a-f]* — headroom[^;]*' "$ROOT/build/image-layout-flag.log")"
         fi
     fi
-    printf 'flags=%s\nmd5=%s\n' "$BUILD_FLAGS" "$(md5sum "$ROOT/build/agnos" | cut -d' ' -f1)" > "$ROOT/build/agnos.flags"
+    printf 'flags=%s\nmd5=%s\nlayout=%s\n' "$BUILD_FLAGS" "$(md5sum "$ROOT/build/agnos" | cut -d' ' -f1)" "$LAYOUT" > "$ROOT/build/agnos.flags"
 
     # ELF64 kernel boot — gnoboot maps the kernel, sets RDI=&boot_info,
     # and jmp rax's into the 64-bit entry (kernel/arch/x86_64/mbi.cyr

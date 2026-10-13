@@ -1,6 +1,7 @@
 # Kernel stacks, the switch tail and preemption — invariants
 
-> **Last Updated**: 2026-09-25 (1.57.7 — Path 2 step S3d, bites S3.6–S3.9: the 0xE1 reschedule kick (EOI-only — a
+> **Last Updated**: 2026-10-10 (1.57.12 — the BSP stacks left region 1: the boot stack is image `.bss`, the BSP's
+> TSS.RSP0 is region-7 slot 0; § Region 1 rewritten. 1.57.7 — Path 2 step S3d, bites S3.6–S3.9: the 0xE1 reschedule kick (EOI-only — a
 > wake, not a switch path), the vector table below, keep-current, the idle step and the park; the KEEP-build idle-stack
 > bound. 1.57.7 — Path 2 step S3c, bites S3.4–S3.5: the voluntary switch (`int 0xE0`,
 > Invariant 7), the 174-byte stub (bite C), `clac` at every interrupt/exception stub, per-process a4, fork from the
@@ -262,13 +263,13 @@ pre-existing, found by kstack-smoke's DPL0 phase (1.57.7: QEMU `-d int` showed `
 
 ## Region 7 and the guard pages
 
-| Phys range | Use (1.57.6) |
+| Phys range | Use (1.57.6; slot 0 1.57.12) |
 |---|---|
 | `0xE00000–0xF00000` | 16 × 64 KB per-process kernel stacks (slot = pid) |
 | `0xF00000–0xF40000` | 4 × 64 KB kthread stacks (the BSP idle's included; were the per-CPU syscall stacks) |
 | `0xF40000–0xF80000` | IST1 (#DF), one per CPU |
 | `0xF80000–0xFC0000` | FREE (were the #37 second stacks) — reserved for a future NMI/#MC IST |
-| `0xFC0000–0x1000000` | AP boot/TSS stacks (slot 0 unused) |
+| `0xFC0000–0x1000000` | per-CPU TSS.RSP0 slots, tops `0xFD0000 + cpu·0x10000`: slot 0 = the BSP's RSP0 (1.57.12; unused 1.57.3–1.57.11), slots 1–3 = the AP boot stacks (also their RSP0) |
 
 `kstack_guard_init` (after `pmm_bitmap_use_directmap`, before any per-process CR3 and before the APs wake)
 replaces the direct map's 2 MB entry for region 7 in `dm_pd` — a single PD copied **by pointer** into every
@@ -282,45 +283,189 @@ grows. AP idles are registered on their AP boot stacks and take no kthread slot;
 their initial RSP is the stack `ap_entry` is running on. A `BOOTCR3_KEEP_GNOBOOT_CR3` build keeps the 4 KB `.bss` kthread pool and gets no guard pages (its kmain
 context has no direct map); no smoke covers that build.
 
-## Region 1 — the BSP's two fixed stacks (1.57.11)
+**A kthread pool slot is handed out again once its kthread is gone (1.57.12).** `kthread_create` used to advance a
+cursor that never moved back, so the four slots were four kthreads per boot (the BSP idle, KTEST's two context-switch
+threads and the TEST suite's flock T9b filled them; THREAD_SELFTEST or KSTACK_SELFTEST beside KTEST got -1). Each slot
+now records its kthread as an incarnation — `kthread_slot_pid` (pid + 1) and `kthread_slot_epoch` (`proc_epoch[pid]`)
+— and `kthread_slot_free(n)` frees it when the pid was recycled (the epoch moved: `proc_alloc_slot` reuses a dead slot
+only at `on_cpu == -1`) or the kthread is dead (state 0) **and** `on_cpu == -1` — the switch tail's release, written
+only after the CPU has left that stack (INV-11). A retired kthread that a CPU has not yet switched away from keeps its
+slot. The slot is recorded between `proc_create_kclaim` and the READY store, so no thread runs with a stale record;
+`kthread_create`'s callers are all kmain (bootstrap, boot self-tests, the TEST suite), never an AP. ⚠ "Dead" has to
+mean dead for good: a kthread retires ITSELF (state 0 on its own CPU, then `sched_exit_tail`) or is retired by another
+context through `kthread_retire` (`proc.cyr`), which stores the 0 under `sched_lock` — never a bare
+`proc_set_state(pid, 0)` from another CPU, which can land inside that CPU's `do_context_switch` revive of a running
+`old` (load the state, load it again, store 1) and be lost, the thread READY again on a stack the pool then hands out.
+`kthread_slot_free` reads the state and `on_cpu` as one snapshot under `sched_lock` for the same reason (1.57.12
+review; latent — the two kmain-side retires, THREAD_SELFTEST's and KSTACK_SELFTEST's rmw pair, were unlocked).
 
-| Phys = VA (identity, PD[1]) | Use |
+**A guard page only catches a descent that touches it — so no frame may be large enough to step over one (1.57.12).**
+cycc's prologue is `push rbp; mov rbp, rsp; sub rsp, N`, and nothing writes the new frame until the body does,
+anywhere in `[rsp, rbp)` — a local buffer fills upward from its base at the frame's bottom. The caller's pushes landed
+at or above the guard's top (they did not fault), so with `N + 32 > 4 KB` (the saved rbp and return address, then the
+next call's push or an interrupt frame's first slot after its 16-byte alignment) a frame entered near the bottom of a
+slot puts its buffer entirely below the guard — in the TOP of the next slot down, another live stack — and writes it
+with no fault. `scripts/check/image-layout-check.sh` (9) (gate 34, and `build.sh` after every x86_64 build) holds every
+`sub rsp, imm32` in `.text` to `<= 0xC00` (the 4 KB guard less a 1 KB margin for codegen a byte scan would not see as
+one frame) and re-reads `kstack_guard_init`'s one-page-per-slot shape. `sh_exec` broke it in every build until 1.57.12
+(5,152 B: the `blkread` verb's `var rbuf[4096]`, now a per-call `kmalloc(4096)` in `sh_cmd_blkread`); the largest frame
+is now `ksyscall`'s 2,176 B. Fix an oversized frame by moving the big local off the stack (a per-call allocation, or a
+module buffer where the code is provably single-walker) — never by growing the guard: region 7 is laid out slot for slot.
+
+## Region 1 — the image only; the BSP's stacks (1.57.12)
+
+| Where | Use |
 |---|---|
-| `[0x100000, LOAD end)` | the kernel image (LOAD end `0x38fd68` at 1.57.11, with the ZFS reader) |
-| `[LOAD end, 0x3D0000)` | image headroom — `scripts/check/image-layout-check.sh` (check.sh gate 34; `scripts/build.sh` after every x86_64 build, fatal for a flag build; CI after its plain build) fails any image past `0x3D0000` |
-| `[0x3D0000, 0x3E0000)` | BSP boot stack, 64 KB, grows down from `0x3E0000` (`boot_shim.cyr`: the legacy `mov esp` / `mov rsp` and the ELF64 `mov rsp`; kmain = proc 0 runs and is switched out on it) |
-| `[0x3E0000, 0x3F0000)` | UNUSED guard gap — nothing in the tree references it; keep it empty |
-| `[0x3F0000, 0x400000)` | BSP TSS.RSP0 (`gdt.cyr` `tss_kernel_stack` = `0x400000`, the top of region 1; the fallback for an unassigned `proc_rsp0`) |
+| `[0x100000, LOAD end)` phys = VA (identity, PD[0..1]) | the kernel image — LOAD end `0x3a1c70` for the plain 1.57.12 build; `scripts/check/image-layout-check.sh` (check.sh gate 34; `scripts/build.sh` after every x86_64 build, fatal for a flag build; CI after its plain build) fails any image past **`0x400000`, the top of region 1** |
+| `bsp_boot_stack`, 64 KB in the image's `.bss` (`[0x30d300, 0x31d300)` in that build) | BSP boot stack (`boot_shim.cyr`): the shim's `bsp_boot_stack_lo = &bsp_boot_stack;` leaves the address in RAX, the asm block after it does `add rax, 0x10000` / `and rax, -16` / `mov rsp, rax` / `mov rbp, rsp`. kmain = proc 0 runs and is switched out on it. No guard page — its lowest 8 KB is a canary RED ZONE (56 KB usable), below |
+| region-7 slot 0 `[0xFC0000, 0xFD0000)`, via the direct map | BSP TSS.RSP0 (`gdt.cyr` `tss_get_cpu_stack(0)` = `DIRECTMAP_BASE + 0xFD0000`; the fallback for an unassigned `proc_rsp0`) — guarded like every region-7 slot |
 
-⭐ **1.57.11 moved all three up 256 KB** (top `0x3A0000` → `0x3E0000`, bound `0x390000` → `0x3D0000`, RSP0
-`0x3C0000` → `0x400000`): the read-only ZFS module added ~100 KB and the plain image ended 2,504 B past the old
-bound; operator ruling — allow the growth (a heavy refactor/rewrite is planned). `[0x3C0000, 0x400000)` was
-audited first: every reference was a stale comment (the old syscall kstacks left region 1 at 1.46.x/1.51.x).
-⛔ **Region 1 is now full above the image** — the next growth past `0x3D0000` needs the BSP stacks somewhere
-else, not a bigger number. The rest of this section's numbers describe the 1.57.7 layout (shifted, not changed).
+⭐ **1.57.12 moved both BSP stacks out of region 1.** Operator ruling (2026-10-10): the ZFS write path needs ~170 KB
+more than the binding flag build had left, compiler DCE is blocked on a cyrius bug, so make room by moving the stacks.
+Until 1.57.12 three fixed windows sat above the image — the boot stack `[0x3D0000, 0x3E0000)`, a 64 KB guard gap
+`[0x3E0000, 0x3F0000)`, the RSP0 window `[0x3F0000, 0x400000)` (`var tss_kernel_stack = 0x400000`) — and the image had
+to end at `0x3D0000`. Now region 1 holds only the image and its bound is `0x400000`: **the last bound this layout
+allows**, because VA `0x400000` (PD[2]) is ring-3 code in every process (`ring3.cyr` `code_va`; every agnos ELF links
+there and the ELF loaders refuse anything lower), `pmm_init` reserves exactly `[0, 4 MB)` for the kernel, and
+`sel_rip_is_kernel` takes `[0, 0x400000)` as kernel RIPs. Room under it is made by MOVING bulk out of the image — since
+the ROOM step (2026-10-12) eleven large module arrays live in a boot carve-out reached through the direct map
+([`kernel-image-room.md`](kernel-image-room.md); no stack goes there) — and only past that does growth need an
+architectural change (a higher-half kernel, or a higher user link base). Net gain ≈ 126 KiB on every build (+128,952 B plain): the bound rose 192 KiB and the 64 KiB stack (plus ~2 KB of boot-evidence code) now
+counts inside the image (plain headroom 256,984 B → 385,936 B; the per-build table is in the 1.57.12 CHANGELOG entry).
 
-The boot stack was `[0x370000, 0x380000)` from 1.57.3 through 1.57.6; the IMG step moved it up 128 KB because the
-1.57.7 plan's image estimates left 4 B of headroom and three flag builds the sweep boots were already past
-`0x370000`. It cannot leave region 1 (live from the shim's first instruction, before the direct map exists — see
-`boot_shim.cyr` step 12). Neither region-1 stack has a guard page (they are inside the 2 MB identity pages), and
-the boot stack's peak depth is **not measured** by any build (`KSTACK_HW` paints only region 7). Measured from
-outside at 1.57.7 (IMG-fix): the window is **painted** over QEMU's gdbstub while the VM is held at reset, booted,
-then `pmemsave`d — the lowest qword that is no longer paint is a true high-water mark (a lowest-non-zero scan of
-the zero-filled window is only a lower bound: at `-smp 4` the deepest qword written was a zero). To the agnsh
-prompt: 2,088 B and 2,312 B (`-smp 1`, two boots), 2,328 B (`-smp 4`, KVM); 5,288 B through doom-smoke's
-pre-scheduler IF=0 run. The image headroom, the guard gap and the RSP0 window stayed paint in every run.
+**Why the boot stack is image `.bss`.** It is live from the shim's first instruction under gnoboot's CR3 (UEFI's
+identity map), before the direct map exists, and kmain is switched out on it under per-process CR3s — so it must be
+mapped identically under every CR3 from power-on on. Only PD[0..1] (copied into every per-process CR3, never
+overridden by a user segment) and the direct map (not live until `cr3_load(0x1000)`) qualify; region 7's identity VA
+does not (a large ELF overrides PD[7] in its own CR3). Inside PD[0..1] the image's own `.bss` is the one place nobody
+else can own: gnoboot allocates the whole image with one `AllocatePages(AllocateAddress, EfiLoaderCode)` sized from
+`p_memsz` and zeroes every `[p_filesz, p_memsz)` gap, so the stack is loader-pinned memory from the first push, on
+QEMU and on iron. The old region-1 window was free only because the firmware left it free — 1.57.7's
+`bootstack_window_check` could report that, never ensure it. Prior art: Linux x86_64 (`head_64.S` loads
+`__top_init_kernel_stack`; `init_stack` is `INIT_TASK_DATA` inside `.data`), FreeBSD amd64 (`locore.S`
+`movq $bootstack,%rsp`, `bootstack` in `.bss`), seL4 x86_64 (`boot_stack_top` in `.phys.bss`, then
+`kernel_stack_alloc` in `.bss`), vidya `boot_and_startup` ("a static boot stack in the kernel's .bss section (e.g.,
+64KB)"). agnos had re-picked a fixed number above the image end five times instead (`0x200000` → `0x380000` →
+`0x3A0000` → `0x3E0000`; the AP windows once).
 
-**What keeps the window free is the firmware.** Nothing reserves `[0x390000, 0x3A0000)` before the shim's first
-push: `pmm_init`'s 0–4 MB reservation is the kernel's own bookkeeping, made later; gnoboot pins only the kernel
-image (ET_EXEC `AllocateAddress`), allocates the `/initramfs` and `/cmdline` blobs with `AllocateAnyPages`
-(EfiLoaderData), and keeps `boot_info` and the memory-map buffer in its own image (EfiLoaderCode), wherever the
-firmware loaded it. So kmain checks the map it was handed right after `pmm_probe_memmap`
-(`mbi.cyr` `bootstack_window_check`): every descriptor meeting `[0x390000, 0x3C0000)` must be free once
-ExitBootServices returns (type 3, 4 or 7), the descriptors must cover the span, and the map buffer must lie outside
-it. It prints `boot: BSP stack span 0x390000-0x3C0000 is free RAM in the UEFI map OK`, or
-`boot: BSP stack window not free RAM in the UEFI map - type 0x.. at 0x..` — a latched line in
-`SMOKE_INVARIANT_DENY` (agnsh-smoke requires the OK line). It cannot move the stack (already in use); it makes the
-one iron-only risk of this window observable in the burn's klug/fb transcript. Iron: built, gated, NOT burned.
+**Why the BSP's RSP0 can be region 7 although `tss_init` runs under gnoboot's CR3.** The CPU loads TSS.RSP0 only on a
+CPL3→CPL0 transition, and nothing reaches CPL 3 before the kernel CR3 and the direct map are live — IST1 has taken a
+direct-map VA from the same early call since 1.56.52. And the value is a fallback: every process gets its own region-7
+stack in `proc_alloc_slot` and `kstack_install` rewrites RSP0 on every switch. `proc_rsp0_top` falls back to
+`tss_get_cpu_stack(0)` — cpu 0's slot specifically, never the calling CPU's, because slots 1–3 are the AP boot stacks
+their idles run on (an RSP0 on live frames is the 1.44.x triple fault `gdt.cyr` records).
+
+**Alternatives weighed (1.57.12).** (a) A fixed window elsewhere: below 1 MB is firmware territory on iron (Linux has
+reserved all of the first 1 MB since v5.13 after Ryzen BIOSes corrupted it — archaemenid is Zen); regions 2–6 are user
+code VA and the pmm pool; region 7/8's identity VA is overridden by large ELFs (and boot PD[8] is aliased); region 7's
+direct map does not exist under gnoboot's CR3. (b) cycc's 64 KB zero-fill tail (`memsz = filesz + 65536`) as the
+stack, top = LOAD end read from the ELF header: the full 192 KB at no image cost, but it leans on undocumented compiler
+slack and a fixed header address, and is invisible in the source — a cyrius request to make that zero-fill explicit or
+configurable would hand those 64 KB back. (c) FreeBSD's shape — a small `.bss` early stack, then switch kmain onto a
+guarded region-7 slot once the direct map is live: +176–184 KB and a guard page for kmain, but every boot-time path that
+treats a stack buffer as an identity/physical address (the ext2 direct-DMA window below `0x10000000`,
+`pmm_kva_for_access(&local)`, kernel-pointer range checks) would need an audit, it spends the NMI/#MC slot, it cannot
+apply to `BOOTCR3_KEEP_GNOBOOT_CR3`, and it adds a second stack switch. It remains possible later ON TOP of this — the
+`.bss` stack would become its early stack unchanged.
+
+**What the gate checks** (`image-layout-check.sh`, header): LOAD end ≤ `0x400000`; in the IMAGE, right after the CP1
+stamp, exactly one `48 B8 imm64` / `48 B9 imm64` / `48 89 01` / `48 05 00 00 01 00` / `48 83 E0 F0` / `48 89 C4` /
+`48 89 E5` with `[imm64, imm64 + 64 KB)` inside `.bss` and the stored-to cell exactly `imm64 + 64 KB` (the
+`bsp_boot_stack_lo` declared right after the array — this ties `imm64` to `bsp_boot_stack` itself, not to any `.bss`
+symbol with 64 KB above it); in the SOURCE, one `var bsp_boot_stack[8192]` (8·N = the add immediate), each byte line's
+comment matching its bytes; nowhere in `kernel/` a `mov esp/rsp, imm` byte line (`BC`, `48 BC`, `48 C7 C4`) or
+`mov rsp|esp, <number>` mnemonic; nowhere in `.text` a `mov rsp, imm64` / `mov esp, imm32` / `mov rsp, simm32` whose
+value lies in `[0x100000, 0x400000]`; `tss_get_cpu_stack` is one formula with no BSP case, no `var tss_kernel_stack`,
+and the fallback is `tss_get_cpu_stack(0)`; main.cyr's two evidence checks name the image base and region 7; (7) the
+red zone below (`BSP_REDZONE`, every frame in `.text` smaller than it, the arm and both checks wired); (8) nothing but
+stack-free constant stores between the entry `jmp` and the shim's first byte (below). Mutation-proven (M1–M9 and
+R1–R6, the script header). `weighed-size-check.sh` parses `REGION1_TOP` / `CEIL` from it (GRANT `0x290000`);
+`rbp-repro.sh` takes its kmain window from `--bsp-stack-span`.
+
+**No guard page, so a red zone (1.57.12 review fix), and the depth is measured.** The array sits inside the image's RW
+2 MB identity pages (a not-present page would mean splitting PD[1], the kernel's own text, into 4 KB pages), so an
+overflow would write the `.bss` global declared just before it, silently — in the 1.57.12 plain build `syscall.cyr`'s
+`blk_rw_armed` 48 B below the array (the raw-disk-write gate tests `blk_rw_armed == 0`, so garbage there arms it),
+`BLK_RW_ARM_MAGIC`, `blk_rw_arm_pid`, then the 4 KB `blk_sc_bounce` DMA bounce buffer; which global it is changes with
+unrelated edits (whatever is declared last ahead of `boot_shim.cyr`'s include). Linux's `init_stack` has the same
+shape and carries `STACK_END_MAGIC` at `end_of_stack()`, re-read by `schedule_debug()` on every `schedule()`. agnos
+widens that to a RED ZONE: the lowest `BSP_REDZONE` = 8 KB of the array holds `0x57AC6E9D57AC6E9D`, written by
+`bsp_stack_redzone_arm` (`proc.cyr`, called right after `klog_tsc_boot` in `main.cyr`), and `bsp_stack_redzone_check`
+re-reads all of it whenever a context LEAVES the boot stack — `sched_leave_old` on every real switch (kmain switched
+out by a tick or its own BLOCK/YIELD) and `sched_assert_oob` on the boot-only `exec_and_wait` / `kernel_resume`. One
+changed qword prints `PANIC: BSP boot stack red zone overwritten at 0x… (depth 0x… of 0x10000, check 0x…) --
+halting` (klug + COM1; `SMOKE_INVARIANT_DENY`) and halts that CPU, as `stack_canary_check` does. It is detection at
+the next exit, not prevention (at `-smp 4` the APs run on until then). 8 KB rather than a region-7 slot's 4 KB because
+a frame larger than the zone could straddle it without writing to it — a local buffer fills upward from its base,
+below the floor, while the frame's return address sits above the zone; gate 34 (7) requires every `sub rsp, imm32`
+frame in `.text` to be smaller than `BSP_REDZONE`, and gate 34 (9) holds every frame to `0xC00` (below), so any descent
+through the zone pushes a return address inside it. Usable: 56 KB. A `KSTACK_HW=1` build (implied by `KSTACK_SELFTEST`) paints the 56 KB
+above the zone at kmain entry (`bsp_stack_paint`, below its own frame − 1 KB) and every `kstack_hw_scan` prints
+`kstack-hw: bsp boot stack max=0x… of 0xe000 usable` when it grows — a lower bound, like the slots. Measured at 1.57.12
+through kstack-smoke's whole `KSTACK_SELFTEST` run: `0x638` = 1,592 B (`-smp 1`), `0x688` = 1,672 B (`-smp 4`); the
+review's `ZFS_SELFTEST` + `KSTACK_HW` run peaked at 3,544 B across all seven zfs-smoke lanes. Measured from outside at
+1.57.7 (the old window painted over the gdbstub, a true high-water mark): 2,088–2,328 B to the agnsh prompt, 5,288 B
+through doom-smoke's pre-scheduler IF=0 run. 56 KB is ~10× the deepest. A real guard page for kmain is design (c)
+above, on top of this.
+
+**Nothing ahead of the shim may use the stack (corrected 1.57.12).** gnoboot jumps to the entry with an undefined
+stack (`mov rdi, rax; jmp rax`; handoff protocol §1), and the shim's stack load is the first instruction allowed to
+make one. But the shim is not the first code: cycc emits the top-level ENUM initialisations before PARSE_PROG in every
+mode, so ~200 constant stores into `.bss` (`mov eax, imm32` / `movabs rcx, &x` / `mov [rcx], rax`) run ahead of it on
+gnoboot's stack — stack-free and RDI-preserving today. Gate 34 (8) walks the image from the entry `jmp` to the shim's
+first byte (the CMOS `0x51 = 0xAB` stamp) and fails the build on any other instruction shape. (CLAUDE.md and
+`agnos.cyr` said the shim was the first code emitted until the 1.57.12 review read the image.)
+
+**What the boot checks** (`main.cyr`, right after `pmm_probe_memmap`; `mbi.cyr` `uefi_span_check`), against the UEFI
+map gnoboot handed over:
+- `boot: BSP boot stack [0x…, 0x…) inside the loader-pinned image (EfiLoaderCode) OK` — the shim's statement ran
+  (`bsp_boot_stack_lo == &bsp_boot_stack`), a frame of kmain lies inside the array, and every descriptor meeting the
+  image span `[0x100000, LOAD end)` (LOAD end read from the ELF header the loader put at `0x100000`) is
+  EfiLoaderCode and covers it. Violations, both in `SMOKE_INVARIANT_DENY`: `boot: BSP boot stack not loader-pinned -
+  type 0x.. at 0x..`, `boot: BSP not on its boot stack - rsp 0x.. lo 0x..`.
+- `boot: region 7 [0xE00000, 0x1000000) is free RAM in the UEFI map OK` — every kernel stack (per-process, kthread,
+  IST1, the per-CPU RSP0 slots, the BSP's included) sits in memory the firmware calls free once ExitBootServices
+  returns (type 3, 4 or 7), the descriptors cover it, and the map buffer is outside it. Nothing checked this before
+  1.57.12. Violation (denied): `boot: region 7 not free RAM in the UEFI map - type 0x.. at 0x..`.
+agnsh-smoke requires both OK lines. They replace 1.57.7–1.57.11's `boot: BSP stack span 0x3D0000-0x400000 is free RAM
+in the UEFI map OK` (the window is gone). Iron: built, gated, not yet burned — the next burn's klug/fb transcript
+should show both OK lines.
+
+⚠ **The one iron trade this move makes (1.57.12 review).** The boot stack's 64 KB — and every byte the image later
+grows into, up to `0x400000` — now lies inside gnoboot's single `AllocatePages(AllocateAddress, EfiLoaderCode)` span
+(`gnoboot/src/main.cyr`, the ET_EXEC branch: `efi_fail(st, &code_ap)` on a non-zero status, pages sized from the whole
+span). That span must be FREE CONVENTIONAL memory at allocation time, BEFORE ExitBootServices; the old window only
+had to be type 3/4/7 after it. A firmware that holds BootServicesData anywhere in `[old LOAD end, new LOAD end)`
+(plain: `0x391428` → `0x3a1c70`) fails the load — loudly on ConOut (`gnoboot: fail @ AP`), which on a headless box is
+simply no kernel output. The region-7 check covers the stacks; **the image span's allocatability is proven only by
+booting**, so the next burn's checklist is: the kernel banner appears (the allocation succeeded) AND both OK lines
+above. (QEMU/OVMF: the whole span is EfiLoaderCode, region 7 free — every smoke.)
+
+**KASLR (dormant) must re-derive three things here.** `CYRIUS_PIE=1` builds are refused today (`bad entry point`), so
+nothing below is live, but the 1.57.12 layout leans on the fixed `0x100000` base in three places a slid kernel breaks:
+(1) the boot stack slides with the image into `[32 MB, 254 MB)` (gnoboot slides ET_DYN to `0x2000000 + k·0x200000`),
+i.e. PD[16..126], which a user PT_LOAD in `[0x400000, 0x10000000)` overrides in its own CR3 — the stack must stay
+mapped under every CR3 kmain is switched out under, which PD[0..1] guaranteed; (2) gate 34's (2)/(8) decode expects
+`movabs` immediates, while a PIE build emits `lea rax, [rip+…]` / `lea rcx, [rip+…]` / `mov [rcx], rax` — accept the
+RIP-relative form; (3) `mbi.cyr` `kernel_image_end` reads the ELF header at `0x100000`, so a slid kernel prints the
+`unchecked` lines (not in `SMOKE_INVARIANT_DENY`; only agnsh-smoke, which requires the OK lines, would notice) — read
+the base from `boot_info + 0x70` instead. Recorded in `docs/development/proposals/2026-05-11-kaslr-scope.md` too.
+
+### History — the fixed region-1 windows (1.57.3 – 1.57.11)
+
+The 1.57.11 map above the image was `[LOAD end, 0x3D0000)` headroom · `[0x3D0000, 0x3E0000)` boot stack · `[0x3E0000,
+0x3F0000)` unused guard gap · `[0x3F0000, 0x400000)` BSP TSS.RSP0. 1.57.11 had moved all three up 256 KB (top
+`0x3A0000` → `0x3E0000`, bound `0x390000` → `0x3D0000`, RSP0 `0x3C0000` → `0x400000`) for the read-only ZFS module's
+~100 KB, after auditing `[0x3C0000, 0x400000)` (every reference was a stale comment — the old syscall kstacks left region
+1 at 1.46.x/1.51.x), and noted that region 1 was then full: the next growth needed the BSP stacks somewhere else — which
+is 1.57.12. The boot stack was `[0x370000, 0x380000)` from 1.57.3 through 1.57.6; the IMG step moved it up 128 KB because
+the 1.57.7 plan's image estimates left 4 B of headroom and three flag builds the sweep boots were already past
+`0x370000`. Neither region-1 stack had a guard page. 1.57.7 (IMG-fix) made the window's one iron-only risk observable:
+kmain checked that every UEFI descriptor meeting the span was free RAM after ExitBootServices (`mbi.cyr`
+`bootstack_window_check`, superseded by `uefi_span_check`) — nothing reserved the window before the shim's first push:
+`pmm_init`'s 0–4 MB reservation is the kernel's own bookkeeping, made later; gnoboot pins only the kernel image (ET_EXEC
+`AllocateAddress`), allocates the `/initramfs` and `/cmdline` blobs with `AllocateAnyPages` (EfiLoaderData), and keeps
+`boot_info` and the memory-map buffer in its own image (EfiLoaderCode).
 
 ## The lifecycle boundaries on these stacks (1.57.7, S7)
 

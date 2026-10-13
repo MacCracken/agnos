@@ -9,9 +9,11 @@
 # the IMG step moved the BSP boot stack to top 0x3A0000 — so the old page matched no stack at all, named image
 # headroom that flag builds already reach (a #PF on future .rodata there would read as a "smash"), and a
 # leaked kmain frame (0x39fxxx) would have scored clean. Two windows now, both computed at run time:
-#   W1 the BSP boot stack's 64 KB budget [BSP_BOOT_TOP - 64 KB, BSP_BOOT_TOP), BSP_BOOT_TOP read out of
-#      scripts/check/image-layout-check.sh (the one place the tree states it, gated against the shim's bytes),
-#      so the next stack move cannot strand this probe again — kmain's frames;
+#   W1 the BSP boot stack — kmain's frames. ⭐ 1.57.12: it is no longer a fixed region-1 window but a 64 KB array in
+#      the image's .bss (boot_shim.cyr bsp_boot_stack), so its span is DECODED from the kernel ELF this probe boots
+#      (::boot/agnos, copied back out of the agnsh-smoke disk image) by `image-layout-check.sh --bsp-stack-span`,
+#      the same decoder gate 34 uses on the shim's stack load. (1.57.7-1.57.11 read BSP_BOOT_TOP out of that script:
+#      [BSP_BOOT_TOP - 64 KB, BSP_BOOT_TOP).) A stack move cannot strand this probe;
 #   W2 the region-7 per-process kernel-stack pool through the direct map, DIRECTMAP_BASE + [0xE00000,
 #      0x1000000) (DIRECTMAP_BASE from kernel/core/vmm.cyr) — where a syscall-path frame lives today.
 #
@@ -82,11 +84,13 @@ OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 [ -f "$IMG" ] || { echo "ERROR: image $IMG not built — run agnsh-smoke.sh first"; exit 1; }
 
-BSP_BOOT_TOP=$(sed -n 's/^BSP_BOOT_TOP = \(0x[0-9A-Fa-f]*\).*/\1/p' "$ROOT/scripts/check/image-layout-check.sh" | head -1)
+KELF="$WORK/rbp-repro-agnos.elf"
+rm -f "$KELF"
+mcopy -o -i "$IMG"@@1048576 ::boot/agnos "$KELF" 2>/dev/null || { echo "ERROR: cannot copy ::boot/agnos out of $IMG (mtools) — no smash window"; exit 2; }
+BSP_SPAN=$(sh "$ROOT/scripts/check/image-layout-check.sh" --bsp-stack-span "$KELF") || { echo "ERROR: image-layout-check.sh --bsp-stack-span could not decode the BSP boot stack from $KELF: $BSP_SPAN — no smash window"; exit 2; }
 DM_BASE=$(sed -n 's/^var DIRECTMAP_BASE = \(0x[0-9A-Fa-f]*\);.*/\1/p' "$ROOT/kernel/core/vmm.cyr" | head -1)
-[ -n "$BSP_BOOT_TOP" ] || { echo "ERROR: cannot read BSP_BOOT_TOP from scripts/check/image-layout-check.sh — no smash window"; exit 2; }
 [ -n "$DM_BASE" ] || { echo "ERROR: cannot read DIRECTMAP_BASE from kernel/core/vmm.cyr — no smash window"; exit 2; }
-W1_LO=$(printf '0x%x' $((BSP_BOOT_TOP - 0x10000))); W1_HI=$(printf '0x%x' $((BSP_BOOT_TOP - 1)))
+W1_LO=${BSP_SPAN% *}; W1_HI=$(printf '0x%x' $((${BSP_SPAN#* } - 1)))
 W2_LO=$(printf '0x%x' $((DM_BASE + 0xE00000)));    W2_HI=$(printf '0x%x' $((DM_BASE + 0xFFFFFF)))
 echo "smash windows: W1 kmain boot stack [$W1_LO, $W1_HI]  W2 region-7 kstack pool (direct map) [$W2_LO, $W2_HI]"
 smash=0; reached=0; pf_total=0; boots=0; ev_total=0; blind=0; evidenced=0

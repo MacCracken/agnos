@@ -493,6 +493,45 @@ fn sh_cmd_run(arg, arglen) {
     return 0;
 }
 
+# `blkread <sector>`: hexdump the first 64 bytes of one LBA.
+# ⛔ 1.57.12 — THE LBA BUFFER IS A PER-CALL kmalloc(4096), NOT A 4 KB LOCAL OF sh_exec. As `var rbuf[4096];` inside
+# sh_exec it made sh_exec's frame 5,152 B in every build — larger than the 4 KB not-present guard page at the bottom
+# of every region-7 kernel-stack slot, so the frame could step OVER a guard: called near the bottom of a slot, the
+# buffer would sit below it, in the top of the next slot down (another live stack), and blk_read would write it
+# without a fault. (sh_exec's callers — the recovery REPL and the boot selftests — run on kmain's BSP boot stack
+# today, whose 8 KB red zone catches a 5 KB frame; the guard rule cannot depend on that.) image-layout-check (9)
+# now holds every frame <= 0xC00. kmalloc(4096) is one whole zeroed slab page at a direct-map VA: every block
+# backend fills a caller buffer by CPU copy out of its own bounce page (never DMA into it), and a buffer per call
+# keeps the verb reentrant without a lock.
+# ⛔⛔ 1.56.52 — 4096 bytes, NOT 64. blk_read writes ONE WHOLE LBA into this buffer, and the LBA size is the DEVICE's:
+# 512 on most disks and 4096 on a 4K-LBA NVMe. At 64 that was 448 bytes of ring-0 stack smashed on a 512 B disk and
+# 4032 on a 4K one; the hexdump below only READS 64 bytes, which is what hid it. 4096 matches blk_sc_bounce, the
+# largest LBA the block layer will register.
+fn sh_cmd_blkread(arg, arglen) {
+    if (blk_active == 0) { kprintln("no block device", 15); return 0; }
+    # Parse sector number from arg (simple decimal)
+    var sector = 0;
+    for (var i = 0; i < arglen; i = i + 1) {
+        var digit = load8(arg + i) - 48;
+        if (digit >= 0) { if (digit <= 9) { sector = sector * 10 + digit; } }
+    }
+    kprint("Reading sector ", 15);
+    kprint_num(sector);
+    kprintln(":", 1);
+    var rbuf = kmalloc(4096);
+    if (rbuf == 0) { kprintln("blkread: no memory for the LBA buffer", 37); return 0; }
+    var r = blk_read(sector, rbuf);
+    if (r != 0) { kfree_sized(rbuf, 4096); kprintln("read failed", 11); return 0; }
+    # Hexdump first 64 bytes
+    for (var j = 0; j < 64; j = j + 1) {
+        kfmt_byte(load8(rbuf + j));
+        kputc(32);
+        if ((j & 15) == 15) { kprintln("", 0); }
+    }
+    kfree_sized(rbuf, 4096);
+    return 0;
+}
+
 fn sh_exec(buf, len) {
     if (len < 1) { return 0; }
     # Find command end (first space or end)
@@ -546,7 +585,7 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "run", 3) == 1)   { return sh_cmd_run(arg, arglen); }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
-            var base = &pci_devs + i * 32;
+            var base = pci_devs + i * 32;
             kprint("  slot ", 7);
             kprint_num(load64(base));
             kprint(": vendor=", 9);
@@ -752,35 +791,7 @@ fn sh_exec(buf, len) {
         else { if (net_clock_source == 2) { kprintln(" [NTP]", 6); } else { kprintln("", 0); } }
         return 0;
     }
-    if (sh_streq(buf, clen, "blkread", 7) == 1) {
-        if (blk_active == 0) { kprintln("no block device", 15); return 0; }
-        # Parse sector number from arg (simple decimal)
-        var sector = 0;
-        for (var i = 0; i < arglen; i = i + 1) {
-            var digit = load8(arg + i) - 48;
-            if (digit >= 0) { if (digit <= 9) { sector = sector * 10 + digit; } }
-        }
-        kprint("Reading sector ", 15);
-        kprint_num(sector);
-        kprintln(":", 1);
-        # ⛔⛔ 1.56.52 — [4096], NOT [64]. blk_read writes ONE WHOLE LBA into this buffer, and the LBA
-        # size is the DEVICE's: 512 on most disks and 4096 on a 4K-LBA NVMe (a size the block layer
-        # now honours as of this same cut, so the larger case is live, not hypothetical). At [64]
-        # that is 448 bytes of ring-0 stack smashed on a 512 B disk and 4032 on a 4K one. The
-        # hexdump below only READS 64 bytes, which is what hid this — the overflow is in the callee's
-        # write, not in anything visible here. 4096 matches blk_sc_bounce, the largest LBA the block
-        # layer will register.
-        var rbuf[4096];
-        var r = blk_read(sector, &rbuf);
-        if (r != 0) { kprintln("read failed", 11); return 0; }
-        # Hexdump first 64 bytes
-        for (var i = 0; i < 64; i = i + 1) {
-            kfmt_byte(load8(&rbuf + i));
-            kputc(32);
-            if ((i & 15) == 15) { kprintln("", 0); }
-        }
-        return 0;
-    }
+    if (sh_streq(buf, clen, "blkread", 7) == 1) { return sh_cmd_blkread(arg, arglen); }
     if (sh_streq(buf, clen, "disk", 4) == 1) {
         if (blk_active == 0) { kprintln("no block device", 15); return 0; }
         if (blk_active == BLK_VIRTIO) { kprint("VirtIO-blk: ", 12); }

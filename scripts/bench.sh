@@ -12,11 +12,34 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # build — must prepend kashi's font_data.cyr (a bare `cyrius build` fails on
 # 'undefined KASHI_FONT_VGA_8X16'). Resolution mirrors scripts/build.sh:
 # sibling-checkout default, auto-clone the pinned tag when absent.
+# ⭐ 1.57.12 — a fallback clone is a CACHE of the pinned tag, and a cache has to match its key. From a
+# .claude/worktrees/<x> checkout, $ROOT/../kashi is not the dev sibling but the clone an earlier build left
+# behind: one sat at kashi 1.0.3 from July to 2026-10-09 while the pin moved to 1.0.10 and then 1.1.0 —
+# harmless only while font_data.cyr stayed byte-identical, which 1.1.0 ends. A SHALLOW, CLEAN clone whose
+# VERSION is not the pin is moved to the pinned tag IN PLACE (fetch + checkout — never rm -rf, see the rekha
+# note); a dirty one is refused; a full checkout (the dev sibling) is used as is, with a note.
+# ⚠ build.sh, test.sh and bench.sh carry this function verbatim — move them together.
+dep_pin_sync() { # <name> <dir> <ref>
+    _dv=$(cat "$2/VERSION" 2>/dev/null)
+    if [ -z "$_dv" ] || [ "$_dv" = "$3" ]; then return 0; fi
+    if [ "$(git -C "$2" rev-parse --is-shallow-repository 2>/dev/null)" != "true" ]; then
+        echo "  note: $1 at $2 is $_dv (a full checkout, used as is); the pin is $3" >&2
+        return 0
+    fi
+    if [ -n "$(git -C "$2" status --porcelain 2>/dev/null)" ]; then
+        echo "ERROR: the $1 fallback clone at $2 is $_dv WITH LOCAL CHANGES; the pin is $3 — refusing to touch it." >&2
+        exit 1
+    fi
+    echo "  the $1 fallback clone at $2 is $_dv, the pin is $3 — moving it to the tag..." >&2
+    git -C "$2" fetch --quiet --depth 1 origin tag "$3" >&2 \
+        && git -C "$2" -c advice.detachedHead=false checkout --quiet "$3" >&2 \
+        || { echo "ERROR: could not move the $1 fallback clone at $2 to $3" >&2; exit 1; }
+}
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
 # ⛔ 1.56.51: kept in step with scripts/build.sh and scripts/test.sh — see the measured note at
 # test.sh's KASHI_REF. The three had drifted to 1.0.6 / 1.0.4 / 1.0.4 with a comment naming
 # 1.0.0, invisible locally because [deps.kashi] path wins over any of them.
-KASHI_REF="${KASHI_REF:-1.0.10}"
+KASHI_REF="${KASHI_REF:-1.1.0}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout (2026-09-13) — see the rekha block in scripts/build.sh.
     if [ -d "$KASHI_DIR/.git" ]; then
@@ -32,6 +55,7 @@ if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
         exit 1
     }
 fi
+dep_pin_sync kashi "$KASHI_DIR" "$KASHI_REF"
 # rekha default-face data (1.57.2): core/kfont.cyr calls rekha_face_default_*, so EVERY kernel
 # build — this bench build included — must prepend rekha's fonts/face_data.cyr next to kashi's.
 # Resolution mirrors scripts/build.sh; REKHA_REF kept in step with build.sh and test.sh (see the
@@ -54,6 +78,7 @@ if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
         exit 1
     }
 fi
+dep_pin_sync rekha "$REKHA_DIR" "$REKHA_REF"
 
 echo "Building AGNOS with benchmarks..."
 # The bench build rewrites the kybernet() launch in core/boot_finish.cyr to
@@ -70,9 +95,10 @@ BFIN_CYR="$ROOT/kernel/core/boot_finish.cyr"
 BFIN_BAK="$BFIN_CYR.benchbak"
 cp "$BFIN_CYR" "$BFIN_BAK"
 
-# Guard the test_procs shape: the boot-test procs (KTEST-gated) are already in
-# their no-op `if (0 == 1)` form and must NOT busy-loop, else a scheduled proc
-# would keep the scheduler alive past bench's arch_halt. We make a .bak and
+# Guard the test_procs shape: the boot-test procs (KTEST-gated; since 1.57.12
+# kthreads that make a bounded number of hlt rounds and retire) must NOT
+# busy-loop, else a scheduled proc would keep the scheduler alive past bench's
+# arch_halt. bench builds do not define KTEST, so none is created. We make a .bak and
 # restore it unchanged (no transformation needed at the current shape), but the
 # guard fails loudly if a future reshape reintroduces a `while (1 == 1)` busy-
 # loop into test_procs.cyr — see that file's header comment.
@@ -158,11 +184,12 @@ cp "$ROOT/build/agnos" "$ROOT/build/agnos_bench"
 # ⭐ 1.57.7 (IMG-fix, review A5/A6): this image is "plain" to build.sh's flag test (no #define) but is built from
 # REWRITTEN sources and is booted below, so (1) it must pass the image-layout gate here — build.sh only WARNS for
 # a plain over-bound image — and (2) build/agnos is re-marked as the bench kernel it is, so a production smoke's
-# smoke_require_image refuses it instead of booting bench_run_all as if it were the shipped kernel.
+# smoke_require_image refuses it instead of booting bench_run_all as if it were the shipped kernel. (1.57.12, the second
+# ROOM review: the record's `layout=pass` is this gate's verdict — smoke_require_image refuses any other.)
 if ! sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos_bench" >&2; then
     echo "ERROR: the bench kernel fails the image-layout gate (above) — not booting it" >&2; exit 1
 fi
-printf 'flags=BENCH\nmd5=%s\n' "$(md5sum "$ROOT/build/agnos" | cut -d' ' -f1)" > "$ROOT/build/agnos.flags"
+printf 'flags=BENCH\nmd5=%s\nlayout=pass\n' "$(md5sum "$ROOT/build/agnos" | cut -d' ' -f1)" > "$ROOT/build/agnos.flags"
 
 # Sources restored — undo the trap so a later non-build failure doesn't try to
 # restore already-restored files.

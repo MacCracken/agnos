@@ -109,6 +109,67 @@ fn rdmsr(msr) {
     return result;
 }
 
+# ⭐ 1.57.12 B11 — INTERRUPT WINDOWS for ONE CPU's long kernel path that holds only plain spinlocks (today: the ZFS commit,
+# core/zfs_write.cyr zfs_commit — design 2026-10-09-zfs-write.md § b.3 "Hold time", k.126 (B11)). The path opts in
+# (kirqw_begin, on its own CPU only) and calls kirqw_point where it holds no lock an interrupt handler could want — the
+# commit between its device writes, the NVMe / AHCI completion polls it waits in (nvme_io_poll_n, ahci_poll_slot0: they
+# are POLLED, no ISR takes nvme_lock / ahci_lock). A point at least KIRQW_GAP µs after the last one opens a window when the
+# path asked for live ones — `pushfq; clac; sti; nop; cli; popfq`: one pending interrupt (and any that follows at the
+# iretq) is taken with AC clear (the ISR never runs with SMAP lifted — idt.cyr's exception stub clacs for the same
+# reason), and the caller's IF and AC come back exactly (a syscall's IF=0, kybernet's IF=1). The path holds
+# preempt_count > 0 (a plain spinlock, smp.cyr), so the timer ISR never switches it out. Every point also MEASURES: the
+# longest stretch between two points (kirqw_max) is the interrupt latency the path imposes with windows open — the
+# whole path without them. kirqw_cpu 0 = nobody opted in: a point is one load and a return.
+var KIRQW_GAP  = 20;         # µs between windows (a completion poll spins far faster than interrupts arrive)
+var kirqw_cpu  = 0;          # pcpu_cpu() + 1 of the CPU whose path opted in, 0 = none
+var kirqw_live = 0;          # 1 = the points OPEN interrupts; 0 = they only measure
+var kirqw_last = 0;          # klog_uptime_us of the last point (or the path's start)
+var kirqw_max  = 0;          # the longest stretch between two points (or the start / end), µs
+var kirqw_n    = 0;          # windows opened
+fn kirqw_begin(live) {
+    # never inside an interrupt handler (apic_in_service: the timer ISR's death chain reaches a process's fd-table
+    # teardown, which may commit): an `sti` there would nest interrupts on the handler before its EOI — measure only
+    if (live == 1 && apic_in_service() == 1) { live = 0; }
+    kirqw_live = live;
+    kirqw_last = klog_uptime_us();
+    kirqw_max = 0;
+    kirqw_n = 0;
+    kirqw_cpu = pcpu_cpu() + 1;
+    return 0;
+}
+fn kirqw_point() {
+    if (kirqw_cpu == 0) { return 0; }
+    if (kirqw_cpu != pcpu_cpu() + 1) { return 0; }
+    var now = klog_uptime_us();
+    var d = now - kirqw_last;
+    if (d < KIRQW_GAP) { return 0; }
+    if (d > kirqw_max) { kirqw_max = d; }
+    kirqw_last = now;
+    if (kirqw_live == 1) {
+        # REGISTER CONTRACT: no GPR read or written. pushfq saves RFLAGS on the stack; clac clears AC; sti sets IF (its
+        # one-instruction shadow covers the nop, so a pending interrupt is delivered after it); cli clears IF; popfq
+        # restores the saved RFLAGS — IF and AC exactly as the caller had them. RSP is back where it was.
+        asm {
+            0x9C;                     # pushfq
+            0x0F; 0x01; 0xCA;         # clac
+            0xFB;                     # sti
+            0x90;                     # nop  (the interrupt shadow ends here: a pending interrupt is taken)
+            0xFA;                     # cli
+            0x9D;                     # popfq
+        }
+        kirqw_n = kirqw_n + 1;
+    }
+    return 0;
+}
+# The path's end: the last stretch measured, the opt-in withdrawn. 0.
+fn kirqw_end() {
+    if (kirqw_cpu == 0) { return 0; }
+    var d = klog_uptime_us() - kirqw_last;
+    if (d > kirqw_max) { kirqw_max = d; }
+    kirqw_cpu = 0;
+    return 0;
+}
+
 # Hardware random 64-bit via RDRAND. Returns 0 on failure (Intel SDM
 # specifies destination is zeroed on RDRAND failure); callers should
 # check val==0 and fall back to a mixer. Extracted from the

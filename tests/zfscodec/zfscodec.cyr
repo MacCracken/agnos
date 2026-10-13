@@ -1,5 +1,6 @@
 # zfscodec.cyr — HOST oracle for kernel/core/zfs_codec.cyr, the ZFS driver's checksum and
-# decompression primitives. Exits 95 iff every case passes (repo convention), 90 otherwise.
+# decompression primitives, and (1.57.12 B3a) kernel/core/zfs_wenc.cyr, the writer's pure encoders
+# (zt_zlec / zt_wcomp / zt_bp / zt_sm below). Exits 95 iff every case passes (repo convention), 90 otherwise.
 #
 # ⭐ ONE IMPLEMENTATION. This INCLUDES the kernel file rather than mirroring it, so what passes here
 # is the code the kernel runs, compiled by the same cyrius pin. The expected side is
@@ -21,6 +22,8 @@
 
 include "../../kernel/klib/kstring.cyr"
 include "../../kernel/core/zfs_codec.cyr"
+#define ZFS_WRITE_OPS                       # 1.57.12 B5: compiles zfs_wenc.cyr's agnos-gen-1 (the op list's content)
+include "../../kernel/core/zfs_wenc.cyr"   # 1.57.12 B3a: the writer's pure encoders, proven here the same way
 include "gen/vectors.cyr"
 
 var ZT_PAGE = 4096;
@@ -196,7 +199,8 @@ fn zt_call_sum(kind, p, n, out) {
     if (kind == 3) { return zfs_sha512_256_le_words(p, n, out); }
     if (kind == 4) { return zfs_fletcher4(p, n, out); }
     if (kind == 5) { return zfs_fletcher2(p, n, out); }
-    return 0 - 2;
+    if (kind >= 20) { return zfs_cksum_words(kind - 20, p, n, out); }   # 1.57.12: the BP checksum dispatch, ck = kind - 20
+    return 0 - 3;
 }
 
 # zt_sum(kind, name, sel, len, expect): sel >= 0 is a blob id, -1 the PRNG buffer's first len bytes.
@@ -471,6 +475,533 @@ fn zt_fuzz(kind, name, sid, cap, iters, fnv) {
     zt_putn(acc);
     zt_puts(" accepted, no fault");
     zt_nl();
+    return zt_ok(name);
+}
+
+# --- 1.57.12 B3a: the writer's encoders -------------------------------------------------------------
+# zt_zlec(name, sid, dlen, eid, expect): zfs_zle_compress blob sid into dlen bytes. expect: the compressed length —
+# the output must then equal blob eid (OpenZFS zle_compress's bytes, by the generator's port) and decode back to
+# sid through the reader's decoder — or -1 (did not fit). Both placements; the source must be unmodified and nothing
+# may be written past dlen (placement 0 faults on it, placement 1 checks a 64-byte canary).
+fn zt_zlec(name, sid, dlen, eid, expect) {
+    var slen = zt_load(sid, zt_stage);
+    if (slen < 0) { return zt_bad(name, "vector blob failed its embedding check"); }
+    if (expect >= 0) {
+        if (zt_load(eid, zt_plain) != expect) { return zt_bad(name, "expected blob length != expected return"); }
+    }
+    if (slen + 64 > ZT_AREA || dlen + 64 > ZT_AREA) { return zt_bad(name, "vector larger than the test area"); }
+    var place = 0;
+    while (place < 2) {
+        var src = zt_srcA + ZT_AREA - slen;
+        var dst = zt_dstA + ZT_AREA - dlen;
+        var span = dlen;
+        if (place == 1) {
+            src = zt_srcA;
+            dst = zt_dstA;
+            span = dlen + 64;
+        }
+        memcpy(src, zt_stage, slen);
+        memset(dst, 0xA5, span);
+        var rc = zfs_zle_compress(src, slen, dst, dlen, 64);
+        if (rc != expect) {
+            zt_puts("  placement ");
+            zt_putn(place);
+            zt_puts(": rc ");
+            zt_putn(rc);
+            zt_puts(", want ");
+            zt_putn(expect);
+            zt_nl();
+            return zt_bad(name, "wrong return value");
+        }
+        if (memeq(src, zt_stage, slen) == 0) { return zt_bad(name, "the compressor wrote into its source"); }
+        if (place == 1) {
+            if (zt_all(dst + dlen, 64, 0xA5) == 0) { return zt_bad(name, "wrote past dlen"); }
+        }
+        if (rc >= 0) {
+            if (memeq(dst, zt_plain, rc) == 0) { return zt_bad(name, "output differs from OpenZFS zle_compress's"); }
+            if (zfs_zle_decompress(dst, rc, zt_fz, slen, 64) != 0) { return zt_bad(name, "the output does not decode"); }
+            if (memeq(zt_fz, zt_stage, slen) == 0) { return zt_bad(name, "the round trip differs from the input"); }
+        }
+        place = place + 1;
+    }
+    return zt_ok(name);
+}
+
+# zt_wcomp(name, sid, ma, eid, expect): zfs_wcomp on blob sid (lsize = its length) at allocation unit ma; expect =
+# the psize zio_write_compress arrives at (0 hole, lsize OFF, else ZLE) — and for ZLE the psize bytes in dst (zero
+# tail included) must equal blob eid. dst has exactly lsize bytes of room (placement 0: against the guard page).
+fn zt_wcomp(name, sid, ma, eid, expect) {
+    var lsize = zt_load(sid, zt_stage);
+    if (lsize < 0) { return zt_bad(name, "vector blob failed its embedding check"); }
+    if (expect > 0 && expect < lsize) {
+        if (zt_load(eid, zt_plain) != expect) { return zt_bad(name, "expected blob length != expected psize"); }
+    }
+    if (lsize + 64 > ZT_AREA) { return zt_bad(name, "vector larger than the test area"); }
+    var place = 0;
+    while (place < 2) {
+        var src = zt_srcA + ZT_AREA - lsize;
+        var dst = zt_dstA + ZT_AREA - lsize;
+        var span = lsize;
+        if (place == 1) {
+            src = zt_srcA;
+            dst = zt_dstA;
+            span = lsize + 64;
+        }
+        memcpy(src, zt_stage, lsize);
+        memset(dst, 0xA5, span);
+        var rc = zfs_wcomp(src, lsize, dst, ma);
+        if (rc != expect) {
+            zt_puts("  placement ");
+            zt_putn(place);
+            zt_puts(": psize ");
+            zt_putn(rc);
+            zt_puts(", want ");
+            zt_putn(expect);
+            zt_nl();
+            return zt_bad(name, "wrong psize");
+        }
+        if (memeq(src, zt_stage, lsize) == 0) { return zt_bad(name, "zfs_wcomp wrote into its source"); }
+        if (place == 1) {
+            if (zt_all(dst + lsize, 64, 0xA5) == 0) { return zt_bad(name, "wrote past lsize"); }
+        }
+        if (rc > 0 && rc < lsize) {
+            if (memeq(dst, zt_plain, rc) == 0) { return zt_bad(name, "physical bytes differ from OpenZFS's"); }
+        }
+        place = place + 1;
+    }
+    return zt_ok(name);
+}
+
+# zt_bp(name, sid, k): block-pointer record k of blob sid, 40 u64 = 320 B: [0] 0 written / 1 hole · [1] DVA count ·
+# [2..10] (asize, vdev, offset) x 3 · [11] lsize · [12] psize · [13] comp · [14] checksum alg · [15] type · [16] level ·
+# [17] birth · [18] fill · [19..22] checksum words · [23] expected return (0 / -1 as u64) · [24..39] the expected
+# 16 words. A written BP is built the way zfs_write.cyr builds one: a zeroed BP, zfs_dva_w0/w1 per DVA, then
+# zfs_bp_prop + zfs_bp_fin; a hole is zfs_bp_mkhole. The BP sits against the guard page (a 129th byte faults).
+fn zt_bp(name, sid, k) {
+    var n = zt_load(sid, zt_stage);
+    if (n < (k + 1) * 320) { return zt_bad(name, "vector blob failed its embedding check"); }
+    var r = zt_stage + k * 320;
+    var bp = zt_dstA + ZT_AREA - 128;
+    memset(bp, 0xA5, 128);
+    var rc = 0;
+    if (load64(r) == 1) {
+        rc = zfs_bp_mkhole(bp, load64(r + 88), load64(r + 120), load64(r + 128), load64(r + 136));
+    } else {
+        memset(bp, 0, 128);
+        var d = 0;
+        while (d < load64(r + 8)) {
+            var w0 = zfs_dva_w0(load64(r + 16 + d * 24), load64(r + 24 + d * 24));
+            var w1 = zfs_dva_w1(load64(r + 32 + d * 24));
+            if (w0 == (0 - 1) || w1 == (0 - 1)) { rc = 0 - 1; }
+            store64(bp + d * 16, w0);
+            store64(bp + d * 16 + 8, w1);
+            d = d + 1;
+        }
+        var pr = zfs_bp_prop(load64(r + 88), load64(r + 96), load64(r + 104), load64(r + 112), load64(r + 120), load64(r + 128));
+        if (pr == (0 - 1)) { rc = 0 - 1; }
+        if (rc == 0) { zfs_bp_fin(bp, pr, load64(r + 136), load64(r + 144), r + 152); }
+    }
+    if (rc != load64(r + 184)) {
+        zt_puts("  rc ");
+        zt_putn(rc);
+        zt_puts(", want ");
+        zt_putn(load64(r + 184));
+        zt_nl();
+        return zt_bad(name, "wrong return value");
+    }
+    if (rc != 0) { return zt_ok(name); }
+    var i = 0;
+    while (i < 16) {
+        if (load64(bp + i * 8) != load64(r + 192 + i * 8)) {
+            zt_puts("  word ");
+            zt_putn(i);
+            zt_puts(" got ");
+            zt_hex(load64(bp + i * 8));
+            zt_puts(" want ");
+            zt_hex(load64(r + 192 + i * 8));
+            zt_nl();
+            return zt_bad(name, "block-pointer words differ");
+        }
+        i = i + 1;
+    }
+    return zt_ok(name);
+}
+
+# zt_sm(name, sid): a space-map script. Blob: [blksz, cap, nops, final length] (4 u64), nops op records of 8 u64
+# [code, a, b, c, d, e, 0, expected return], then the expected cap bytes of the map buffer — which starts 0xA5-filled,
+# so every byte the encoder writes, and every byte it must not, is checked. code 1 zfs_sm_put(word a) · 2
+# zfs_sm_seg(ty a, start b, size c, vdev d, words e) · 3 zfs_sm_put(zfs_sm_dbg(act a, pass b, txg c)) (-1 when the
+# debug word itself is refused). The buffer ends at the guard page (placement 0) or carries a canary (placement 1).
+fn zt_sm(name, sid) {
+    var n = zt_load(sid, zt_stage);
+    if (n < 32) { return zt_bad(name, "vector blob failed its embedding check"); }
+    var blksz = load64(zt_stage);
+    var cap = load64(zt_stage + 8);
+    var nops = load64(zt_stage + 16);
+    var flen = load64(zt_stage + 24);
+    var ops = zt_stage + 32;
+    var want = ops + nops * 64;
+    if (n != 32 + nops * 64 + cap || cap + 64 > ZT_AREA) { return zt_bad(name, "malformed script blob"); }
+    var place = 0;
+    while (place < 2) {
+        var buf = zt_dstA + ZT_AREA - cap;
+        var span = cap;
+        if (place == 1) {
+            buf = zt_dstA;
+            span = cap + 64;
+        }
+        memset(buf, 0xA5, span);
+        var len = 0;
+        var i = 0;
+        while (i < nops) {
+            var o = ops + i * 64;
+            var c = load64(o);
+            var rc = 0 - 9;
+            if (c == 1) { rc = zfs_sm_put(buf, len, cap, load64(o + 8)); }
+            elif (c == 2) { rc = zfs_sm_seg(buf, len, cap, blksz, load64(o + 8), load64(o + 16), load64(o + 24), load64(o + 32), load64(o + 40)); }
+            elif (c == 3) {
+                var w = zfs_sm_dbg(load64(o + 8), load64(o + 16), load64(o + 24));
+                if (w == (0 - 1)) { rc = 0 - 1; } else { rc = zfs_sm_put(buf, len, cap, w); }
+            }
+            if (rc != load64(o + 56)) {
+                zt_puts("  op ");
+                zt_putn(i);
+                zt_puts(": rc ");
+                zt_putn(rc);
+                zt_puts(", want ");
+                zt_putn(load64(o + 56));
+                zt_nl();
+                return zt_bad(name, "wrong return value");
+            }
+            if (rc >= 0) { len = rc; }
+            i = i + 1;
+        }
+        if (len != flen) { return zt_bad(name, "final length differs"); }
+        if (memeq(buf, want, cap) == 0) {
+            var j = 0;
+            while (j < cap && load8(buf + j) == load8(want + j)) { j = j + 1; }
+            zt_puts("  first differing byte ");
+            zt_putn(j);
+            zt_nl();
+            return zt_bad(name, "space-map bytes differ");
+        }
+        if (place == 1) {
+            if (zt_all(buf + cap, 64, 0xA5) == 0) { return zt_bad(name, "wrote past cap"); }
+        }
+        place = place + 1;
+    }
+    return zt_ok(name);
+}
+
+# zt_fill(name, sid, kind, expect, eid): kind 1 zfs_fill_dnodes / 2 zfs_ind_ready on blob sid (the block, against the
+# guard page); the fill must be expect, and for kind 2 the block afterwards must equal blob eid (zeroed when every
+# child was a hole, untouched otherwise). Also the 1.57.12 writer section.
+fn zt_fill(name, sid, kind, expect, eid) {
+    var n = zt_load(sid, zt_stage);
+    if (n < 0) { return zt_bad(name, "vector blob failed its embedding check"); }
+    if (kind == 2) {
+        if (zt_load(eid, zt_plain) != n) { return zt_bad(name, "expected block blob has the wrong length"); }
+    }
+    var p = zt_dstA + ZT_AREA - n;
+    memcpy(p, zt_stage, n);
+    var f = 0;
+    if (kind == 1) { f = zfs_fill_dnodes(p, n); } else { f = zfs_ind_ready(p, n); }
+    if (f != expect) {
+        zt_puts("  fill ");
+        zt_putn(f);
+        zt_puts(", want ");
+        zt_putn(expect);
+        zt_nl();
+        return zt_bad(name, "wrong fill");
+    }
+    if (kind == 1) {
+        if (memeq(p, zt_stage, n) == 0) { return zt_bad(name, "zfs_fill_dnodes wrote into the block"); }
+    } else {
+        if (memeq(p, zt_plain, n) == 0) { return zt_bad(name, "the readied block differs"); }
+    }
+    return zt_ok(name);
+}
+
+# --- 1.57.12 B4: the dataset COW's accounting rules (kernel/core/zfs_wenc.cyr) ------------------------------------
+# zt_acct(name, kind, a, b, c, d, expect): kind 1 zfs_ot_meta(a) · 2 zfs_pdelta(a, b, c) · 3 zfs_md_copies(a, b, c, d)
+# — each must return expect.
+fn zt_acct(name, kind, a, b, c, d, expect) {
+    var r = 0 - 99;
+    if (kind == 1) { r = zfs_ot_meta(a); }
+    elif (kind == 2) { r = zfs_pdelta(a, b, c); }
+    elif (kind == 3) { r = zfs_md_copies(a, b, c, d); }
+    if (r != expect) {
+        zt_puts("  got ");
+        zt_putn(r);
+        zt_puts(", want ");
+        zt_putn(expect);
+        zt_nl();
+        return zt_bad(name, "wrong value");
+    }
+    return zt_ok(name);
+}
+# zt_bpacct(name, sid, ucs, birth): blob sid is ONE 128-byte BP, placed against the guard page — zfs_bp_ucsize and
+# zfs_bp_birth must give ucs and birth, and read nothing past it.
+fn zt_bpacct(name, sid, ucs, birth) {
+    if (zt_load(sid, zt_stage) != 128) { return zt_bad(name, "the BP blob is not 128 bytes"); }
+    var p = zt_dstA + ZT_AREA - 128;
+    memcpy(p, zt_stage, 128);
+    var u = zfs_bp_ucsize(p);
+    var b = zfs_bp_birth(p);
+    if (u != ucs || b != birth) {
+        zt_puts("  ucsize ");
+        zt_putn(u);
+        zt_puts(" birth ");
+        zt_putn(b);
+        zt_puts(", want ");
+        zt_putn(ucs);
+        zt_puts(" / ");
+        zt_putn(birth);
+        zt_nl();
+        return zt_bad(name, "wrong UCSIZE or birth");
+    }
+    return zt_ok(name);
+}
+# zt_said(name, sid, bt, rc, uid, gid, pj): blob sid is a bonus (or spill) of its own length, placed against the guard
+# page — zfs_sa_ids(bt, it, its length) must return rc and, for rc 0, the uid / gid / project id given.
+fn zt_said(name, sid, bt, rc, uid, gid, pj) {
+    var n = zt_load(sid, zt_stage);
+    if (n < 0) { return zt_bad(name, "vector blob failed its embedding check"); }
+    var p = zt_dstA + ZT_AREA - n;
+    memcpy(p, zt_stage, n);
+    var o[24];
+    var r = zfs_sa_ids(bt, p, n, &o);
+    if (r != rc) {
+        zt_puts("  rc ");
+        zt_putn(r);
+        zt_puts(", want ");
+        zt_putn(rc);
+        zt_nl();
+        return zt_bad(name, "wrong verdict");
+    }
+    if (rc == 0 && (load64(&o) != uid || load64(&o + 8) != gid || load64(&o + 16) != pj)) {
+        zt_puts("  ids ");
+        zt_putn(load64(&o));
+        zt_puts(" ");
+        zt_putn(load64(&o + 8));
+        zt_puts(" ");
+        zt_putn(load64(&o + 16));
+        zt_nl();
+        return zt_bad(name, "wrong ids");
+    }
+    return zt_ok(name);
+}
+
+# --- 1.57.12 B11: UTF-8 names (kernel/core/zfs_wenc.cyr zfs_u8_valid) -----------------------------------------------------
+# zt_u8(name, sid, off, n, want): bytes [off, off + n) of blob sid (every UTF-8 vector lives in one) placed so they END at
+# the guard page — zfs_u8_valid must return u8_validate's class want (0 / 1 EILSEQ / 2 ERANGE / 3 EINVAL) and read nothing
+# past them. The blob (a few KiB) is loaded, and its embedding checked, by every case.
+fn zt_u8(name, sid, off, n, want) {
+    if (zt_load(sid, zt_stage) < off + n) { return zt_bad(name, "vector blob failed its embedding check"); }
+    var p = zt_dstA + ZT_AREA - n;
+    memcpy(p, zt_stage + off, n);
+    var r = zfs_u8_valid(p, n);
+    if (r != want) {
+        zt_puts("  got ");
+        zt_putn(r);
+        zt_puts(", want ");
+        zt_putn(want);
+        zt_nl();
+        return zt_bad(name, "wrong u8_validate class");
+    }
+    return zt_ok(name);
+}
+
+# --- 1.57.12 B8: the fat ZAP (kernel/core/zfs_wenc.cyr zfs_zf_* / zfs_zl_*) ------------------------------------------
+# The kernel's fat-ZAP code runs here over a FLAT image — block k at zt_zimg + (k << zfs_zf_bs), its last block ending
+# exactly at the guard page and 64 canary bytes before its first — through the four resolvers it calls, defined here
+# as the kernel defines them over its dirty set (core/zfs_write.cyr zfs_zf_blk / zfs_zf_rblk / zfs_zf_kill /
+# zfs_zf_gok). (B8 review) Two knobs a script sets (op 9) stand for the kernel's refusals: zt_zkfail — every
+# zfs_zf_kill fails, changing nothing (an unreadable or snapshot-owned old table block, a full kill list) — and
+# zt_zgno — zfs_zf_gok refuses (a MOS ZAP).
+var zt_zimg = 0;
+var zt_zmax = 0;
+var zt_zkfail = 0;
+var zt_zgno = 0;
+fn zfs_zf_blk(k) {
+    if (k < 0 || k >= zt_zmax) { return 0; }
+    return zt_zimg + (k << zfs_zf_bs);
+}
+fn zfs_zf_rblk(k) { return zfs_zf_blk(k); }
+fn zfs_zf_kill(k, n) {
+    if (zt_zkfail != 0 || k < 0 || n < 0 || k + n > zt_zmax) { return 0 - 1; }
+    memset(zt_zimg + (k << zfs_zf_bs), 0, n << zfs_zf_bs);
+    return 0;
+}
+fn zfs_zf_gok() { return zt_zgno; }
+# zt_zops(name, oid, olen, bs, nmax): blob oid is a ZLIB-compressed op script (zfs-codec-vectors.py ZapScript —
+# inflated by the codec's own zfs_gzip_decompress, which must give exactly olen bytes), run in order on a zeroed image
+# of nmax blocks of 2^bs bytes. Each record: u8 op, i8 the expected result code (ZZ_*; a get's 0 = the values given),
+# then — 0 add · 1 update · 2 remove · 4 get: u16 name length, the name, u8 integer size, u16 count, the integers
+# (little-endian), i32 cd (-1 = ZAP_NEED_CD) · 7 a microzap staged: u32 size, u64 salt, u64 normflags · 6 an entry into
+# it: u16 chunk, u64 value, u32 cd, u8 name length, the name · 3 the upgrade from it · 5 poke one image byte: u32
+# offset, u8 value · 8 a CHECKPOINT: u16 nd, then nd x 32 bytes — blocks 0..nd-1 must have those SHA-256 words (the
+# Python model's, or OpenZFS's own), every block past them must still be zeros · 9 the resolvers' knobs: u8 zt_zkfail,
+# u8 zt_zgno. Last, the canary before the image.
+fn zt_zops(name, oid, olen, bs, nmax) {
+    var n = zt_load(oid, zt_fz);
+    if (n < 0) { return zt_bad(name, "op blob failed its embedding check"); }
+    if (zfs_gzip_decompress(zt_fz, n, zt_stage, ZT_AREA) != 0 || zfs_codec_outlen != olen) { return zt_bad(name, "op blob did not inflate"); }
+    zfs_zf_bs = bs;
+    zt_zmax = nmax;
+    zt_zimg = zt_dstA + ZT_AREA - (nmax << bs);
+    memset(zt_zimg, 0, nmax << bs);
+    memset(zt_zimg - 64, 0xA5, 64);
+    zt_zkfail = 0;
+    zt_zgno = 0;
+    var p = zt_stage;
+    var end = zt_stage + olen;
+    var k = 0;
+    var ck = 0;
+    var msz = 0;
+    var gb[2048];
+    while (p < end) {
+        var op = load8(p);
+        var want = load8(p + 1);
+        if (want >= 128) { want = want - 256; }
+        p = p + 2;
+        var r = 0;
+        if (op == 8) {
+            var nd = load16(p);
+            var b = 0;
+            while (b < nd) {
+                zfs_sha256_words(zt_zimg + (b << bs), 1 << bs, &zt_o);
+                if (memeq(&zt_o, p + 2 + b * 32, 32) != 1) {
+                    zt_puts("  checkpoint ");
+                    zt_putn(ck);
+                    zt_puts(", block ");
+                    zt_putn(b);
+                    zt_puts(" word 0 ");
+                    zt_hex(load64(&zt_o));
+                    zt_puts(" want ");
+                    zt_hex(load64(p + 2 + b * 32));
+                    zt_nl();
+                    return zt_bad(name, "a block differs from the expected one");
+                }
+                b = b + 1;
+            }
+            if (zt_all(zt_zimg + (nd << bs), (nmax - nd) << bs, 0) != 1) { return zt_bad(name, "a block past the expected ones was written"); }
+            p = p + 2 + nd * 32;
+            ck = ck + 1;
+        } elif (op == 7) {
+            msz = load32(p);
+            memset(zt_plain, 0, msz);
+            store64(zt_plain, (1 << 63) | 3);
+            store64(zt_plain + 8, load64(p + 4));
+            store64(zt_plain + 16, load64(p + 12));
+            p = p + 20;
+        } elif (op == 6) {
+            var ce = zt_plain + 64 + load16(p) * 64;
+            store64(ce, load64(p + 2));
+            store32(ce + 8, load32(p + 10));
+            memcpy(ce + 14, p + 15, load8(p + 14));
+            p = p + 15 + load8(p + 14);
+        } elif (op == 3) {
+            r = zfs_zf_upgrade(zfs_zf_blk(0), zt_plain, msz);
+        } elif (op == 5) {
+            store8(zt_zimg + load32(p), load8(p + 4));
+            p = p + 5;
+        } elif (op == 9) {
+            zt_zkfail = load8(p);
+            zt_zgno = load8(p + 1);
+            p = p + 2;
+        } else {
+            var nl = load16(p);
+            var nm = p + 2;
+            p = p + 2 + nl;
+            var isz = load8(p);
+            var cnt = load16(p + 1);
+            var vals = p + 3;
+            p = p + 3 + isz * cnt;
+            var cd = load32(p);
+            if (cd == 0xFFFFFFFF) { cd = 0 - 1; }
+            p = p + 4;
+            var hdr = zfs_zf_blk(0);
+            var h = zfs_zf_hash(hdr, nm, nl);
+            if (zfs_zf_ns != 0) { r = ZZ_NOTSUP; }
+            elif (op <= 2) { r = zfs_zf_op(hdr, op, h, nm, nl, isz, cnt, vals, cd); }
+            else {
+                r = zfs_zf_get(hdr, h, nm, nl, isz, 2048 / isz, &gb);
+                if (r >= 0) {
+                    if (r != cnt || memeq(&gb, vals, isz * cnt) != 1) {
+                        zt_puts("  op ");
+                        zt_putn(k);
+                        zt_nl();
+                        return zt_bad(name, "a get read the wrong values");
+                    }
+                    r = 0;
+                }
+            }
+        }
+        if (r != want) {
+            zt_puts("  op ");
+            zt_putn(k);
+            zt_puts(" (kind ");
+            zt_putn(op);
+            zt_puts(") returned ");
+            zt_putn(r);
+            zt_puts(", want ");
+            zt_putn(want);
+            zt_nl();
+            return zt_bad(name, "an op's result differs");
+        }
+        k = k + 1;
+    }
+    if (zt_all(zt_zimg - 64, 64, 0xA5) != 1) { return zt_bad(name, "wrote before the image"); }
+    zt_puts("  ");
+    zt_puts(name);
+    zt_puts(": ");
+    zt_putn(k);
+    zt_puts(" op(s), ");
+    zt_putn(ck);
+    zt_puts(" checkpoint(s)");
+    zt_nl();
+    return zt_ok(name);
+}
+
+# --- 1.57.12 B5: agnos-gen-1 (kernel/core/zfs_wenc.cyr zfs_gen_seed / zfs_gen_fill) ----------------------------------
+# zt_gen(name, sid, sl, off, n, eid, h): the first sl bytes of blob sid are the seed — zfs_gen_seed of them must be h —
+# and zfs_gen_fill(h, off, dst, n), dst ending EXACTLY at the guard page with 64 canary bytes before it, must write
+# blob eid's n bytes and nothing else.
+fn zt_gen(name, sid, sl, off, n, eid, h) {
+    if (zt_load(sid, zt_stage) < sl) { return zt_bad(name, "seed blob failed its embedding check"); }
+    var g = zfs_gen_seed(zt_stage, sl);
+    if (g != h) {
+        zt_puts("  seed64 ");
+        zt_hex(g);
+        zt_puts(", want ");
+        zt_hex(h);
+        zt_nl();
+        return zt_bad(name, "wrong seed hash");
+    }
+    if (n > 0 && zt_load(eid, zt_plain) != n) { return zt_bad(name, "expected blob failed its embedding check"); }
+    var dst = zt_dstA + ZT_AREA - n;
+    memset(dst - 64, 0xA5, 64);
+    zfs_gen_fill(g, off, dst, n);
+    if (n > 0 && memeq(dst, zt_plain, n) != 1) { return zt_bad(name, "the bytes differ from zfs-expect.py's gen"); }
+    if (zt_all(dst - 64, 64, 0xA5) != 1) { return zt_bad(name, "wrote before its window"); }
+    return zt_ok(name);
+}
+# zt_gensha(name, sid, off, n, h): n bytes (<= ZT_AREA, ending at the guard page) of seed blob sid's stream at off — their
+# SHA-256 must be the expected words (zt_e4).
+fn zt_gensha(name, sid, off, n, h) {
+    var sl = zt_load(sid, zt_stage);
+    if (sl < 0) { return zt_bad(name, "seed blob failed its embedding check"); }
+    var g = zfs_gen_seed(zt_stage, sl);
+    if (g != h) { return zt_bad(name, "wrong seed hash"); }
+    var dst = zt_dstA + ZT_AREA - n;
+    zfs_gen_fill(g, off, dst, n);
+    zfs_sha256_words(dst, n, &zt_o);
+    var i = 0;
+    while (i < 4) {
+        if (load64(&zt_o + i * 8) != load64(&zt_e + i * 8)) { return zt_bad(name, "SHA-256 differs from zfs-expect.py's gen"); }
+        i = i + 1;
+    }
     return zt_ok(name);
 }
 

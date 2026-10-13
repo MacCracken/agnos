@@ -270,7 +270,14 @@ fn blk_is_registered(tag) {
 # the slot, but the filesystem-layer probe still needs to know they're
 # callable via blk_read_on. Call this from the secondary/tertiary code
 # path right after printing the "registered as secondary" log line.
-fn blk_mark_registered(tag) {
+# ⛔ 1.57.12 — IT RECORDS THE BACKEND'S LBA SIZE TOO. It set only the bit, so blk_lba_bytes_for(tag) fell back to the
+# PRIMARY's size for every secondary: an AHCI disk (512 B) or a 512 B USB stick behind a 4096 B-LBA NVMe answered
+# 4096 — blk_read#77 then copied 4096 bytes of blk_sc_bounce out for a 512 B read (3584 stale bytes: the 1.56.52
+# disclosure, through the secondary door), and every reader that sizes by blk_lba_bytes_for (the FS probes, ZFS,
+# gpt_scratch_lbas_on) read in the wrong unit. Same gate as the blk_register_* arms.
+fn blk_mark_registered(tag, lba_bytes) {
+    if (blk_lba_bytes_ok(lba_bytes) == 0) { return 0 - 1; }
+    if (tag >= 1) { if (tag <= 5) { store64(&blk_lba_by_tag + tag * 8, lba_bytes); } }
     blk_registered = blk_registered | (1 << tag);
     return 0;
 }
@@ -321,6 +328,17 @@ fn blk_flush_on(tag) {
 
 fn blk_flush() {
     return blk_flush_on(blk_active);
+}
+
+# Is this backend write-protected? 1 / 0 — 0 also when the backend cannot tell. virtio: VIRTIO_BLK_F_RO (its write
+# path refuses, vblk_blk_write); NVMe: Identify Namespace NSATTR bit 0. AHCI, USB-MS and the RAM-disk report none
+# (a write-protected stick answers its first WRITE with DATA PROTECT — a failed write, which every writer handles).
+# 1.57.12: the ZFS write gate refuses a pool on a protected device by name instead of failing its first commit.
+fn blk_readonly_on(tag) {
+    if ((blk_registered & (1 << tag)) == 0) { return 0; }
+    if (tag == BLK_VIRTIO) { return vblk_readonly; }
+    if (tag == BLK_NVME)   { return nvme_ns1_wp; }
+    return 0;
 }
 
 fn blk_read_sectors(start, count, buf) {

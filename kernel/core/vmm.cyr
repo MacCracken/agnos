@@ -66,8 +66,9 @@ fn vmm_map(virt, phys, flags) {
 #
 # Returns 1 on success, 0 on pmm_alloc failure or a refused low-4 MB phys.
 fn vmm_remap_uc_2mb(phys) {
-    # ⛔ 1.57.8 — NEVER the low 4 MB: PD[0..1] hold the boot page tables, the kernel image (<= 0x370000) and the BSP
-    # boot stacks; no device BAR lives there. An I/O port base handed in as a "phys" (virtio's PCI_CFG cap names the
+    # ⛔ 1.57.8 — NEVER the low 4 MB: PD[0..1] hold the boot page tables and the kernel image (LOAD end <= 0x400000,
+    # gate 34; the BSP boot stack is in its .bss since 1.57.12); no device BAR lives there. An I/O port base handed
+    # in as a "phys" (virtio's PCI_CFG cap names the
     # legacy I/O BAR0) made chunk 0 UC and ran the kernel's first megabyte of code uncached under KVM (~1.45 s per
     # console line). pci_bar_64 now answers 0 for an I/O BAR; this is the backstop for every other caller, and the
     # line is in SMOKE_INVARIANT_DENY (qemu-dwell.sh) so a regression fails every production smoke.
@@ -387,8 +388,9 @@ fn pmm_kva_for_access(phys) {
 # ═══════════════ 1.57.6 (Path 2, S3.3) — REGION-7 GUARD PAGES ═══════════════
 # Region 7 (phys [0xE00000, 0x1000000)) holds every kernel stack that is not the BSP's boot stack: the 16
 # per-process kernel stacks (syscalls AND CPL3 interrupts since S3.3), the 4 kthread stacks, the IST1 (#DF)
-# stacks and the AP boot/TSS stacks — 32 slots of 64 KB, always addressed through the DIRECT MAP (gdt.cyr has
-# the map). The direct map for GB 0 is ONE page directory, dm_pd, installed at the kernel PDPT[8] and copied
+# stacks and the per-CPU TSS.RSP0 slots (the AP boot stacks, and since 1.57.12 the BSP's RSP0 in slot 0) — 32
+# slots of 64 KB, always addressed through the DIRECT MAP (gdt.cyr has the map). The direct map for GB 0 is
+# ONE page directory, dm_pd, installed at the kernel PDPT[8] and copied
 # BY POINTER into every per-process CR3 (proc_create_address_space copies PDPT[1..511]), so replacing its
 # 2 MB entry 7 with a 4 KB page table reaches every address space at once. The lowest 4 KB of each slot is
 # left NOT PRESENT: a stack that overflows its 60 KB faults at CPL0 -> #DF on IST1 — whose own stack is in
@@ -397,8 +399,9 @@ fn pmm_kva_for_access(phys) {
 # on a stack right now moves.
 # Called once from main.cyr right after pmm_bitmap_use_directmap(): after cr3_load(0x1000) (the direct map
 # is only live there), before any per-proc CR3 exists and before smp_start_aps, while the BSP runs on its
-# region-1 boot stack. NOT in a BOOTCR3_KEEP_GNOBOOT_CR3 build (no direct map in kmain's context — the
-# kfont_init exclusion). Idempotent: an entry that is already a table is left alone.
+# boot stack (bsp_boot_stack, image .bss since 1.57.12; region 1 before). NOT in a BOOTCR3_KEEP_GNOBOOT_CR3
+# build (no direct map in kmain's context — the kfont_init exclusion). Idempotent: an entry that is already a
+# table is left alone.
 # ⚠ NX on the 4 KB entries: EFER.NXE is set on every CPU (boot shim 0x900, the AP trampoline 0x900), which
 # per-proc NX user pages already rely on. Nothing executes from region 7.
 var kstack_guard_pt = 0;

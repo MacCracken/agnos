@@ -31,6 +31,14 @@
 #                                 8 sectors written under the shadow read back on the kernel CR3.
 #           "dmash: window PASS"  after EVERY arm the 0xA5 region is untouched (dirty=0): no CPU store, DMA driver or
 #                                 CPU-only buffer, went through an identity VA of the pmm window.
+# 1.57.12 (ROOM — core/room.cyr, docs/architecture/kernel-image-room.md) adds the boot carve-out that holds the large
+# module arrays that left the image (the klug ring, the PCI tables, the per-CPU syscall staging ...):
+#   STATIC  room.cyr joins the CPU-only grep (room_phys is never an address).
+#   BOOT    "dmash: room PASS"    under the shadow the room header reads back through room_base and the klug ring's first
+#                                 qword through klug_buf (a moved array's own pointer) as the kernel CR3 read it; a word
+#                                 written there under the shadow is in the room on the kernel CR3, and the 0xA5 region is
+#                                 untouched. RED on a room reached by the identity VA of room_phys (mutation record:
+#                                 docs/architecture/kernel-image-room.md).
 #
 # Banner-gated retry (qemu_dwell_kernel; exit 2 on a firmware VOID), PASS/FAIL per check, the shared latched-invariant
 # deny ($SMOKE_INVARIANT_DENY), two boots: -smp 1 (TCG) and a GATED -smp 4 (smoke_accel). DSH_SMP overrides ("1 4").
@@ -50,11 +58,11 @@ void=0
 # ---- STATIC: no CPU dereference of a *_phys value in the four drivers ----
 echo "=== AGNOS DMA shadow smoke ==="
 DRV="kernel/core/virtio_blk.cyr kernel/core/nvme.cyr kernel/core/ahci.cyr kernel/core/hda.cyr"
-CPUONLY="kernel/arch/x86_64/iommu.cyr kernel/core/ramdisk.cyr kernel/arch/x86_64/fb_console.cyr"
+CPUONLY="kernel/arch/x86_64/iommu.cyr kernel/core/ramdisk.cyr kernel/arch/x86_64/fb_console.cyr kernel/core/room.cyr"
 HITS=$(cd "$ROOT" && grep -nE '(load(8|16|32|64)|store(8|16|32|64)|memset|memcpy) *\( *[A-Za-z0-9_]*_phys\b' $DRV $CPUONLY \
     | grep -vE '^[^:]+:[0-9]+: *#')
 if [ -z "$HITS" ]; then
-    echo "PASS: [static] no load/store/memset/memcpy takes a *_phys address in virtio_blk/nvme/ahci/hda/iommu/ramdisk/fb_console"
+    echo "PASS: [static] no load/store/memset/memcpy takes a *_phys address in virtio_blk/nvme/ahci/hda/iommu/ramdisk/fb_console/room"
     pass=$((pass + 1))
 else
     echo "FAIL: [static] a CPU dereference of a *_phys value:"; echo "$HITS" | head -10 | sed 's/^/        /'; fail=$((fail + 1))
@@ -157,6 +165,7 @@ for SMP in ${DSH_SMP:-1 4}; do
     check "dmash: hda PASS"      "HDA: CORB/RIRB verb round-trip under the shadow"                  "CORB/RIRB reached by identity VA"
     check "dmash: fb PASS"       "fb_console shadow: glyph lands in fb_shadow, not the identity window" "fb_shadow reached by identity VA"
     check "dmash: ramdisk PASS"  "ramdisk: sectors cross the CR3 switch byte-exact"                "ramdisk pages reached by identity VA"
+    check "dmash: room PASS"     "the ROOM carve-out (moved .bss arrays) crosses the CR3 switch: header, klug_buf, scratch" "the room reached by the identity VA of room_phys"
     check "dmash: window PASS"   "no arm stored through an identity VA (0xA5 region untouched)"    "a CPU store reached the shadowed window"
     check "dmash: done"          "the selftest ran to its last line"                                "the selftest did not finish"
     deny "dmash: [a-z-]+ (FAIL|SKIP)" "an arm printed FAIL or SKIP" "no arm printed FAIL or SKIP"

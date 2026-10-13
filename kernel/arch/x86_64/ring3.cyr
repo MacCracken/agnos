@@ -160,8 +160,8 @@ fn exec_and_wait(entry, rsp, cr3) {
     # triple fault, the ring-3 bring-up blocker). Done here under the kernel CR3.
     # 1.46.1: per-proc RSP0 — the foreground proc (proc_current_get(): agnsh for kybernet's
     # launch, the child for execwait#37) takes its CPL3->CPL0 interrupts on ITS OWN
-    # region-7 stack. Falls back to 0x400000 (= tss_kernel_stack) for an unassigned
-    # slot, so this is byte-identical where it used to pass tss_kernel_stack. Inert
+    # region-7 stack. Falls back to tss_get_cpu_stack(0) (the BSP's region-7 RSP0 slot; 0x400000 =
+    # tss_kernel_stack until 1.57.12) for an unassigned slot (proc_rsp0_top). Inert
     # at IF=0 (foreground run-to-completion takes no timer interrupt); forward-correct
     # for when exec_preempt=1 makes agnsh preemptible. Kept BEFORE the CR3 switch (the
     # APIC-read rule above).
@@ -288,8 +288,9 @@ fn iretq_to_ring3(fp) {
 # After `sched_active = 1` kmain (pid 0: the emergency shell's `run`, kybernet's /bin/agnsh, the post-scheduler boot
 # selftest hooks) launches a program as an ORDINARY SCHEDULED CHILD and BLOCKS until it exits — the same model
 # execwait#37 uses — instead of entering it out of band (exec_and_wait: IF=0, pinned, kmain's continuation in
-# per-CPU cells). kmain may block: it is a real proc (state 2, on_cpu = BSP) on its own region-1 stack and the boot
-# CR3, and it stays BSP-pinned (idle_owner 0) because that stack is the BSP boot stack (D22).
+# per-CPU cells). kmain may block: it is a real proc (state 2, on_cpu = BSP) on its own boot stack (bsp_boot_stack,
+# image .bss since 1.57.12; region 1 before) and the boot CR3, and it stays BSP-pinned (idle_owner 0) because that
+# stack is the BSP boot stack (D22).
 # kernel_run_child_keep(pid, pin): `pid` is elf_load_from_file's state-3 child of the CURRENT kernel context (kmain).
 # Blocks until it exits; returns its RAW exit code with the child DEAD BUT UNREAPED and proc_fgwait[me] still naming
 # it (INV-FG-2: its slot cannot be reused, so its page is still mapped — the KSTACK fallback phase reads it).
@@ -363,7 +364,15 @@ fn kernel_exec_foreground(pid, pin) {
 # Allocates per-process address space, maps code+stack pages, returns pid.
 # Security (S1): kernel PD entries stay supervisor-only. User code is copied
 # to a separate physical page mapped at a user-accessible virtual address.
+# 1.57.12: spawn_user_proc publishes the child READY with RING-0 selectors (its callers proc_set_ring3 it afterwards);
+# spawn_user_proc_claim leaves it CLAIMING (state 3, CR3 wired) for a launcher that publishes it itself after the
+# ring-3 selectors — kernel_exec_foreground (the KTEST Userland Exec Test), whose child no scheduler can pick early.
 fn spawn_user_proc(entry_fn) {
+    var su_pid = spawn_user_proc_claim(entry_fn);
+    if (su_pid >= 0) { proc_set_state(su_pid, 1); }   # 1.46.x #2: CR3 wired — NOW schedulable
+    return su_pid;
+}
+fn spawn_user_proc_claim(entry_fn) {
     var new_cr3 = proc_create_address_space();
     if (new_cr3 == 0) { return 0 - 1; }
 
@@ -414,8 +423,7 @@ fn spawn_user_proc(entry_fn) {
     # woken AP can't pick it mid-build (these run via the scheduler).
     var new_pid = proc_create_user(code_va, stack_top);
     if (new_pid >= 0) {
-        proc_set_cr3(new_pid, new_cr3);
-        proc_set_state(new_pid, 1);   # 1.46.x #2: CR3 wired — NOW schedulable
+        proc_set_cr3(new_pid, new_cr3);   # still CLAIMING (3): spawn_user_proc / the launcher publishes it
     }
     return new_pid;
 }

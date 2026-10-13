@@ -1,7 +1,7 @@
 #!/bin/bash
 # Read-only ZFS smoke (agnos 1.57.11) — the kernel against pools that REAL OpenZFS built.
 #
-# Seven lanes, one boot each, every one against an image from scripts/tool/zfs-fixture.sh (a FreeBSD 15.1 guest
+# Eight lanes, one boot each, every one against an image from scripts/tool/zfs-fixture.sh (a FreeBSD 15.1 guest
 # with OpenZFS in base builds the pools and writes what `zpool import -o readonly=on -R` + `zfs mount -a` shows):
 #   main      ashift 12, every default feature: lz4 / gzip / lzjb / zle / off, 1 MiB records, sha256 + sha512
 #             datasets, forced gang blocks, embedded blocks, holes, large dnodes + SA xattrs/spill, a pre-SA
@@ -14,12 +14,35 @@
 #   mirror-b  the other side, read alone
 #   makefs    FreeBSD makefs -t zfs — a second, independent ZFS writer
 #   raidz-0   one child of a raidz1 — must be REFUSED by name with no pool mounted
+#   logs      (fixture RECIPE 4) a pool OpenZFS last ran near its slop and exported with its log space maps KEPT
+#             (keep_log_spacemaps_at_export): many logs, U[] spread over the round-robin flush, FREEs later logs
+#             reallocated — the wms check below is the real many-logs replay of the write gate's state load (B1)
 # Each manifest lane boots the ZFS_SELFTEST kernel (core/zfs.cyr zfs_selftest: every grafted dir / symlink /
 # file, each file SHA-256'd through the read#5 path) and scripts/smoke/lib/zfs-manifest-diff.py demands an EXACT
 # reproduction of the manifest — the only tolerated differences are the refusals the pool's own properties
 # explain (see that script's header).
+# ⭐ 1.57.12 (bite B1, the write gate — core/zfs_write.cyr) adds three checks per lane:
+#   gate   the writer's verdict lines (`zfs: <pool> rw` / `zfs: <pool>[/<ds>] read-only (<why>)`) are EXACTLY the
+#          lane's expected set — main rw with its two refused datasets, ashift9 rw, every other lane refused by name
+#   G1     the pool partition is byte-identical to the fixture image after the boot: a mount writes NOT ONE BYTE
+#          until a write verb runs (design § h, gate G1). B2 (1.57.12): the writer can now commit, but only the
+#          ZFS_WRITE_OPS op list calls it — this kernel is refused if built with it, and no `zfs-wtest:` line may
+#          appear. The writes themselves are scripts/smoke/zfs-write-smoke.sh's.
+#   wms    on every rw lane, scripts/smoke/lib/zfs-wms-check.py diffs the kernel's ZFS_WRITE_SELFTEST state dump
+#          (every log space map, every metaslab's allocated bytes, the pool totals) against an independent host
+#          replay of the same image — the fixtures carry no `zdb -mmm` (it needs B0's scripts/tool/zfs-damage.py)
+#   b3a    (bite B3a) on every rw lane `zfs-wb3: done ok`: the writer's dirty set, allocator, frees and BP builder
+#          exercised IN MEMORY on the pool's real bitmaps, each built BP judged by the reader's own checksum and
+#          decompression code, every extent undone — and G1 above proves it wrote nothing; since the B4 review also
+#          `zfs-wb3: uacct … ok` (accounting microzaps: new keys, growth, removal at 0) and `zfs-wb3: resv … ok` (the
+#          space step across refreservation / reservation boundaries), both in memory; since the B8 review also
+#          `zfs-wb3: uafat … ok` (the commit's ADD into a FAT accounting ZAP: leaf splits, the special dnode's level,
+#          the admission's reservation and shape refusal — in memory, design k.86); since B10 also `zfs-wb3: flush … ok`
+#          (a flush whose append outgrows its space map's block: the levels, the cursor across blocks, the words replayed
+#          back — in memory, design k.118) and, on main, `zfs-wb3: gang … ok` (a MOS gang predecessor's free over
+#          gang.bin's real tree, counted, freed, undone — design k.110)
 #
-# Build first:  ZFS_SELFTEST=1 sh scripts/build.sh
+# Build first:  ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 sh scripts/build.sh
 # Requires: qemu-system-x86_64, OVMF, parted, sgdisk, mtools, python3, gnoboot at $GNOBOOT_ROOT/build/; the
 # fixture (cached under ${ZFS_FIXTURE_DIR:-~/.cache/agnos/zfs-fixtures}; a cold build downloads the FreeBSD
 # image once and needs KVM — see scripts/tool/zfs-fixture.sh). The fixture carries tests/zfs's exerciser as
@@ -40,8 +63,8 @@ done
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 2; }
-[ -f "$AGNOS" ] || { echo "ERROR: agnos not built — run ZFS_SELFTEST=1 sh scripts/build.sh"; exit 2; }
-smoke_require_image "$AGNOS" "ZFS_SELFTEST"
+[ -f "$AGNOS" ] || { echo "ERROR: agnos not built — run ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 sh scripts/build.sh"; exit 2; }
+smoke_require_image "$AGNOS" "ZFS_SELFTEST ZFS_WRITE_SELFTEST"
 
 WORK="$ROOT/build/zfs-smoke"
 LOGS="$ROOT/build/zfs-smoke-logs"
@@ -65,9 +88,11 @@ if [ -w /dev/kvm ] && [ "${SMOKE_KVM:-1}" = "1" ]; then ACCEL="-enable-kvm -cpu 
 echo "  accel: $ACCEL"
 
 rc=0; lanes=0; voids=0
-# lane <image> <marker> [--expect-refusal TEXT]
+# lane <image> <marker> <gate> [--expect-refusal TEXT]
+#   <gate>  the write gate's verdict lines without `zfs: ` and the log timestamp, '|'-separated, matched as an exact
+#           SET; "-" = no pool mounted, so no verdict line may appear
 lane() {
-    _img="$1"; _mark="$2"; shift 2
+    _img="$1"; _mark="$2"; _gate="$3"; shift 3
     _fi="$FIX/$_img.img"
     [ -f "$_fi" ] || { echo "  FAIL [$_img]: $_fi missing from the fixture"; rc=1; lanes=$((lanes + 1)); return; }
     _d="$WORK/$_img.disk"
@@ -82,6 +107,8 @@ lane() {
     dd if="$_fi" of="$_d" bs=512 seek=67584 conv=notrunc status=none
     _log="$LOGS/$_img.log"
     # shellcheck disable=SC2086 # ACCEL is deliberately word-split
+    # a firmware VOID ends the dwell at once and is retried (1.57.12 B2 review: it used to burn the 300 s budget)
+    QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @|BootManagerMenuApp|Please select boot device}" \
     qemu_dwell_kernel "$_log" "$_mark" "${QEMU_TIMEOUT:-300}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
         qemu-system-x86_64 -machine q35 -m 1024M $ACCEL \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -94,24 +121,48 @@ lane() {
     fi
     echo "  --- $_img ---"
     strings "$_log" | grep -E "^(\[[^]]*\] )?zfs: (pool|dataset|vdev|this device|pool needs)" | sed 's/^/    /'
-    if python3 -I "$ROOT/scripts/smoke/lib/zfs-manifest-diff.py" "$_log" "$FIX/$_img.manifest" "$FIX/$_img.summary" "$@"; then
-        echo "  PASS: $_img"
-    else
-        echo "  FAIL: $_img ($_log)"; rc=1
-    fi
+    _ok=1
+    python3 -I "$ROOT/scripts/smoke/lib/zfs-manifest-diff.py" "$_log" "$FIX/$_img.manifest" "$FIX/$_img.summary" "$@" || _ok=0
+    # gate: the writer's verdict lines, as a set (a reader line never has `rw` / `read-only` as its second word)
+    _got=$(strings "$_log" | sed -n -E 's/^(\[[^]]*\] )?zfs: ([^ ]+ (rw|read-only \(.*\)))$/\2/p' | sort | paste -sd'|')
+    _want=""; [ "$_gate" != "-" ] && _want=$(printf '%s\n' "$_gate" | tr '|' '\n' | sort | paste -sd'|')
+    if [ "$_got" = "$_want" ]; then echo "    gate: ${_got:-(none — no pool)}"
+    else echo "    gate: FAIL — got [${_got:-none}], want [${_want:-none}]"; _ok=0; fi
+    # G1: the boot wrote not one byte of the pool — and no op list ran: this kernel has no ZFS_WRITE_OPS (refused above
+    # by smoke_require_image), so nothing in it calls a commit (1.57.12 B2, core/zfs_write.cyr zfs_commit_ub)
+    if strings "$_log" | grep -qE "^(\[[^]]*\] )?zfs-wtest:"; then echo "    G1: FAIL — the writer's op list ran in the read smoke's kernel"; _ok=0; fi
+    if cmp -s -n "$(( _sec * 512 ))" -i "$(( 67584 * 512 )):0" "$_d" "$_fi"; then echo "    G1: the pool partition is byte-identical to the fixture image"
+    else echo "    G1: FAIL — the boot changed the pool partition"; _ok=0; fi
+    # wms: an rw lane's state dump against the host replay
+    case "|$_want|" in
+        *" rw|"*) python3 -I "$ROOT/scripts/smoke/lib/zfs-wms-check.py" "$_fi" "$_log" | sed 's/^/    /'
+                  [ "${PIPESTATUS[0]}" = "0" ] || _ok=0
+                  # b3a: the writer's in-memory exercise on this pool's real bitmaps (core/zfs_write.cyr zfs_wst_b3)
+                  if strings "$_log" | grep -qE "^(\[[^]]*\] )?zfs-wb3: done ok"; then
+                      echo "    b3a: $(strings "$_log" | sed -n -E 's/^(\[[^]]*\] )?zfs-wb3: (build zle .*)$/\2/p' | head -1)"
+                      # B4 review: the accounting microzaps and the reservation boundaries, in memory on this pool
+                      _sts="uacct uafat resv flush"; [ "$_img" = main ] && _sts="$_sts gang"
+                      for _st in $_sts; do
+                          _sl=$(strings "$_log" | sed -n -E "s/^(\[[^]]*\] )?zfs-wb3: ($_st .* ok)\$/\2/p" | head -1)
+                          if [ -n "$_sl" ]; then echo "    b3a: $_sl"; else echo "    b3a: FAIL — no zfs-wb3: $_st line"; _ok=0; fi
+                      done
+                  else echo "    b3a: FAIL — $(strings "$_log" | grep -E 'zfs-wb3:' | tail -1)"; _ok=0; fi ;;
+    esac
+    if [ "$_ok" = "1" ]; then echo "  PASS: $_img"; else echo "  FAIL: $_img ($_log)"; rc=1; fi
     rm -f "$_d"
 }
 
-lane main      "zfs-walk: done"
-lane ashift9   "zfs-walk: done"
-lane v28       "zfs-walk: done"
-lane mirror-a  "zfs-walk: done"
-lane mirror-b  "zfs-walk: done"
-lane makefs    "zfs-walk: done"
-lane raidz-0   "zfs-walk: no pool"  --expect-refusal "vdev type raidz unsupported"
+lane main      "zfs-walk: done"    "agnostank rw|agnostank/zpl4 read-only (ZPL version 4)"
+lane ashift9   "zfs-walk: done"    "agnos9 rw"
+lane v28       "zfs-walk: done"    "agnosv28 read-only (pool version 28)"
+lane mirror-a  "zfs-walk: done"    "agnosmir read-only (vdev type mirror)"
+lane mirror-b  "zfs-walk: done"    "agnosmir read-only (vdev type mirror)"
+lane makefs    "zfs-walk: done"    "agnosmk read-only (no log_spacemap)"
+lane raidz-0   "zfs-walk: no pool" "-"  --expect-refusal "vdev type raidz unsupported"
+lane logs      "zfs-walk: done"    "agnoslogs rw"
 
 # ⚠ VACUITY FLOOR (the exfat-smoke rule): a lane that silently did not run must not read as a pass.
-EXPECT=7
+EXPECT=8
 echo ""
 echo "  lanes scored: $lanes/$EXPECT  (VOID: $voids)"
 [ "$lanes" -lt "$EXPECT" ] && { echo "  FAIL: only $lanes of $EXPECT lanes ran"; rc=1; }

@@ -1,0 +1,172 @@
+# room.cyr — the kernel image's ROOM (agnos 1.57.12): ONE boot-time carve-out that holds large module arrays OUTSIDE
+# the image. Design, prior art and the rules for moving one more array: docs/architecture/kernel-image-room.md.
+#
+# WHY. The image must end at or below 0x400000, the top of region 1 and the LAST bound this layout allows (VA 0x400000
+# is ring-3 code in every process: CLAUDE.md, scripts/check/image-layout-check.sh). The LOAD image's memsz counts .bss,
+# and a module-scope `var X[N]` is N u64 = 8N bytes of it, zero or not. After the ZFS writer's B7 the binding flag
+# build had 60,216 B left while ~300 KB of .bss was arrays nothing touches until long after the physical allocator is
+# up. Operator standing rule (2026-10-11), grow before refactor: never trim code to make room — MOVE things.
+#
+# THE MECHANISM (Linux setup_log_buf + memblock; FreeBSD's msgbufp, carved off the top of phys_avail and reached
+# through PHYS_TO_DMAP). room_init runs ONCE, in kmain once the direct map is live (main.cyr: after
+# pmm_bitmap_use_directmap and fb_shadow_init — the console shadow's contiguous run is taken first — and before
+# pci_scan). It takes one 2 MB region from the pmm (pmm_alloc_2mb_run, top-down below 256 MB; when none is free there,
+# the whole live bitmap, top-down — pmm_alloc_2mb_run_under, the second ROOM review), reaches it ONLY through its
+# direct-map alias (dma_kva = DIRECTMAP_BASE + phys, kernel PDPT[8+], which
+# every per-process CR3 copies by pointer — the same memory under 0x1000, every process's CR3, the APs' and the
+# selftests' shadow CR3s; dma_kva_ok is asserted), zeroes the bytes it hands out (.bss was zero) and points each moved
+# array's POINTER at its page-aligned slot. A moved array is declared
+#     var NAME = 0xFFFFA0SS00000000;   # ROOM slot SS ...
+# — a pointer whose initial value is its POISON: the upper canonical half, PML4[0x140], which no CR3 this kernel runs on
+# maps (gnoboot's and the firmware's identity maps and every agnos table live in the lower half). Code writes
+# `NAME + off` where it wrote `&NAME + off`. A use before room_init therefore takes a CPL0 #PF at ROOM_POISON +
+# (SS << 32) + off, and the #PF stub's report (idt.cyr exc_pf_report -> room_pf_say) names the array: "PANIC: room:
+# NAME used before the carve-out" — never silently (Linux's LIST_POISON idea: a pointer that faults until it is set).
+# ⚠ BY NAME ON A CPU DEREFERENCE ONLY. A poison handed to a DEVICE as an address is no CPU access and faults nothing.
+# The room is never a DMA address (below), and the one place a kernel pointer becomes a DMA address under a bound
+# test — ext2's direct-DMA gates (ext2.cyr ext2_dma_direct_ok) — refuses a non-positive pointer: every poison is
+# negative as an i64, and Cyrius compares signed, so `p + bs <= 0x10000000` alone would have passed a page-aligned
+# poison through to the controller. A poison there takes the CPU bounce path and faults by name.
+#
+# ⛔ CPU-ONLY MEMORY. The room is never handed to a device: no IOMMU grant, and room_phys is never stored anywhere but
+# the header. A DMA buffer that must leave the image becomes its driver's own pmm pages (dma-cpu-pointers.md).
+# ⛔ NO STACKS. A stack needs a not-present guard page and the region-7 rules (kernel-stacks-and-preemption.md).
+# ⛔ ONLY ARRAYS FIRST TOUCHED AFTER room_init. Anything used earlier — idt, the GDT/TSS, pmm_bitmap, bsp_boot_stack,
+# fpu_state, the boot data — stays in the image. The klug log ring is the one array split in two (klug.cyr): an 8 KB
+# early ring in the image takes the boot log until room_init moves it into its 64 KB slot.
+# HOW TO MOVE ONE MORE: give it the next slot in room_init (room_take), declare it `var NAME = <its poison>;` where it
+# was `var NAME[N];`, turn every `&NAME` into `NAME`, and add its name to room_say. image-layout-check.sh (10) refuses
+# a slot whose declaration, poison or name disagree, any `&NAME` left in kernel/, and the array coming back into the
+# image as `var NAME[N]`.
+# aarch64: this file is in agnos.cyr's x86_64 block only. The shared files' pointers (klug_buf, sec_wfile_buf) stay
+# their poison there — an aarch64 room_init belongs to the 1.6x port (the aarch64 build does not link today).
+
+var ROOM_POISON = 0xFFFFA00000000000;   # slot SS's pointer is ROOM_POISON + (SS << 32) until room_init
+var ROOM_MAGIC  = 0x4D4F4F52534F4E47;   # "GNOSROOM" — header word 0 (DMA_SHADOW_SELFTEST reads it under a shadow CR3)
+var room_phys = 0;     # phys of the carve-out (2 MB aligned; 0 until room_init) — never dereferenced, never a DMA address
+var room_base = 0;     # its direct-map VA: the header page, then the slots
+var room_used = 0;     # bytes handed out, header page included, every slot page-rounded
+var room_slots = 0;    # arrays placed
+var room_moved = 0;    # bytes the moved arrays declare — the sum of room_take's sizes (room_used page-rounds each slot)
+var room_wide = 0;     # 1 when no 2 MB region below 256 MB was free and the carve-out came from the whole bitmap
+
+# The name of slot `slot`, on COM1 only (lock-free: the #PF report calls it). Returns 1 for a known slot.
+fn room_say(slot) {
+    if (slot == 1)  { serial_print("pcpu_spawn_elf_buf", 18); return 1; }
+    if (slot == 2)  { serial_print("klug_buf", 8); return 1; }
+    if (slot == 3)  { serial_print("pci_bar_phys", 12); return 1; }
+    if (slot == 4)  { serial_print("pci_devs", 8); return 1; }
+    if (slot == 5)  { serial_print("pci_class", 9); return 1; }
+    if (slot == 6)  { serial_print("pci_busfunc", 11); return 1; }
+    if (slot == 7)  { serial_print("sec_wfile_buf", 13); return 1; }
+    if (slot == 8)  { serial_print("pcpu_elf_hdr_buf", 16); return 1; }
+    if (slot == 9)  { serial_print("pcpu_sc_gpuop", 13); return 1; }
+    if (slot == 10) { serial_print("lo_ring", 7); return 1; }
+    if (slot == 11) { serial_print("exfat_upcase_buf", 16); return 1; }
+    return 0;
+}
+
+# The #PF report's room arm (idt.cyr exc_pf_report, every CPL0 #PF): a fault inside the poison window is a moved array
+# used before room_init. Lock-free, COM1 only. `>>` is logical, so both tests are exact on upper-half addresses.
+fn room_pf_say(cr2) {
+    if ((cr2 >> 47) != 0x1FFFF) { return 0; }             # not the upper canonical half
+    if (((cr2 >> 39) & 0x1FF) != 0x140) { return 0; }     # not PML4[0x140], the poison window
+    var rp_slot = (cr2 >> 32) & 0x7F;
+    serial_print("PANIC: room: ", 13);
+    if (room_say(rp_slot) == 0) { serial_print("slot ", 5); exc_serial_hex(rp_slot); }
+    serial_println(" used before the carve-out -- its pointer is still the poison (room_init, main.cyr) -- halting", 94);
+    return 1;
+}
+
+# Point the moved array whose pointer cell is `cell` at the next free slot. The cell must still hold slot `slot`'s
+# poison: anything else means it was written before the carve-out, or its initializer is not the poison (vidya
+# kernel_topics: do not trust a global's initial value at boot — check it).
+fn room_take(cell, slot, size) {
+    if (load64(cell) != ROOM_POISON + (slot << 32)) {
+        serial_print("PANIC: room: ", 13);
+        room_say(slot);
+        serial_print(" pointer is ", 12);
+        exc_serial_hex(load64(cell));
+        serial_println(", not its poison, before the carve-out -- written early, or a wrong initializer -- halting", 90);
+        arch_halt();
+    }
+    store64(cell, room_base + room_used);
+    room_used = room_used + ((size + 4095) & (0 - 4096));
+    room_moved = room_moved + size;
+    room_slots = room_slots + 1;
+    return 0;
+}
+
+# The carve-out. ONE call, main.cyr, after the direct map is live in kmain's context and after fb_shadow_init (whose
+# contiguous run it must not split), before anything that touches a moved array. Halts by name on every failure: the
+# moved arrays have no other home.
+# ⭐ The second ROOM review (2026-10-12): the first search is pmm_alloc_2mb_run's — top-down below 256 MB, beside the
+# console shadow and the kfont region. When no 2 MB region there is fully free (fragmented low memory on iron; a box
+# whose low pool the earlier carve-outs filled) the room does NOT halt the boot the way it did at first: it searches the
+# whole live bitmap, top-down (pmm_alloc_2mb_run_under(1, pmm_2mb_top_region)) — it needs no identity VA, only the
+# direct map, which dma_kva_ok bounds below. Every other boot carve-out degrades instead of halting (fb_shadow -> direct
+# paint, kfont -> no /fonts, the chan band -> CH_E_NOREGION); the room cannot degrade (its arrays have no other home),
+# so it widens its search. It halts only when the whole bitmap has no free 2 MB region (a <= 256 MB box keeps a 128-
+# region bitmap: the same pool, so the same answer). ⚠ A BOOTCR3_KEEP_GNOBOOT_CR3 build reaches the room by its
+# identity VA (dma_kva = phys there), and above 256 MB that VA is not the kernel's under a per-process CR3 (below 1 GB
+# it is PD[128..510], the process's mmap arena): that build's room is weaker than the image already (kernel-image-room.md
+# § The KEEP_GNOBOOT build), and a widened one weaker still.
+fn room_init() {
+    room_phys = pmm_alloc_2mb_run(1);
+    if (room_phys == 0) {
+        room_phys = pmm_alloc_2mb_run_under(1, pmm_2mb_top_region);
+        room_wide = 1;
+    }
+    if (room_phys == 0) {
+        serial_println("PANIC: room: no free 2 MB region in the whole pmm bitmap for the image carve-out -- halting", 91);
+        arch_halt();
+    }
+    var ri_kva = dma_kva(room_phys);
+    if (dma_kva_ok(ri_kva) == 0) {
+        serial_print("PANIC: room: the carve-out pointer ", 35);
+        exc_serial_hex(ri_kva);
+        serial_println(" is not in the direct map -- a per-process CR3 would not see it -- halting", 74);
+        arch_halt();
+    }
+    room_base = ri_kva;
+    room_used = 4096;                                     # page 0: the header (ROOM_MAGIC, phys, used, slots)
+    # cell                          slot  bytes    owner — what it is
+    room_take(&pcpu_spawn_elf_buf,  1, 65536);    # syscall.cyr — spawn#3's ELF staging, 16 KB per CPU
+    room_take(&klug_buf,            2, 65536);    # klug.cyr — the log ring (klug_move_to_room, below)
+    room_take(&pci_bar_phys,        3, 49152);    # pci.cyr — resolved BAR phys (128 x 6 x 8 B used of the [6144] u64)
+    room_take(&pci_devs,            4, 32768);    # pci.cyr — the PciDev table (128 x 32 B used of the [4096] u64)
+    room_take(&pci_class,           5, 8192);     # pci.cyr — packed class codes (128 x 8 B used of the [1024] u64)
+    room_take(&pci_busfunc,         6, 8192);     # pci.cyr — bus << 8 | func (128 x 8 B used of the [1024] u64)
+    room_take(&sec_wfile_buf,       7, 17440);    # vfs.cyr — the FAT/exFAT write-fd pool, 4 x 4360 B
+    room_take(&pcpu_elf_hdr_buf,    8, 16384);    # elf.cyr — ELF header staging, 4 KB per CPU
+    room_take(&pcpu_sc_gpuop,       9, 16384);    # syscall.cyr — gpu_op#92 descriptor staging, 4 KB per CPU
+    room_take(&lo_ring,            10, 12288);    # net.cyr — the loopback frame ring, 8 x 1536 B
+    room_take(&exfat_upcase_buf,   11, 8192);     # exfat.cyr — the up-case table
+    if (room_used > 0x200000) {
+        serial_println("PANIC: room: the moved arrays need more than the 2 MB carve-out -- halting", 74);
+        arch_halt();
+    }
+    memset(room_base, 0, room_used);                     # .bss was zero; so is the room
+    store64(room_base, ROOM_MAGIC);
+    store64(room_base + 8, room_phys);
+    store64(room_base + 16, room_used);
+    store64(room_base + 24, room_slots);
+    klug_move_to_room();                                  # the boot log: early ring -> klug_buf (Linux setup_log_buf)
+    if (room_wide != 0) {
+        kprintln("boot: room: no free 2 MB region below 256 MB -- the carve-out came from the whole pmm bitmap (top-down)", 103);
+    }
+    kprint("boot: room carve-out [0x", 24);
+    kprint_hex(room_phys);
+    kprint(", 0x", 4);
+    kprint_hex(room_phys + room_used);
+    kprint(") at 0x", 7);
+    kprint_hex(room_base);
+    kprint(" -- ", 4);
+    kprint_num(room_slots);
+    kprint(" arrays, ", 9);
+    kprint_num(room_moved);                               # the arrays' declared bytes: the figure the docs quote
+    kprint(" B moved out of the image (", 27);
+    kprint_num(room_used - 4096);                         # the slots they occupy, each page-rounded
+    kprintln(" B of page-rounded slots) OK", 28);
+    return 0;
+}

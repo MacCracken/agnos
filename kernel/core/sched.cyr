@@ -304,7 +304,8 @@ fn proc_restore_context(pid, isr_rsp) {
 # span pmm_extend_to_memmap reserves at kbase (it reserves a generous 16 MB; the image is ~3 MB,
 # and 4 MB keeps the window clear of the mmap arena at 0x10000000).
 # ⚠ If the kernel image ever crosses 4 MB this needs raising — the SAME check pmm.cyr already
-# carries ("bump this if the kernel image ever crosses 4 MB — readelf -l build/agnos LOAD MemSiz").
+# carries. Since 1.57.12 it cannot cross silently: scripts/check/image-layout-check.sh (check.sh gate 34,
+# build.sh after every build) refuses any image whose LOAD end passes 0x400000.
 # Unlike the old literal, being late here is no longer fatal: (1) means a consistent frame is
 # untouched regardless, so a stale window can only mis-arbitrate an already-torn pair.
 fn sel_rip_is_kernel(rip) {
@@ -1223,6 +1224,7 @@ fn sched_leave_old(isr_rsp, old) {
     kst_note_switch_out(old);                          # KSTACK_SELFTEST: count CPL0 switch-outs of probe procs (no-op twin)
     kst_tail_hook();                                   # KSTACK_SELFTEST: the M-A1/M-A3 window widener (no-op twin; 0 iterations)
     kst_note_leave(old);                               # KSTACK_SELFTEST: was old's slot re-allocated under this CPU? (no-op twin)
+    bsp_stack_redzone_check(isr_rsp, 1);               # 1.57.12: leaving the BSP boot stack (kmain) -> its red zone must be intact (proc.cyr; PANIC + halt)
     sched_frame_iretq(fp, &proc_on_cpu + old * 8);
     return 0;
 }
@@ -1265,6 +1267,8 @@ fn wq_deadline_after_us(us) {
 # wake; sched_lock is the leaf, and nothing prints under it (latched lines are emitted after the unlock); never
 # keep pcpu_cpu(), a pcpu_* pointer or per-CPU scratch across a wait (R4 — only wq_sleep's c0 is compared); the
 # live CR3 must be the slot's (R6: the loaders' cr3_load(0x1000) windows contain no wait).
+# (1.57.12: pcpu_spawn_elf_buf, pcpu_sc_gpuop and pcpu_elf_hdr_buf live in the ROOM carve-out — core/room.cyr — same
+# per-CPU slicing, same rules.)
 # ⚠ R4/R6 PER-CPU SCRATCH (percpu_audit): pcpu_spawn_elf_buf, pcpu_spawn_path_buf, pcpu_spawn_env_buf,
 # pcpu_sc_open_abs, pcpu_sc_gpuop, fb_scale's row buffer, gpu_texl_stage (syscall.cyr), pcpu_elf_hdr_buf,
 # pcpu_exec_env_src/len (elf.cyr) — never add a wq_* call inside one of their live spans.
@@ -1773,13 +1777,14 @@ fn proc_tick_lifecycle(isr_rsp, tl_p) {
 fn proc_b1_check(me) {
     if (me < 0) { return 0; }
     if (me >= 16) { return 0; }
-    if ((load64(&proc_kill_pending + me * 8) | load64(&proc_stop_pending + me * 8) | klug_spill_owed) == 0) { return 0; }
+    if ((load64(&proc_kill_pending + me * 8) | load64(&proc_stop_pending + me * 8) | klug_spill_owed | zfs_wp_owed) == 0) { return 0; }
     return proc_b1(me);
 }
 # A stop parks here with the syscall's result preserved on the process's own kernel stack; after SIGCONT the syscall
 # returns its real value (kill(self, 19) returns 0). A kill never returns.
 fn proc_b1(me) {
     if (klug_spill_owed != 0) { klug_spill_owed_run(); }
+    if (zfs_wp_owed != 0) { zfs_wp_owed_run(); }    # 1.57.12 B11 review: a ZFS commit a death in the timer ISR owed
     if (lifecycle_park_or_abort(me, VIA_B1) == 0) { return 0; }
     var b1_k = lc_kp(me);
     proc_exit_current(128 + b1_k, b1_k);
@@ -1898,7 +1903,7 @@ fn lifecycle_trace(kind, pid, sig, via) {
     var lt_seq = lifecycle_seq;
     lifecycle_seq = lifecycle_seq + 1;
     if (klug_count > 0) {
-        if (load8(&klug_buf + ((klug_head + 0xFFFF) & 0xFFFF)) != 10) { klug_putc_raw(10); }
+        if (load8(klug_buf + ((klug_head + 0xFFFF) & 0xFFFF)) != 10) { klug_putc_raw(10); }
     }
     klug_append_raw("lifecycle: #", 12);
     lt_hex(lt_seq);
@@ -2166,6 +2171,8 @@ fn kstack_check_entry(kce_c) {
 # each per boot, to klug and COM1 (lock-free), never to the console. tag 1 = exec_and_wait, 2 = kernel_resume.
 var sched_oob_said = 0;
 fn sched_assert_oob(tag) {
+    var oob_sp = 0;
+    bsp_stack_redzone_check(&oob_sp, 1 + tag);        # 1.57.12: on the BSP boot stack -> its red zone must be intact (proc.cyr)
     if (preempt_count_get() != 0) {
         if (tag == 1) {
             if ((sched_oob_said & 1) == 0) {

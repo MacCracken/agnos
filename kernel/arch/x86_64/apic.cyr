@@ -38,6 +38,18 @@ fn apic_eoi() {
     apic_write(0xB0, 0);
     return 0;
 }
+# 1.57.12 B11: is ANY interrupt in service on this CPU — an ISR bit set in the LAPIC's in-service registers (0x100-0x170,
+# 256 bits: set at delivery, cleared by its EOI)? 1 = this code runs inside an interrupt handler (the timer ISR's death
+# chain can reach a process's fd-table teardown), where io.cyr's interrupt windows must not open. 0 without a LAPIC.
+fn apic_in_service() {
+    if (apic_enabled != 1) { return 0; }
+    var k = 0;
+    while (k < 8) {
+        if (apic_read(0x100 + k * 0x10) != 0) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
 
 fn apic_timer_init(vector, count) {
     # Divide config: 0x0B = divide by 1

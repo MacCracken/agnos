@@ -50,6 +50,7 @@ fn enter_ring3(entry, user_rsp) { return 0; }
 fn exec_and_wait(entry, rsp, cr3) { return 0; }
 fn kernel_exec_foreground(pid, pin) { proc_reap(pid); return 0 - 1; }   # 1.57.7 (S3b): the shared launch entry (x86: ring3.cyr)
 fn spawn_user_proc(entry_fn) { return 0 - 1; }
+fn spawn_user_proc_claim(entry_fn) { return 0 - 1; }   # 1.57.12: x86 ring3.cyr (spawn_user_proc = claim + publish); -1 = no user process here
 fn tss_set_rsp0(rsp0) { return 0; }
 
 # SYSCALL/SYSRET stubs
@@ -87,7 +88,7 @@ fn spin_unlock() { return 0; }
 fn smp_start_aps() { return 0; }
 
 # PCI + VirtIO stubs (x86 port I/O based, not available on aarch64)
-var pci_devs[64];
+var pci_devs = 0;         # 1.57.12: a POINTER, as on x86_64 (ROOM slot 4 there) — shell.cyr's lspci reads `pci_devs + i * 32`; pci_count stays 0
 var pci_count = 0;
 var vnet_active = 0;
 var vnet_mac[8];
@@ -224,7 +225,7 @@ var gpt_q_type_lo   = 0;
 var gpt_q_type_hi   = 0;
 fn gpt_init() { return 0; }
 fn gpt_print_all_partitions() { return 0; }
-fn gpt_partition_info(a) { return 0; }
+fn gpt_used_info(a) { return 0; }
 
 # FAT16 filesystem stubs
 var fatfs_active = 0;
@@ -308,6 +309,15 @@ fn atomic_and64(addr, v) { store64(addr, load64(addr) & v); return 0; }
 
 # 1.57.11 — read-only ZFS (core/zfs.cyr) lives inside #ifdef ARCH_X86_64 like ext2/exFAT, but shared vfs.cyr reaches
 # two of its names: zfs_active (the mount table) and zfs_fd_read (the read arm). This port never imports a pool:
-# never active, and a ZFS fd cannot exist, so the read arm refuses.
+# never active, and a ZFS fd cannot exist, so the read arm refuses. 1.57.12 B5: the write arm (vfs.cyr) and lseek's
+# SEEK_END (syscall.cyr) reach zfs_fd_write and zfs_fd_size — refused the same way.
 var zfs_active = 0;
 fn zfs_fd_read(slot, buf, count) { return 0 - 1; }
+fn zfs_fd_write(slot, buf, count) { return 0 - 1; }
+fn zfs_fd_size(slot) { return 0 - 1; }
+# 1.57.12 B6 review: vfs.cyr's write arm logs a refused ZFS write (zfs_wr_say over zfs_wr_lit) — never reached here.
+var zfs_wr_lit = 0;
+fn zfs_wr_say(verb) { return 0; }
+# 1.57.12 B11: vfs.cyr's close#6 and fd-table teardown commit a ZFS fd's pending policy-B txg (zfs_wp_close) — no ZFS fd
+# exists on this port, so there is never one to commit.
+fn zfs_wp_close(base) { return 0; }

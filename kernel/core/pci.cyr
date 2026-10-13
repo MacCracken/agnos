@@ -19,14 +19,18 @@ struct PciDev { slot; vendor; device; bar0; }
 # ~10-15 on QEMU and 6 on archaemenid; full bus walk + multifunction
 # expansion on AMD Ryzen platforms can push the count to 40-60. 128
 # entries x 32 bytes = 4 KB; cheap on the heap-mapped BSS.
-var pci_devs[4096];     # 128 entries x 32 bytes
+# ⭐ 1.57.12 (ROOM): the four PCI tables below are ROOM slots 3-6 (core/room.cyr) — POINTERS into the boot carve-out,
+# their poison until room_init (which runs long before pci_scan). Each kept its old declared size there (32 + 8 + 48
+# + 8 KB, the `[N]` u64 of .bss they were): ⚠ every one is declared 8x its use (128 x 32 B = 4 KB in a [4096] u64,
+# and so on — the module-scope u64 unit), which cost 84 KB of image until the move and costs RAM in the room now.
+var pci_devs = 0xFFFFA00400000000;      # ROOM slot 4 — 128 entries x 32 bytes
 var pci_count = 0;
 
 # Side arrays parallel to pci_devs[i*32]. Kept separate from PciDev so
 # existing consumers (virtio_net, virtio_blk, iommu, shell.cyr lspci)
-# stay byte-compatible against `&pci_devs + i * 32` indexing.
+# stay byte-compatible against `pci_devs + i * 32` indexing.
 # v1.30.1: added for xhci_probe (PCI class lookup + 64-bit BAR readback).
-var pci_class[1024];    # 128 entries x 8 bytes; packed (class<<16 | subclass<<8 | prog_if)
+var pci_class = 0xFFFFA00500000000;     # ROOM slot 5 — 128 entries x 8 bytes; packed (class<<16 | subclass<<8 | prog_if)
 # Resolved 64-bit phys for each of the six standard BARs per device.
 # Layout: idx*48 + slot*8 where slot ∈ {0..5}. For a 64-bit memory BAR
 # at slot N, slot N is the full resolved phys (lo & 0xFFFFFFF0 | hi<<32)
@@ -36,13 +40,13 @@ var pci_class[1024];    # 128 entries x 8 bytes; packed (class<<16 | subclass<<8
 # store 0 (1.57.8 — see pci_bar_64: this table holds MMIO addresses only).
 # Consumers should call pci_bar_64(idx, bir) which understands this
 # layout; pci_bar0_64(idx) is the legacy shortcut for slot 0.
-var pci_bar_phys[6144]; # 128 entries x 6 BARs x 8 bytes
+var pci_bar_phys = 0xFFFFA00300000000;  # ROOM slot 3 — 128 entries x 6 BARs x 8 bytes
 # v1.30.1: full PCIe-addressing — packed (bus<<8 | func) per entry.
 # Legacy consumers (virtio_net/blk, iommu, lspci) assume bus=0/func=0
 # and only look at PciDev_slot — they continue to work unchanged because
 # every entry they care about reads back 0x0000 here. xhci_probe is the
 # first consumer that actually decodes this side array.
-var pci_busfunc[1024];  # 128 entries x 8 bytes; (bus<<8 | func)
+var pci_busfunc = 0xFFFFA00600000000;   # ROOM slot 6 — 128 entries x 8 bytes; (bus<<8 | func)
 
 fn pci_addr(bus, slot, func, off) {
     return 0x80000000 | (bus << 16) | (slot << 11) | (func << 8) | (off & 0xFC);
@@ -95,8 +99,8 @@ fn pci_enable_bus_master(slot) {
 # bus-master bits set. Added v1.30.1 for xhci on AMD Ryzen platforms where
 # the XHCI controller sits at non-zero bus / non-zero function.
 fn pci_enable_bus_master_idx(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var cmd = pci_read32(bus, slot, func, 4);
@@ -112,8 +116,8 @@ fn pci_enable_bus_master_idx(idx) {
 # self-sufficient on a cold function. Full PCIe addressing via idx (bus/func from
 # the pci_busfunc side array), like pci_enable_bus_master_idx.
 fn pci_enable_mem_space_idx(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var cmd = pci_read32(bus, slot, func, 4);
@@ -131,8 +135,8 @@ fn pci_enable_mem_space_idx(idx) {
 # Differs from the xHCI xECP chain (which lives in MMIO, not config space)
 # — this is the standard PCI cap list for MSI/MSI-X/PM/PCIe/AER etc.
 fn pci_find_cap(idx, cap_id) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     # Status register (bits 16-31 of config dword 0x04). Bit 4 = Capabilities List.
@@ -184,8 +188,8 @@ fn pci_find_cap(idx, cap_id) {
 #
 # Returns 1 if MSI-X enabled, 2 if MSI enabled, 0 if neither advertised.
 fn pci_enable_msix_masked(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var msix_off = pci_find_cap(idx, 0x11);
@@ -228,8 +232,8 @@ fn pci_enable_msix_masked(idx) {
 #
 # Returns 1 if MSI-X enabled, 2 if MSI fallback, 0 if neither advertised.
 fn pci_enable_msix_unmasked(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var msix_off = pci_find_cap(idx, 0x11);
@@ -295,8 +299,8 @@ fn pci_enable_msix_unmasked(idx) {
 # enumeration) so the now-live interrupt has a handler and won't race the EP0 control path.
 # Recomputes the table address exactly as pci_enable_msix_unmasked Phase 2. Returns 1/0.
 fn pci_msix_arm_vector0(idx, vec) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var msix_off = pci_find_cap(idx, 0x11);
@@ -346,8 +350,8 @@ fn pci_msix_arm_vector0(idx, vec) {
 # Returns 1 if MSI was programmed, 0 if the device advertises no MSI capability
 # (caller then relies on the timer-tick drain — never worse than the tick floor).
 fn pci_enable_msi_vector(idx, vector) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var off = pci_find_cap(idx, 0x05);
@@ -379,8 +383,8 @@ fn pci_enable_msi_vector(idx, vector) {
 # whose handler is about to stop existing. Clearing bit 16 of the MSI control dword
 # is the only thing that actually detaches it.
 fn pci_disable_msi(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var off = pci_find_cap(idx, 0x05);
@@ -399,7 +403,7 @@ fn pci_record(bus, slot, func) {
     var vendor = pci_read32(bus, slot, func, 0);
     if (vendor == 0xFFFFFFFF) { return 0; }
     if (vendor == 0) { return 0; }
-    var base = &pci_devs + pci_count * 32;
+    var base = pci_devs + pci_count * 32;
     PciDev_set_slot(base, slot);
     PciDev_set_vendor(base, vendor & 0xFFFF);
     PciDev_set_device(base, (vendor >> 16) & 0xFFFF);
@@ -412,7 +416,7 @@ fn pci_record(bus, slot, func) {
     var packed = (((class_reg >> 24) & 0xFF) << 16)
     | (((class_reg >> 16) & 0xFF) << 8)
     | ((class_reg >> 8) & 0xFF);
-    store64(&pci_class + pci_count * 8, packed);
+    store64(pci_class + pci_count * 8, packed);
     # BAR walk — all six slots (PCI 3.0 §6.2.5.1):
     #   bit 0 = 0 (memory) / 1 (I/O); for memory, bits 2:1 = type (0=32, 2=64).
     # 64-bit memory BARs consume two adjacent slots: slot N holds the
@@ -423,7 +427,7 @@ fn pci_record(bus, slot, func) {
     while (s < 6) {
         var lo = pci_read32(bus, slot, func, 0x10 + s * 4);
         if (lo == 0 || lo == 0xFFFFFFFF) {
-            store64(&pci_bar_phys + pci_count * 48 + s * 8, 0);
+            store64(pci_bar_phys + pci_count * 48 + s * 8, 0);
             s = s + 1;
         } else {
             if ((lo & 0x01) == 0) {
@@ -434,21 +438,21 @@ fn pci_record(bus, slot, func) {
                     # 64-bit — consume next slot for high half.
                     var hi = pci_read32(bus, slot, func, 0x10 + (s + 1) * 4);
                     phys = phys | (hi << 32);
-                    store64(&pci_bar_phys + pci_count * 48 + s * 8, phys);
-                    store64(&pci_bar_phys + pci_count * 48 + (s + 1) * 8, 0);
+                    store64(pci_bar_phys + pci_count * 48 + s * 8, phys);
+                    store64(pci_bar_phys + pci_count * 48 + (s + 1) * 8, 0);
                     s = s + 2;
                 } else {
-                    store64(&pci_bar_phys + pci_count * 48 + s * 8, phys);
+                    store64(pci_bar_phys + pci_count * 48 + s * 8, phys);
                     s = s + 1;
                 }
             } else {
                 # I/O BAR — recorded as 0 ("no MMIO here"): pci_bar_64 is an MMIO-only contract (below).
-                store64(&pci_bar_phys + pci_count * 48 + s * 8, 0);
+                store64(pci_bar_phys + pci_count * 48 + s * 8, 0);
                 s = s + 1;
             }
         }
     }
-    store64(&pci_busfunc + pci_count * 8, (bus << 8) | func);
+    store64(pci_busfunc + pci_count * 8, (bus << 8) | func);
     pci_count = pci_count + 1;
     return 1;
 }
@@ -493,7 +497,7 @@ fn pci_scan() {
 
 fn pci_find(vendor, device) {
     for (var i = 0; i < pci_count; i = i + 1) {
-        var base = &pci_devs + i * 32;
+        var base = pci_devs + i * 32;
         if (PciDev_vendor(base) == vendor) {
             if (PciDev_device(base) == device) {
                 return i;
@@ -510,7 +514,7 @@ fn pci_find(vendor, device) {
 fn pci_find_by_class(class_code, subclass, prog_if) {
     var want = (class_code << 16) | (subclass << 8) | prog_if;
     for (var i = 0; i < pci_count; i = i + 1) {
-        if (load64(&pci_class + i * 8) == want) {
+        if (load64(pci_class + i * 8) == want) {
             return i;
         }
     }
@@ -520,8 +524,8 @@ fn pci_find_by_class(class_code, subclass, prog_if) {
 # Vendor / device of the device at pci_devs[idx] — small public accessors so
 # drivers can log/verify their bound function without reaching pci_devs's
 # internal 32-byte stride (added 1.52.0 for hda_probe's found-line).
-fn pci_vendor(idx) { return PciDev_vendor(&pci_devs + idx * 32); }
-fn pci_device(idx) { return PciDev_device(&pci_devs + idx * 32); }
+fn pci_vendor(idx) { return PciDev_vendor(pci_devs + idx * 32); }
+fn pci_device(idx) { return PciDev_device(pci_devs + idx * 32); }
 
 # Return the full 64-bit phys for BAR(bir) of the device at pci_devs[idx].
 # Flag bits already masked at probe time (pci_record). For 32-bit BARs the
@@ -535,11 +539,11 @@ fn pci_device(idx) { return PciDev_device(&pci_devs + idx * 32); }
 # ignores memory types, so only KVM showed it: every console line took ~1.45 s (issue 2026-09-25 kvm-virtio-net).
 fn pci_bar_64(idx, bir) {
     if (bir < 0 || bir > 5) { return 0; }
-    return load64(&pci_bar_phys + idx * 48 + bir * 8);
+    return load64(pci_bar_phys + idx * 48 + bir * 8);
 }
 
 # Legacy shortcut for BAR0. Kept so xhci.cyr's existing pci_bar0_64
 # consumer doesn't need rework.
 fn pci_bar0_64(idx) {
-    return load64(&pci_bar_phys + idx * 48);
+    return load64(pci_bar_phys + idx * 48);
 }

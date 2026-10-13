@@ -43,7 +43,7 @@ lists — not normative, not maintained): `~/.claude/projects/-home-macro-Repos-
   per-process kernel stacks (slot = pid; SYSCALL entry AND CPL3→CPL0 interrupts) · `[0xF00000,0xF40000)` 4
   kthread stacks · `[0xF40000,0xF80000)` IST1 `#DF` · `[0xF80000,0xFC0000)` FREE, reserved for an NMI/#MC
   IST · `[0xFC0000,0x1000000)` AP boot/TSS stacks. The lowest 4 KB of every 64 KB slot is a not-present
-  guard page. kmain stays on the BSP boot stack in region 1; AP idles stay on their AP boot stacks.
+  guard page. kmain stays on the BSP boot stack (region 1 then; image `.bss` since 1.57.12); AP idles stay on their AP boot stacks.
 - **C2 syscall frame** at the stack top: user RSP/RBP/RIP/RFLAGS, rbx, r12–r15 (`SCF_*` 8..72); the exit
   pops SYSRET state from it, so a syscall may resume on any CPU.
 - **C3 exactly two switch paths, one save format:** (T) timer → `do_context_switch` → `sched_leave_old`;

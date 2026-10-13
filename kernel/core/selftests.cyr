@@ -269,7 +269,7 @@ fn tcpst_drain() {
     while (n < 4 && lo_count != 0) { net_poll(); n = n + 1; }
     return 0;
 }
-fn tcpst_lo_byte(k, off) { return load8(&lo_ring + ((lo_tail - 1 - k) & 7) * 1536 + off); }
+fn tcpst_lo_byte(k, off) { return load8(lo_ring + ((lo_tail - 1 - k) & 7) * 1536 + off); }
 fn tcpst_seq32(k) {
     return (tcpst_lo_byte(k, 38) << 24) | (tcpst_lo_byte(k, 39) << 16) | (tcpst_lo_byte(k, 40) << 8) | tcpst_lo_byte(k, 41);
 }
@@ -2572,6 +2572,40 @@ fn dsh_rd_post() {
     store64(&dsh_res + 5 * 8, load64(&dsh_res + 5 * 8) + rp);
     return 0;
 }
+# ─── 1.57.12 (ROOM) — the boot carve-out (core/room.cyr) ───────────────────────────────────────────────────────────
+# The room holds CPU-only arrays (the klug ring, the PCI tables, the per-CPU syscall staging ...) that syscalls and ISRs
+# reach under EVERY CR3, so its pointer must be the direct-map alias — never the identity VA of room_phys, which a
+# per-process CR3 gives to the ring-3 image like any pmm page. Like the fb/ramdisk arms, this one crosses the switch.
+# UNDER the shadow: the header (ROOM_MAGIC, room_phys) must read back through room_base (+1000 / +2000 — an identity
+# room_base reads 0xA5), the klug ring's first qword through klug_buf (a MOVED ARRAY's own pointer) must equal what the
+# kernel CR3 read before the switch (+8000), and the header's scratch cell is written. POST, on the kernel CR3: the
+# scratch must hold that word (+4000 — an identity room_base wrote it into the 0xA5 region), plus the region's dirt.
+var DSH_ROOM_WORD = 0x524F4F4D53484457;   # written under the shadow into room header word 4 (scratch), cleared after
+var dsh_room_k0 = 0;                       # klug_buf's first qword, read on the kernel CR3 before the switch
+fn dsh_room_pre() {
+    if (room_base == 0) { return 0; }
+    store64(&dsh_ran + 7 * 8, 1);
+    dsh_room_k0 = load64(klug_buf);
+    return 0;
+}
+fn dsh_room_under() {
+    if (load64(&dsh_ran + 7 * 8) == 0) { return 0; }
+    var rb = 0;
+    if (load64(room_base) != ROOM_MAGIC) { rb = rb + 1000; }
+    if (load64(room_base + 8) != room_phys) { rb = rb + 2000; }
+    if (load64(klug_buf) != dsh_room_k0) { rb = rb + 8000; }
+    store64(room_base + 32, DSH_ROOM_WORD);
+    store64(&dsh_res + 7 * 8, rb);
+    return 0;
+}
+fn dsh_room_post() {
+    if (load64(&dsh_ran + 7 * 8) == 0) { return 0; }
+    var rp = 0;
+    if (load64(room_base + 32) != DSH_ROOM_WORD) { rp = rp + 4000; }
+    store64(room_base + 32, 0);
+    store64(&dsh_res + 7 * 8, load64(&dsh_res + 7 * 8) + rp);
+    return 0;
+}
 fn dma_shadow_selftest() {
     if (dsh_build() == 0) { kprintln("dmash: FAIL no memory for the shadow", 36); kprintln("dmash: done", 11); return 0; }
     var probe = pmm_alloc();
@@ -2585,6 +2619,7 @@ fn dma_shadow_selftest() {
     if (hda_on == 1) { v0 = dsh_hda_vendor(); }
     var nsec = nvme_ns1_nsze / 2;
     dsh_rd_pre();                                 # 1.57.9: ramdisk sector 64 written on the kernel CR3
+    dsh_room_pre();                               # 1.57.12: klug_buf's first qword, read on the kernel CR3
     var old = dm_read_cr3();
     var fl = kbd_irq_save();                      # IF=0 for the whole window: no ISR, no preemption, no CR3 switch
     cr3_load(dsh_cr3);
@@ -2605,6 +2640,8 @@ fn dma_shadow_selftest() {
     var dz2 = dsh_dirty();
     dsh_rd_under();
     var dz3 = dsh_dirty();
+    dsh_room_under();                             # 1.57.12: the room carve-out
+    var dz4 = dsh_dirty();
     cr3_load(old);
     kbd_irq_restore(fl);
     hda_active_ctl = hsave;
@@ -2612,6 +2649,8 @@ fn dma_shadow_selftest() {
     if (load64(&dsh_ran + 6 * 8) != 0) { store64(&dsh_res + 6 * 8, dsh_fb_check() + (dz2 - dz1)); }
     dsh_rd_post();
     store64(&dsh_res + 5 * 8, load64(&dsh_res + 5 * 8) + (dz3 - dz2));
+    dsh_room_post();
+    store64(&dsh_res + 7 * 8, load64(&dsh_res + 7 * 8) + (dz4 - dz3));
     var shok = 0;
     if (id_v == 0xA5A5A5A5A5A5A5A5) { shok = 1; }
     if (dm_v != 0x5A5A5A5A5A5A5A5A) { shok = 2; }
@@ -2635,12 +2674,14 @@ fn dma_shadow_selftest() {
     # no arm, DMA or CPU-only, may have stored through an identity VA (dz0 must be 0 too — nothing ran before it).
     dsh_verdict("fb", 2, 6);
     dsh_verdict("ramdisk", 7, 5);
+    dsh_verdict("room", 4, 7);
     kprint("dmash: window", 13);
-    if (dz3 == 0) { kprint(" PASS", 5); } else { kprint(" FAIL", 5); }
-    kprint(" dirty=", 7); kprint_num(dz3);
+    if (dz4 == 0) { kprint(" PASS", 5); } else { kprint(" FAIL", 5); }
+    kprint(" dirty=", 7); kprint_num(dz4);
     kprint(" (dma ", 6); kprint_num(dz1 - dz0);
     kprint(" fb ", 4); kprint_num(dz2 - dz1);
     kprint(" ramdisk ", 9); kprint_num(dz3 - dz2);
+    kprint(" room ", 6); kprint_num(dz4 - dz3);
     kprintln(")", 1);
     kprintln("dmash: done", 11);
     return 0;

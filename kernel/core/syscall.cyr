@@ -98,8 +98,10 @@ fn execwait_rsp0_check(me) { return 0; }
 # 1.46.x SMP STEP-2 (#3): PER-CPU. Two CPUs each in spawn#3 (e.g. a bg-proc spawn on an AP) would
 # clobber one another's staging. 2048 u64 (16 KB) per CPU × 4; cpu c at byte c*16384.
 # R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
-var pcpu_spawn_elf_buf[8192];
-fn spawn_elf_buf_base() { return &pcpu_spawn_elf_buf + pcpu_cpu() * 16384; }
+# 1.57.12 (ROOM): 64 KB of the image's .bss until here; now ROOM slot 1 (core/room.cyr) — a pointer to a page run of the
+# boot carve-out, its poison until room_init. Spawn runs long after it.
+var pcpu_spawn_elf_buf = 0xFFFFA00100000000;   # ROOM slot 1 — 4 x 16 KB (core/room.cyr)
+fn spawn_elf_buf_base() { return pcpu_spawn_elf_buf + pcpu_cpu() * 16384; }
 
 # 1.44.11: spawn_path(#43) path/argv staging buffer (128 B per CPU until 1.57.6 — see below; a
 # module-global var X[N] is N*u64 = 8N bytes). Holds the caller's "PATH [args..]" line (capped at
@@ -779,6 +781,9 @@ fn proc_death_release(pid, code, sig, via) {
     spawn_arms_clear(pid);                        # S2: redirects, endowment, placement record
     proc_fgwait_set(pid, 0);                      # S3b: a dying waiter's own foreground cell
     lim_arm_clear(pid);                           # S8: the limits arm (the alloc reset covers a recycle too)
+    # 1.57.12 B11 review: its pending ZFS txg COMMITTED before the publish — durable at exit, not at a reap a parent may
+    # never do (zfs_write.cyr zfs_release_pid). From the timer ISR (D-34) the commit is owed to the next B1, like the spill.
+    if (via == VIA_TICK) { zfs_release_pid(pid, 1); } else { zfs_release_pid(pid, 0); }
     return 0;
 }
 fn proc_death(pid, code, sig, via) {
@@ -2106,12 +2111,12 @@ fn gpu_blit_bb_sys(srcxy, wh, dstxy) {
 # under SMP at 1.46.x, where `rename` ran with another CPU's length. (The 4th syscall argument had the same
 # per-CPU shape until 1.57.7, when blocking syscalls made it per-process: proc_sc_a4, proc.cyr.)
 # R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
-var pcpu_sc_gpuop[2048];             # 16384 B total = GPU_OP_CPUS x GPU_OP_BUF_BYTES
+var pcpu_sc_gpuop = 0xFFFFA00900000000;   # ROOM slot 9 (1.57.12, core/room.cyr) — 16384 B = GPU_OP_CPUS x GPU_OP_BUF_BYTES
 var GPU_OP_CPUS      = 4;            # matches pcpu_cpu()'s `if (c >= 4) { c = 0; }` clamp
 var GPU_OP_BUF_BYTES = 4096;         # per-CPU share
 var GPU_OP_STRIDE    = 64;           # bytes per op record — a power of two, so indexing is a shift
 var GPU_OP_MAX       = 64;           # GPU_OP_BUF_BYTES / GPU_OP_STRIDE
-fn sc_gpuop_buf() { return &pcpu_sc_gpuop + pcpu_cpu() * GPU_OP_BUF_BYTES; }
+fn sc_gpuop_buf() { return pcpu_sc_gpuop + pcpu_cpu() * GPU_OP_BUF_BYTES; }
 
 # --- Op codes. Codes 0x00-0x1F are the bitmask tier: an op code IS its bit index in gpu_caps#89's
 # support word at +28, so ring 3 can discover exactly which ops this kernel implements instead of
@@ -8005,7 +8010,7 @@ fn mdo_transmit_run(arm) {
         # would have lost its log. Latent until now only because the guard above was on the wrong flag.
         klug_spill();
         # ⭐ 1.56.60 — FLUSH, OR THE SPILL ABOVE NEVER REACHES THE PLATTER. klug_spill writes through
-        # ext2_write_at_dma (core/klug.cyr:179/:199/:202/:206) and that path contains no blk_flush_on,
+        # ext2_write_at (core/klug.cyr klug_spill; ext2_write_at_dma until 1.57.12) and that path contains no blk_flush_on,
         # no ext2_sync and no ext2_write_superblock — the bytes land in the drive's write cache and a
         # reset throws them away. This was the ONE power_reset() caller with no durability barrier (the
         # other, power.cyr:413, is preceded by power_quiesce_devices() at :410), so it also left a dirty
@@ -9570,10 +9575,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var op_path = arg1;
         var op_len  = arg2;
         if (load8(arg1) != 47) {
+            # 1.57.12 (B6 review): a relative name of 255+ bytes is REFUSED — it was copied up to 254 and opened, so
+            # AO_CREAT made a DIFFERENT, truncated name (ext2 since 1.54.11; ZFS since B6). '/' + 254 fill the slice.
+            if (arg2 > 254) { return 0 - 1; }
             var oabs = sc_open_abs_base();          # 1.56.51: THIS CPU's slice — see the banner
             store8(oabs, 47);
             var opi = 0;
-            while (opi < arg2 && opi < 254) { store8(oabs + 1 + opi, load8(arg1 + opi)); opi = opi + 1; }
+            while (opi < arg2) { store8(oabs + 1 + opi, load8(arg1 + opi)); opi = opi + 1; }
             op_path = oabs;
             op_len  = opi + 1;
         }
@@ -9618,12 +9626,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
             return vfs_open_on(be7, roff, rlen);
         }
         if (be7 == FS_ZFS) {
-            # 1.57.11 — read-only ZFS (core/zfs.cyr): a VFS_ZFS_FILE fd (streams any size, lseek#58 works) or, with
-            # AO_DIRECTORY, a VFS_ZFS_DIR fd for getdents#29. Any write / create / truncate flag answers -1: nothing
-            # on a ZFS pool is writable until the write path (1.57.12). Never falls through to initrd.
+            # 1.57.11 — ZFS (core/zfs.cyr): a VFS_ZFS_FILE fd (streams any size, lseek#58 works) or, with
+            # AO_DIRECTORY, a VFS_ZFS_DIR fd for getdents#29. 1.57.12 B5: AO_WRONLY / AO_RDWR on a writable dataset
+            # give a writable fd and AO_TRUNC truncates in its own txg (zfs_open's rules); B6: AO_CREAT creates a missing
+            # file (mode 0100644, its own txg; never through a final symlink), AO_EXCL is tested before AO_TRUNC and a
+            # file just created is not truncated; a read-only pool or dataset answers -1 as before. Never falls through
+            # to initrd.
+            # A refused write-intent open (AO_WRONLY / AO_RDWR / AO_CREAT / AO_TRUNC) logs its reason (zfs_wr_say).
             var zr7 = zfs_reloff(op_path, op_len);
             fs_spin_lock();
+            zfs_wr_lit = 0;
             var zfd7 = zfs_open(op_path + zr7, op_len - zr7, arg3);
+            if (zfd7 < 0 && (arg3 & 0x303) != 0) { zfs_wr_say("open"); }
             fs_spin_unlock();
             return zfd7;
         }
@@ -9636,6 +9650,19 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # mkdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
         if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
         var be9 = vfs_resolve_mount(arg1, arg2);
+        if (be9 == FS_ZFS) {
+            # 1.57.12 B6 — ZFS (core/zfs_write.cyr zfs_wmkdir): a 512-byte microzap directory, mode 040755, in its own
+            # txg on a writable dataset — its parent's ZAP micro or fat, a name of up to 255 bytes (B8: one of 50+
+            # upgrades a microzap parent); -1 (named in the kernel's zfs_wr_*, design § a.3 — and on the kernel log,
+            # zfs_wr_say) on a read-only pool or dataset, an existing name, ... Never falls through.
+            var zr9 = zfs_reloff(arg1, arg2);
+            fs_spin_lock();
+            zfs_wr_lit = 0;
+            var zm9 = zfs_wmkdir(arg1 + zr9, arg2 - zr9);
+            if (zm9 != 0) { zfs_wr_say("mkdir"); }
+            fs_spin_unlock();
+            return zm9;
+        }
         if (be9 == FS_FAT || be9 == FS_EXFAT) { return vfs_mkdir_on(be9, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
         if (be9 == FS_EXT2) {
             # SMP sub-bite 5 (fs_lock): ext2 mkdir touches dir/bitmap/bgdt scratch +
@@ -9654,6 +9681,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # rmdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
         if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
         var be10 = vfs_resolve_mount(arg1, arg2);
+        if (be10 == FS_ZFS) {
+            # 1.57.12 B7 — ZFS (core/zfs_write.cyr zfs_wrmdir): an EMPTY directory (SIZE == 2) out of its parent's ZAP
+            # (micro or fat, B8) and freed, in its own txg; -1 named (zfs_wr_* — and on the kernel log, zfs_wr_say) on a
+            # read-only pool or dataset, a non-empty directory (ENOTEMPTY), a mount point, ... Never falls through.
+            var zr10 = zfs_reloff(arg1, arg2);
+            fs_spin_lock();
+            zfs_wr_lit = 0;
+            var zd10 = zfs_wrmdir(arg1 + zr10, arg2 - zr10);
+            if (zd10 != 0) { zfs_wr_say("rmdir"); }
+            fs_spin_unlock();
+            return zd10;
+        }
         if (be10 == FS_FAT || be10 == FS_EXFAT) { return vfs_rmdir_on(be10, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
         if (be10 == FS_EXT2) {
             # SMP sub-bite 5 (fs_lock): ext2_rmdir (calls ext2_truncate_zero internally,
@@ -9670,8 +9709,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 12) {
         # sync() — flush ext2 metadata + all block devices to stable media
         # (1.41.3 — was a stub returning 0).
+        # 1.57.12 B11 — and the ZFS pool's pending policy-B txg COMMITTED (zfs_write.cyr zfs_wp_sync: two device flushes,
+        # durable when this returns); -1 when that commit — or an earlier hook's — failed (the pool read-only, the writes
+        # lost). ⛔ ext2_sync now runs under fs_lock, as power_flush runs it: it touches the ext2 scratch buffers and the
+        # superblock, which every other ext2 path reaches only under fs_lock — this arm called it with no lock at all.
+        fs_spin_lock();
+        var zs12 = zfs_wp_sync();
         if (ext2_active != 0) { ext2_sync(); }
+        fs_spin_unlock();
         blk_flush();
+        if (zs12 != 0) { return 0 - 1; }
         return 0;
     }
     if (num == 15) { return 0; }             # getuid (root)
@@ -9962,6 +10009,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # unlink(path=arg1, pathlen=arg2) — remove a file, mount-routed (1.41.3).
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         var be30 = vfs_resolve_mount(arg1, arg2);
+        if (be30 == FS_ZFS) {
+            # 1.57.12 B7 — ZFS (core/zfs_write.cyr zfs_wunlink): the name out of its parent's ZAP (micro or fat, B8), in
+            # its own txg; at the object's last link it is freed in that txg (its blocks killed — a gang / dedup /
+            # clone one deferred to free_bpobj) or, too big for one txg, put on the DELETE_QUEUE and (B10, design k.63 /
+            # k.111) drained by this same call in the txgs after its own, a bounded part per txg (zfs_wu_end ->
+            # zfs_wq_obj; fs_lock released between two, zfs_wf_yield) — so the call can run for many txgs; one it
+            # cannot drain (an xattr directory, k.111) stays queued for OpenZFS's next mount. -1 named (zfs_wr_say)
+            # on a read-only pool or dataset, a directory (rmdir#10), a mount point, an immutable / no-unlink /
+            # append-only object, ... Never falls through.
+            var zr30 = zfs_reloff(arg1, arg2);
+            fs_spin_lock();
+            zfs_wr_lit = 0;
+            var zu30 = zfs_wunlink(arg1 + zr30, arg2 - zr30);
+            if (zu30 != 0) { zfs_wr_say("unlink"); }
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zu30;
+        }
         if (be30 == FS_FAT || be30 == FS_EXFAT) { stack_canary_check(canary); return vfs_delete_on(be30, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
         if (be30 == FS_EXT2) {
             # SMP sub-bite 5 (fs_lock): ext2_unlink (calls ext2_truncate_zero internally,
@@ -10000,6 +10065,21 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var ben = vfs_resolve_mount(arg3, a4r);
         var rn = vfs_mnt_reloff;
         if (beo != ben) { stack_canary_check(canary); return 0 - 1; }   # cross-FS
+        if (beo == FS_ZFS) {
+            # 1.57.12 B7 — ZFS (core/zfs_write.cyr zfs_wrename): within ONE dataset (EXDEV otherwise), over an existing name
+            # of the same kind (a directory only when empty), a directory moving its PARENT with it (never under itself),
+            # in its own txg; -1 named (zfs_wr_say). The ZFS-relative offsets come from the paths (zfs_reloff), not from
+            # vfs_mnt_reloff. Never falls through.
+            var zro = zfs_reloff(arg1, arg2);
+            var zrn = zfs_reloff(arg3, a4r);
+            fs_spin_lock();
+            zfs_wr_lit = 0;
+            var zn31 = zfs_wrename(arg1 + zro, arg2 - zro, arg3 + zrn, a4r - zrn);
+            if (zn31 != 0) { zfs_wr_say("rename"); }
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zn31;
+        }
         if (beo == FS_FAT || beo == FS_EXFAT) {
             stack_canary_check(canary);
             return vfs_rename_on(beo, arg1 + ro, arg2 - ro, arg3 + rn, a4r - rn);
@@ -10031,6 +10111,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var a4l = ksyscall_a4_get();
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (sc_path_ok(arg3, a4l) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (vfs_resolve_mount(arg1, arg2) == FS_ZFS && vfs_resolve_mount(arg3, a4l) == FS_ZFS) {
+            # 1.57.12 B7 — ZFS (core/zfs_write.cyr zfs_wlink): a second name for a file or symlink (not followed; never a
+            # directory) in the SAME dataset, in its own txg — LINKS + 1, PARENT := the new name's directory (FreeBSD's
+            # zfs_link_create); -1 named (zfs_wr_say).
+            var zrl = zfs_reloff(arg1, arg2);
+            var zrk = zfs_reloff(arg3, a4l);
+            fs_spin_lock();
+            zfs_wr_lit = 0;
+            var zl32 = zfs_wlink(arg1 + zrl, arg2 - zrl, arg3 + zrk, a4l - zrk);
+            if (zl32 != 0) { zfs_wr_say("link"); }
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zl32;
+        }
         if (vfs_resolve_mount(arg1, arg2) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         if (vfs_resolve_mount(arg3, a4l) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         # 1.46.x SMP sub-bite 5: ext2_path_lookup/vfs_ext2_parent/ext2_link use the shared ext2
@@ -10092,7 +10186,23 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg2 > 4096) { stack_canary_check(canary); return 0 - 1; }            # one ext2 block max
         if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }   # target = link TEXT buffer
         if (sc_path_ok(arg3, a4sl) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (vfs_resolve_mount(arg3, a4sl) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        var be63 = vfs_resolve_mount(arg3, a4sl);
+        if (be63 == FS_ZFS) {
+            # 1.57.12 B6 — ZFS (core/zfs_write.cyr zfs_wsymlink): the target text in the SA bonus (SYMLINK), mode
+            # 0120755, in its own txg — targets of 1..144 bytes (a longer one needs a spill block: refused by name); a
+            # dataset whose SA LAYOUTS lacks the symlink layout gets it registered in that txg (B8). A target
+            # holding a NUL byte is refused on both backends (B6 review: symlink(2) takes a C string). A refusal logs its
+            # reason (zfs_wr_say).
+            var zr63 = zfs_reloff(arg3, a4sl);
+            fs_spin_lock();
+            zfs_wr_lit = 0;
+            var zs63 = zfs_wsymlink(arg1, arg2, arg3 + zr63, a4sl - zr63);
+            if (zs63 != 0) { zfs_wr_say("symlink"); }
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zs63;
+        }
+        if (be63 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         fs_spin_lock();
         var sldp = vfs_ext2_parent(arg3, a4sl);
         if (sldp <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
@@ -10747,7 +10857,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var kl_start = (kl_oldest + (kl_avail - kl_want)) & 0xFFFF;   # newest kl_want bytes
         var kl_w = 0;
         while (kl_w < kl_want) {
-            store8(arg1 + kl_w, load8(&klug_buf + ((kl_start + kl_w) & 0xFFFF)));
+            store8(arg1 + kl_w, load8(klug_buf + ((kl_start + kl_w) & 0xFFFF)));
             kl_w = kl_w + 1;
         }
         stack_canary_check(canary);
@@ -11814,12 +11924,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 > 2) { stack_canary_check(canary); return 0 - 1; }
         var lk_base = vfs_fd_table() + arg1 * 32;
-        # 1.57.11 — a VFS_ZFS_FILE carries the same pos/size payload, so it seeks the same way (read-only: no write
-        # past the end can follow).
+        # 1.57.11 — a VFS_ZFS_FILE seeks the same way. 1.57.12 B5: its SEEK_END reads the object's SIZE from the SA
+        # under fs_lock (zfs_fd_size — the generation checked, design § f.4; never a cached size, which a write through
+        # another fd would leave stale), and a position past the end is legal: the next write leaves holes.
         if (ktag(lk_base) != VFS_EXT2_FILE && ktag(lk_base) != VFS_ZFS_FILE) { stack_canary_check(canary); return 0 - 1; }
         var lk_new = arg2;                                          # SEEK_SET (whence 0)
         if (arg3 == 1) { lk_new = kpayload(lk_base, 0) + arg2; }    # SEEK_CUR
-        if (arg3 == 2) { lk_new = kpayload(lk_base, 1) + arg2; }    # SEEK_END
+        if (arg3 == 2) {                                            # SEEK_END
+            if (ktag(lk_base) == VFS_ZFS_FILE) {
+                fs_spin_lock();
+                var lk_zs = 0 - 1;                                 # 1.57.12 B11: a pending txg of it commits first — (B11
+                if (zfs_wp_obs(kpayload(lk_base, 2)) == 0) { lk_zs = zfs_fd_size(lk_base); }   # review) a failed one is -1
+                fs_spin_unlock();
+                if (lk_zs < 0) { stack_canary_check(canary); return 0 - 1; }
+                lk_new = lk_zs + arg2;
+            } else { lk_new = kpayload(lk_base, 1) + arg2; }
+        }
         if (lk_new < 0) { stack_canary_check(canary); return 0 - 1; }
         kpayload_set(lk_base, 0, lk_new);
         stack_canary_check(canary);

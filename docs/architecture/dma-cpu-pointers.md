@@ -55,6 +55,12 @@ ever reads were still reached at phys == VA until 1.57.9 (issue 2026-09-25-cpu-o
   non-coherent hardware every table write is clflushed (`iommu_flush_cache`, Linux `__iommu_flush_cache`) — QEMU
   reports C=0, so vtd-smoke runs that path.
 
+- **the ROOM** (1.57.12, `core/room.cyr`, [`kernel-image-room.md`](kernel-image-room.md)): the one 2 MB pmm carve-out that
+  holds the large module arrays that left the image's `.bss` (the klug ring, the PCI tables, the per-CPU syscall
+  staging …). Every moved array is a pointer `room_base + offset`, `room_base = dma_kva(room_phys)`; `room_phys` is
+  stored only in the room's own header. It is CPU-ONLY memory — a DMA buffer never moves there (it becomes its
+  driver's own pmm pages, granted, by this document's rule). Its arm in the selftest below: `dmash: room`.
+
 **Boot assert.** Each stored-pointer site runs `dma_kva_ok(kva)` once, at allocation: the pointer must lie inside the
 direct map actually installed, `[DIRECTMAP_BASE, (directmap_pdpt_top + 1) GB)` (FreeBSD's `PHYS_TO_DMAP` KASSERT without
 an assertion framework). A failure refuses the buffer (direct-paint console / ramdisk disabled / IOMMU not enabled)

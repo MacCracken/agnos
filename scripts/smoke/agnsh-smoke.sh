@@ -130,13 +130,60 @@ if strings "$LOG" | grep -q "agnoshi "; then
 else
     echo "  FAIL: no agnsh banner — it exec'd but produced no output (wedged before its first write)"; rc=1
 fi
-# ⭐ 1.57.7 (IMG-fix, A3): the BSP boot stack's span must be free RAM in the UEFI map the firmware handed over
-# (mbi.cyr bootstack_window_check). The violation line is denied below; the OK line is REQUIRED here, so a kernel
-# that stops running the check (or never reaches it) cannot pass by printing nothing.
-if strings "$LOG" | grep -q "boot: BSP stack span 0x3D0000-0x400000 is free RAM in the UEFI map OK"; then
-    echo "  PASS: BSP boot-stack span [0x3D0000, 0x400000) is free RAM in the UEFI map"
+# ⭐ 1.57.12: the two facts the BSP-stack move rests on, read against the UEFI map the firmware handed over (main.cyr,
+# mbi.cyr uefi_span_check): kmain runs on bsp_boot_stack inside the loader-pinned image (EfiLoaderCode), and region 7
+# (every kernel stack, the BSP's RSP0 slot included) is free RAM. The violation lines are denied below; both OK lines
+# are REQUIRED here, so a kernel that stops running the checks (or never reaches them) cannot pass by printing nothing.
+# (1.57.7-1.57.11 required "boot: BSP stack span 0x3D0000-0x400000 is free RAM in the UEFI map OK" — the region-1
+# window 1.57.12 vacated.)
+if strings "$LOG" | grep -qE "boot: BSP boot stack \[0x[0-9A-Fa-f]+, 0x[0-9A-Fa-f]+\) inside the loader-pinned image \(EfiLoaderCode\) OK"; then
+    echo "  PASS: $(strings "$LOG" | grep -oE "BSP boot stack \[0x[0-9A-Fa-f]+, 0x[0-9A-Fa-f]+\)" | head -1) is kmain's stack, inside the loader-pinned image (EfiLoaderCode)"
 else
-    echo "  FAIL: no 'boot: BSP stack span ... free RAM ... OK' line — the window check did not pass (or did not run)"; rc=1
+    echo "  FAIL: no 'boot: BSP boot stack [...) inside the loader-pinned image (EfiLoaderCode) OK' line — the check did not pass (or did not run)"; rc=1
+fi
+if strings "$LOG" | grep -q "boot: region 7 \[0xE00000, 0x1000000) is free RAM in the UEFI map OK"; then
+    echo "  PASS: region 7 [0xE00000, 0x1000000) (every kernel stack) is free RAM in the UEFI map"
+else
+    echo "  FAIL: no 'boot: region 7 [0xE00000, 0x1000000) is free RAM in the UEFI map OK' line — the check did not pass (or did not run)"; rc=1
+fi
+# ⭐ 1.57.12 (ROOM): the boot carve-out that holds the module arrays that left the image's .bss (core/room.cyr) — and the
+# klug ring's move into it. Both lines REQUIRED; every room failure halts with a "PANIC: room:" / "PANIC: kernel page
+# fault" line, denied through SMOKE_INVARIANT_DENY below.
+# The VA must be the DIRECT MAP (DIRECTMAP_BASE 0x200000000 + phys): the identity VA of the run works under the processes
+# this smoke runs and is the process's page under another one's CR3 (the room's mutation M3 — dma-shadow-smoke's
+# `room` arm is the behavioural proof; this is the cheap one, on every production boot). A BOOTCR3_KEEP_GNOBOOT_CR3 image
+# (AGNSH_SMOKE_FLAGS) fails it BY CONSTRUCTION: that build's room is the identity VA (kernel-image-room.md § The
+# KEEP_GNOBOOT build). The klug line is a COUNT, not the bytes — klug-spill-smoke's two sweep rows compare those.
+# ⭐ The second ROOM review (2026-10-12): the line's "B moved out of the image" is the arrays' DECLARED bytes (room_moved,
+# the figure the docs quote) and "(N B of page-rounded slots)" what they occupy — the line printed the slot figure as the
+# moved one until then (303104 vs the docs' 300064). Both are checked against kernel/core/room.cyr's own room_take lines
+# (count, sum of sizes, sum of page-rounded sizes), so the boot line and the source cannot drift apart unnoticed.
+ROOM_RE="boot: room carve-out \[0x[0-9a-f]+, 0x[0-9a-f]+\) at 0x[0-9a-f]+ -- [0-9]+ arrays, [0-9]+ B moved out of the image \([0-9]+ B of page-rounded slots\) OK"
+ROOM_SRC=$(sed -nE 's/^[[:space:]]*room_take\(&[A-Za-z0-9_]+,[[:space:]]*[0-9]+,[[:space:]]*([0-9]+)\);.*/\1/p' "$ROOT/kernel/core/room.cyr" \
+    | awk '{ n++; b += $1; s += int(($1 + 4095) / 4096) * 4096 } END { printf "%d %d %d", n, b, s }')
+if strings "$LOG" | grep -qE "$ROOM_RE"; then
+    ROOM_LINE=$(strings "$LOG" | grep -oE "$ROOM_RE" | head -1)
+    ROOM_VA=$(echo "$ROOM_LINE" | grep -oE "\) at 0x[0-9a-f]+" | sed 's/.* at //')
+    ROOM_GOT=$(echo "$ROOM_LINE" | sed -E 's/.* -- ([0-9]+) arrays, ([0-9]+) B moved out of the image \(([0-9]+) B of page-rounded slots\) OK/\1 \2 \3/')
+    if [ $((ROOM_VA)) -ge $((0x200000000)) ]; then
+        echo "  PASS: $(echo "$ROOM_LINE" | grep -oE "room carve-out \[0x[0-9a-f]+, 0x[0-9a-f]+\) at 0x[0-9a-f]+ -- [0-9]+ arrays, [0-9]+ B") moved out of the image, reached through the direct map"
+    else
+        echo "  FAIL: the room carve-out is reached at $ROOM_VA — not the direct map (>= 0x200000000): an identity VA is a process's page under its CR3"; rc=1
+    fi
+    if [ "$ROOM_GOT" = "$ROOM_SRC" ]; then
+        echo "  PASS: the carve-out line's arrays / moved bytes / slot bytes ($ROOM_GOT) are room.cyr's room_take lines'"
+    else
+        echo "  FAIL: the carve-out line says arrays / moved / slot bytes '$ROOM_GOT', room.cyr's room_take lines say '$ROOM_SRC'"; rc=1
+    fi
+else
+    echo "  FAIL: no 'boot: room carve-out [...) at ... -- N arrays, N B moved out of the image (N B of page-rounded slots) OK' line — room_init did not run (or did not finish)"; rc=1
+fi
+# `held [1-9]…`, not `[0-9]+` (the ROOM review's mutation MR3): a move that dropped the early ring prints "held 0" — the
+# banner alone is ~25 B, so a correct boot never moves nothing.
+if strings "$LOG" | grep -qE "klug: log ring moved to the room carve-out \(65536 B\); the early ring held [1-9][0-9]* of 8192 B$"; then
+    echo "  PASS: the klug ring moved into the room with nothing lost ($(strings "$LOG" | grep -oE "the early ring held [0-9]+ of 8192 B" | head -1))"
+else
+    echo "  FAIL: no clean 'klug: log ring moved to the room carve-out' line (missing, the early ring overflowed, or it moved 0 B)"; rc=1
 fi
 # ⭐ 1.57.7 (Path 2, S3.4): the voluntary-switch gate (vector 0xE0) must be installed DPL0 / IST0 / selector 0x08 at
 # &resched_isr (sched.cyr resched_gates_ok). The misconfigured line is denied below; the OK line is REQUIRED here.

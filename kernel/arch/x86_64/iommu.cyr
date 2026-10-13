@@ -540,7 +540,7 @@ fn iommu_init() {
     }
     # Context tables: every bus pci_scan found a function on (the 256-bus sweep, so bridges' secondary buses included).
     for (var k = 0; k < pci_count; k = k + 1) {
-        var cbus = (load64(&pci_busfunc + k * 8) >> 8) & 0xFF;
+        var cbus = (load64(pci_busfunc + k * 8) >> 8) & 0xFF;
         if (iommu_bus_context(cbus) < 0) { kprintln("iommu: translation NOT enabled - no memory for a context table", 62); return iommu_fail(); }
     }
     iommu_flush_cache(iommu_root_kva, 4096);                 # every entry was flushed at its store; the page once more
@@ -692,8 +692,8 @@ fn vtd_selftest() {
         kprintln("vtdst: FAIL the test region is already granted - the blocked arm would prove nothing", 84);
         bad = bad + 1;
     }
-    var sbf = load64(&pci_busfunc + nvme_pci_idx * 8);
-    var nsid = (((sbf >> 8) & 0xFF) << 8) | (PciDev_slot(&pci_devs + nvme_pci_idx * 32) << 3) | (sbf & 7);
+    var sbf = load64(pci_busfunc + nvme_pci_idx * 8);
+    var nsid = (((sbf >> 8) & 0xFF) << 8) | (PciDev_slot(pci_devs + nvme_pci_idx * 32) << 3) | (sbf & 7);
     var rg_kva = dma_kva(reg);
     memset(rg_kva, 0xA5, 4096);
     iommu_fault_scan(0);                                      # start from an empty fault log

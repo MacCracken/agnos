@@ -41,6 +41,12 @@ fn power_flush() {
 
     fs_spin_lock();
     vfs_wfile_sweep_all();
+    # 1.57.12 B11 — the ZFS pool's pending policy-B txg COMMITTED before the machine stops (zfs_write.cyr zfs_wp_sync:
+    # its own two device flushes; the per-backend flushes below find nothing of ZFS's left volatile)
+    # (B11 review) WITHOUT interrupt windows (zfs_wirq_no): power_stop_final's teardown runs IF=0 on purpose — the tick's
+    # hid_poll / net / wq must not run across it — and every power_flush caller is a terminus, so the latch stays set
+    zfs_wirq_no = 1;
+    if (zfs_wp_sync() != 0) { kprintln("power: a ZFS commit failed - its pending writes are lost", 56); }
     if (ext2_active != 0) { ext2_sync(); }
     fs_spin_unlock();
 

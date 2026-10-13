@@ -193,7 +193,9 @@ for SMP in ${MSC_CDB_SMP:-1 4}; do
     if boot "$WORK/agnos-rwdemo" "$SMP" "prod-smp$SMP"; then
         want  "mass-storage device(s) detected"              "[prod-smp$SMP] the usb-storage stick enumerated"
         wantkre "msc: slot [0-9]+ LBA0 first 8 bytes: 77 83 67 76 66 65 48 33" "[prod-smp$SMP] production READ(10) of LBA 0 returned the seeded bytes (the MSC line, not nvme/ahci's)"
-        wantk "msc: LBA100 write-then-read round-trip PASS"  "[prod-smp$SMP] production WRITE(10) + READ(10) round-trip at LBA 100"
+        # 1.57.12: the demo writes the original sector back and verifies it; LBA 100 because this stick has no GPT
+        # (on a GPT stick it takes an LBA outside the GPT and every partition, gpt.cyr gpt_scratch_lbas_on).
+        wantk "msc: LBA100 write-then-read round-trip PASS (original restored)"  "[prod-smp$SMP] production WRITE(10) + READ(10) round-trip at LBA 100, the original sector restored"
         wantk "msc-bounce: A kmalloc blk_read PASS"          "[bounce-smp$SMP] A: msc_blk_read into a kmalloc block (direct-map VA) returns the sector"
         wantk "msc-bounce: B direct-map blk_read_sectors(16) PASS" "[bounce-smp$SMP] B: msc_blk_read_sectors(16) into an unaligned direct-map buffer (2 bounce chunks)"
         wantk "msc-bounce: C direct-map blk_write(x8) PASS"  "[bounce-smp$SMP] C: msc_blk_write from an unaligned direct-map buffer lands on the stick"

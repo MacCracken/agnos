@@ -23,6 +23,11 @@
 #                                             it), so NEITHER other oracle can see it regress — a
 #                                             tss_get_cpu_stack put back on region 1 scored PASS here
 #                                             before this line existed (mutation (b) below);
+#   · "smpstk: bsp rsp0 at region-7 slot 0 top OK" (1.57.12) — the BSP's TSS.RSP0 as tss_init stored it (captured
+#                                             right after tss_init, before any kstack_install) EQUALS DIRECTMAP_BASE +
+#                                             0xFD0000, the top of region-7 slot 0: gdt.cyr tss_get_cpu_stack is one
+#                                             formula for every CPU since the BSP's RSP0 left region 1 (0x400000).
+#                                             Like the AP rsp0 lines, nothing else reads that value at boot;
 #   · "smpstk: rodata intact after AP wake"  — the rekha chunk literals (the .rodata the 1.57.2 region-1
 #                                             windows [0x310000, 0x340000) sat on) re-hashed IN PLACE after
 #                                             the APs took timer frames still equal the generator FNV-1a-64.
@@ -123,7 +128,7 @@ if ! strings "$LOG" 2>/dev/null | grep -q "AGNOS kernel v"; then
     exit 2
 fi
 echo "  --- smp / smpstk serial lines ---"
-strings "$LOG" | grep -aE "smp: |smpstk: |kybernet:|PANIC|Double Fault" | sed 's/^/  /' | head -24
+strings "$LOG" | grep -aE "smp: |smpstk: |kybernet:|PANIC|Double Fault" | sed 's/^/  /' | head -28
 rc=0
 strings "$LOG" | grep -q "smp: cpus online: 4" \
     && echo "  PASS: smp: cpus online: 4 — APs 1-3 woke and counted in (where their stacks ARE is the next three lines)" \
@@ -145,6 +150,14 @@ for n in 1 2 3; do
         echo "  FAIL: no rsp0 verdict for ap $n — the selftest did not read its TSS slot (not online, or a build without the 1.57.3 rsp0 oracle)"; rc=1
     fi
 done
+# 1.57.12 — the BSP's TSS.RSP0 (gdt.cyr tss_get_cpu_stack(0)): region-7 slot 0's top, not region 1's 0x400000.
+if strings "$LOG" | grep -q "smpstk: bsp rsp0 at region-7 slot 0 top OK"; then
+    echo "  PASS: bsp TSS.RSP0 == DIRECTMAP_BASE + 0xFD0000, region-7 slot 0's top ($(strings "$LOG" | grep -o "smpstk: bsp rsp0=0x[0-9A-Fa-f]*" | head -1))"
+elif strings "$LOG" | grep -q "smpstk: bsp rsp0 NOT region-7 slot 0"; then
+    echo "  FAIL: bsp rsp0 NOT region-7 slot 0 ($(strings "$LOG" | grep -o "smpstk: bsp rsp0=0x[0-9A-Fa-f]*" | head -1)) — tss_get_cpu_stack(0) (gdt.cyr) no longer hands the BSP slot 0"; rc=1
+else
+    echo "  FAIL: no bsp rsp0 verdict — the selftest did not run, or a build without the 1.57.12 BSP line"; rc=1
+fi
 if strings "$LOG" | grep -q "smpstk: rodata intact after AP wake"; then
     echo "  PASS: rekha chunk literals re-hashed IN PLACE after the wake == generator FNV-1a-64 (no AP stack is in the image)"
 elif strings "$LOG" | grep -q "smpstk: rodata CORRUPTED by AP stacks"; then
@@ -160,5 +173,5 @@ strings "$LOG" | grep -qE "PANIC|Double Fault" \
     || echo "  PASS: no ring-0 PANIC / Double Fault line"
 
 echo ""
-[ "$rc" -eq 0 ] && echo "ap-stack-smoke: PASS — AP1-3 boot/TSS stacks in region 7 (direct-map), kernel .rodata intact after the wake (1.57.3)" || echo "ap-stack-smoke: FAIL"
+[ "$rc" -eq 0 ] && echo "ap-stack-smoke: PASS — AP1-3 boot/TSS stacks in region 7 (direct-map), BSP TSS.RSP0 in slot 0 (1.57.12), kernel .rodata intact after the wake (1.57.3)" || echo "ap-stack-smoke: FAIL"
 exit $rc

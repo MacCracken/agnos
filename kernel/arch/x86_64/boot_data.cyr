@@ -10,7 +10,7 @@ var gdt_ptr[16];
 # EMIT_GVAR_INITS, avoiding any chance of the gvar-init pass
 # overwriting a captured value.
 # Read via `load64(&boot_info_ptr)` once the kernel reaches main code.
-# Unused in ELF32 multiboot1 builds; the 8 bytes are harmless overhead.
+# (The ELF32 multiboot1 path that did not use it was deleted at 1.57.12.)
 var boot_info_ptr[8];
 # Low (<4 GB) kernel-resident copy of gnoboot's boot_info struct. gnoboot is
 # a UEFI PE app that firmware loads at an arbitrary base — on a RAM-rich Zen

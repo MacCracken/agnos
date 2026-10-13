@@ -241,6 +241,8 @@ fn sys_fork(user_rsp) {
 # code/stack VAs (0x400000+); a late alloc could land at 0x400000 and collide
 # with the user-code page (the ~17% exec flake). Mapped identity (within the
 # 0-1 GB the per-process CR3 mirrors), writable. Idempotent.
+# (HISTORY — nothing lives at 0x3F0000 now: this stack left region 1 for region 7 at 1.46.x/1.51.x, see below,
+# and since 1.57.12 region 1 holds only the kernel image, which may extend to 0x400000 — gate 34.)
 fn syscall_kstack_reserve() {
     if (syscall_kstack_reserved != 0) { return 0; }
     # 1.46.x 4b: FIXED per-CPU kstacks whose PHYS lives in region 7 (0xE00000-0x1000000, 14-16 MB),
@@ -532,7 +534,8 @@ fn syscall_stub_build() {
     # (and its ksyscall callees) use RBP as a frame pointer
     # (push rbp; mov rbp,rsp; … ; leave) — so once we `call syscall_handler`
     # RBP holds a KERNEL-stack frame value (~0x37ff00, just under the kstack
-    # top 0x3F0000). In ~1/52 boots that leaked-kernel RBP survived back to
+    # top 0x3F0000 of the 1.42.x layout — history: region 1 has held only the image since 1.57.12).
+    # In ~1/52 boots that leaked-kernel RBP survived back to
     # ring 3 and agnsh's mmap-wrapper epilogue (`mov -0x28(%rbp),%r15`)
     # #PF'd on the smashed RBP while RSP was healthy. We are now on the
     # kernel stack (RSP=kstack), so push the user RBP here and pop it back

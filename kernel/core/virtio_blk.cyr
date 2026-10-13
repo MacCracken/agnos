@@ -135,8 +135,8 @@ var vblk_dma_buf[512];      # 512-byte sector DMA buffer
 #   +12 length (le32)
 # Notify cap is 20 bytes total (extra trailing le32 notify_off_multiplier).
 fn vblk_scan_caps(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
 
@@ -395,7 +395,7 @@ fn virtio_blk_init() {
     if (idx < 0) { return 0 - 1; }
 
     # Enable bus-master for DMA (matches existing nvme/ahci/virtio_net pattern)
-    pci_enable_bus_master(PciDev_slot(&pci_devs + idx * 32));
+    pci_enable_bus_master(PciDev_slot(pci_devs + idx * 32));
 
     # Scan capabilities → set vblk_common_cfg / vblk_notify_base / vblk_notify_mul
     # / vblk_isr_cfg / vblk_device_cfg.

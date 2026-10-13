@@ -459,7 +459,7 @@ fn hda_find_next_controller(skip_idx) {
     var i = 0;
     while (i < pci_count) {
         if (i != skip_idx) {
-            if (load64(&pci_class + i * 8) == want) { return i; }
+            if (load64(pci_class + i * 8) == want) { return i; }
         }
         i = i + 1;
     }

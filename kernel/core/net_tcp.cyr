@@ -1969,7 +1969,7 @@ fn ta_b2() {
     var a6ch = ta_find(5007, 7170, 0x7F000009);
     var a6c = 0;
     if (a6ch >= 0 && ta_ld(a6ch, 168) == 0x7F000002 && lo_count == a6lc + 1) {
-        var a6fr = &lo_ring + ((lo_tail - 1) & 7) * 1536;
+        var a6fr = lo_ring + ((lo_tail - 1) & 7) * 1536;
         if (load8(a6fr + 26) == 127 && load8(a6fr + 27) == 0 && load8(a6fr + 28) == 0 && load8(a6fr + 29) == 2) { a6c = 1; }
     }
     ta_res(0, "A6c", 3, a6c, a6ch);

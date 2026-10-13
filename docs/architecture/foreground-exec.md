@@ -29,8 +29,8 @@ Since S3b the child is an **ordinary scheduled IF=1 process** and the waiter **b
   return the code. The caller shows #99 state 6 while it waits. Nesting is bounded only by the 16-slot table.
 - **kmain** (`kernel_run_child(pid, pin)`, reached through `kernel_exec_foreground` from the shared `sh_cmd_run` and
   `kybernet_exec_agnsh`): the same wait, the child BSP-pinned (D22). kmain may block: it is a real process (state 2,
-  `on_cpu` = BSP) on its own region-1 stack and the boot CR3; it stays BSP-pinned because that stack IS the BSP boot
-  stack. The split `kernel_run_child_keep` (returns with the child dead but UNREAPED, its slot held by the fgwait
+  `on_cpu` = BSP) on its own boot stack (`bsp_boot_stack`, image `.bss` since 1.57.12; region 1 before) and the boot
+  CR3; it stays BSP-pinned because that stack IS the BSP boot stack. The split `kernel_run_child_keep` (returns with the child dead but UNREAPED, its slot held by the fgwait
   cell) + `kernel_run_child_done` (reap, then clear) exists for KSTACK's fallback phase, which reads the child's data
   page between the two. `kr_refused` tells a refusal from a child that itself exited -1.
 - **Before `sched_active = 1`** (the compile-gated `sh_exec("run …")` selftest hooks, bote, a KTEST-build kybernet)

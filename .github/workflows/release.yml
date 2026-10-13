@@ -87,10 +87,11 @@ jobs:
           # whose own comment says it is a grant that expires. Measured at the revert: 4% headroom.
           echo "  (size ceiling is check.sh gate 32's, deliberately not enforced here — see ci.yml)" 
 
-      - name: Kernel image vs BSP boot stack (image-layout-check.sh)
+      - name: Kernel image vs region-1 top (image-layout-check.sh)
         # ⭐ 1.57.7 (IMG-fix, review A5). NOT the size ceiling's case (above): the weighed-size row's grant (scripts/check/weighed-size-check.sh) is a BUDGET;
-        # this bound is a CORRECTNESS fact — past LOAD end 0x3D0000 the BSP boot stack (top 0x3E0000 since 1.57.11, live from
-        # the shim's first instruction) grows down into the image's .rodata with no fault. build.sh only WARNS
+        # this bound is a CORRECTNESS fact — past LOAD end 0x400000 (1.57.12; the top of region 1) the image runs into ring-3
+        # code's VA and out of the pmm-reserved 4 MB (0x3D0000 until 1.57.12, when the BSP boot stack sat at top 0x3E0000 and
+        # grew down into the image's .rodata with no fault). The gate also decodes the shim's .bss stack load. build.sh only WARNS
         # for a plain image (so check.sh gate 34 can score it locally) and CI does not run check.sh, so without
         # this step an over-bound kernel would build green here and ship. Needs only python3 + the tree.
         run: sh scripts/check/image-layout-check.sh build/agnos
