@@ -129,7 +129,7 @@ run_recovery() {
     ring3_seed_image "$WORK/R.img" "$KERNEL" "$SEED" "AGNOS-FGR" || { echo "  ERROR: image"; exit 1; }
     for smp in ${FG_SMP:-1 4}; do
         LOG="$LOGS/fg-recovery-smp$smp.log"
-        MON="$WORK/mon-$smp.sock"
+        MON=$(smoke_qsock "$WORK/mon-$smp.sock")   # 1.57.13: short socket path (smoke_qsock, qemu-dwell.sh: sun_path is 108 bytes)
         if [ "$smp" -gt 1 ]; then ACC="$(smoke_accel "$smp")"; else ACC="-cpu max"; fi
         echo ""
         echo "Recovery boot -smp $smp  accel: $ACC"

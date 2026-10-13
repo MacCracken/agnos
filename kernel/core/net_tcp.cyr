@@ -95,6 +95,7 @@ var TCP_RTO_RETRIES = 5;       # resends before declaring the conn dead
 var TCP_RTO_BASE_US  = 1000000;   # 1 s initial RTO (was TCP_RTO_BASE = 100 ticks)
 var TCP_CONNECT_US   = 8000000;   # #47 ceiling, computed ONCE per call from entry (never reset by a wake)
 var TCP_PROGRESS_US  = 8000000;   # D6: #48 returns the committed count after this long with no ACK progress
+var TCP_SEND_DL_MAX_US = 0x10000000000;   # 1.57.13 #109: the caller ceiling's clamp (2^40 µs, ~12.7 days; overflow-safe)
 var TCP_FINWAIT2_US  = 8000000;   # a held FIN slot whose FIN is ACKed but whose peer never FINs is released after this
 var TCP_PERSIST_CAP  = 4;         # a zero-window peer that keeps ACKing caps the retry count here (never exhausts)
 var TCP_META_PEER_FIN = 0x2000;   # meta bit 13 (byte 1 bit 5): the peer's FIN has been consumed
@@ -862,7 +863,8 @@ fn tcp_ephemeral_next() {
 # lock, 1 = lifecycle ABORT (S7: wq_signal_point), 2 = this context cannot block (take net_legacy_step).
 # ⚠ Entered with NO lock held (R2); nothing per-CPU is kept across it (R4) — cid, the snapshot and the deadline are
 # locals on the caller's per-process kernel stack. Mode 1 = #47 (SYN_SENT), mode 2 = #48 (a segment in flight).
-fn tcp_block(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen, bk_dl) {
+# `bk_una` (mode 2; 0 in mode 1) is the SND.UNA the caller last decided on — see tcp_wait_done.
+fn tcp_block(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen, bk_dl, bk_una) {
     var bk_f = kbd_irq_save();
     var bk_a = wq_arm(WK_TCP | bk_cid, bk_dl);
     if (bk_a == 2) { kbd_irq_restore(bk_f); return 2; }
@@ -871,7 +873,7 @@ fn tcp_block(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen, bk_dl) {
         if (wq_signal_point() == 1) { return 1; }
         return 0;
     }
-    if (tcp_wait_done(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen) == 1) { wq_cancel(); kbd_irq_restore(bk_f); return 0; }
+    if (tcp_wait_done(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen, bk_una) == 1) { wq_cancel(); kbd_irq_restore(bk_f); return 0; }
     if (sched_clock_us() >= bk_dl) { wq_cancel(); kbd_irq_restore(bk_f); return 0; }
     var bk_r = wq_sleep();
     kbd_irq_restore(bk_f);
@@ -883,7 +885,12 @@ fn tcp_block(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen, bk_dl) {
 # The predicate, as lock-free plain loads (a racy PREFILTER: the waker stores the condition under tcp_tab_lock and
 # wakes after the unlock; the authoritative re-check is the caller's, under tcp_lock, after the wake). tcp_same_locked
 # only READS, so it is legal here without the lock (PLAN E1). 1 = stop waiting.
-fn tcp_wait_done(wd_cid, wd_mode, wd_tag, wd_ep, wd_gen) {
+# ⭐ 1.57.13: mode 2 also stops on SND.UNA != `wd_una` — a PARTIAL ACK is a wake condition (it restarts #48's D6
+# clock), so the post-arm re-check must see it too. Without it a partial ACK consumed before the arm (the sender's OWN
+# net_poll — loopback raises no interrupt — or another CPU's drain racing the arm) left the sender asleep until the
+# OLD D6 deadline, and the loop top then restarted D6 from there: up to 2 x TCP_PROGRESS_US with no progress after
+# the partial ACK (the tcp: d6part arm; under a #109 ceiling the clamp still bounded it).
+fn tcp_wait_done(wd_cid, wd_mode, wd_tag, wd_ep, wd_gen, wd_una) {
     if (tcp_same_locked(wd_cid, wd_tag, wd_ep, wd_gen) == 0) { return 1; }
     var wd_cb = tcp_conn_base(wd_cid);
     var wd_st = load64(wd_cb);
@@ -893,6 +900,7 @@ fn tcp_wait_done(wd_cid, wd_mode, wd_tag, wd_ep, wd_gen) {
     }
     if (wd_st != 2 && wd_st != 4) { return 1; }
     if (load64(wd_cb + 128) == 0) { return 1; }
+    if (load64(wd_cb + 56) != wd_una) { return 1; }               # ACK progress (a partial ACK): re-decide D6
     return 0;
 }
 
@@ -959,7 +967,7 @@ fn tcp_connect_wait(cw_id, cw_tag, cw_ep, cw_gen, cw_dl) {
         if (cw_spins < NET_BLOCK_SPINS) {
             cw_spins = cw_spins + 1;
         } elif (cw_blk == 1) {
-            var cw_r = tcp_block(cw_id, 1, cw_tag, cw_ep, cw_gen, cw_dl);
+            var cw_r = tcp_block(cw_id, 1, cw_tag, cw_ep, cw_gen, cw_dl, 0);
             if (cw_r == 1) {                                                      # lifecycle ABORT (S7)
                 var cw_g = tcp_lock();
                 if (tcp_same_locked(cw_id, cw_tag, cw_ep, cw_gen) == 1) { tcp_close_locked(cw_id); }
@@ -977,6 +985,11 @@ fn tcp_connect_wait(cw_id, cw_tag, cw_ep, cw_gen, cw_dl) {
 fn tcp_connect_owned(dst_ip, dst_port, src_port, ct_own) { return tcp_connect_ex(dst_ip, dst_port, src_port, ct_own, TCP_CONNECT_US); }
 fn tcp_connect(dst_ip, dst_port, src_port) { return tcp_connect_owned(dst_ip, dst_port, src_port, 0); }   # in-kernel
 
+# 1.57.13 (#109): a D6 deadline clamped to the caller's ABSOLUTE ceiling (0 = none) — tcp_send_ex's three D6 sites.
+fn tcp_send_cap_clamp(cc_dl, cc_cap) {
+    if (cc_cap > 0) { if (cc_cap < cc_dl) { return cc_cap; } }
+    return cc_dl;
+}
 # ⭐ sock_send#48's body (1.57.7 S6). STREAM-CORRECT: ONE segment in flight at EVERY entry — a call that finds an
 # earlier call's segment still unACKed waits for it first (M-S2), and the next chunk is never sent over an unACKed
 # one; each chunk is armed, sent FROM THE HELD KERNEL COPY and SND.NXT advanced in ONE tcp_tab_lock hold (S4: the
@@ -985,7 +998,11 @@ fn tcp_connect(dst_ip, dst_port, src_port) { return tcp_connect_owned(dst_ip, ds
 # (the in-flight chunk included, possibly 0) after `prog_us` with no ACK progress (D6); the committed count when
 # the conn dies or stops being the snapshot incarnation after something was committed, else -1; the committed
 # count on a lifecycle ABORT (the segment stays armed; the death chain closes the conn).
-fn tcp_send_ex(se_id, se_data, se_len, se_own, se_prog) {
+# ⭐ 1.57.13 (#109): `se_cap` is an ABSOLUTE sched_clock_us ceiling on the WAITING (0 = none, every #48 caller):
+# each D6 deadline is clamped to it (tcp_send_cap_clamp), so the call returns the committed count at
+# min(cap, last progress + se_prog). A chunk that can go out without a wait still goes — the cap bounds the
+# waiting, never the committing (tcp_send_dl has the rule and its prior art).
+fn tcp_send_ex(se_id, se_data, se_len, se_own, se_prog, se_cap) {
     if (tcp_owner_is(se_id, se_own) == 0) { return 0 - 1; }
     var se_cb = tcp_conn_base(se_id);
     var se_f = tcp_lock();
@@ -1004,7 +1021,7 @@ fn tcp_send_ex(se_id, se_data, se_len, se_own, se_prog) {
     var se_blk = wq_can_block();
     var se_sent = 0;
     var se_spins = 0;
-    var se_pdl = wq_deadline_after_us(se_prog);
+    var se_pdl = tcp_send_cap_clamp(wq_deadline_after_us(se_prog), se_cap);
     while (1) {
         var se_g = tcp_lock();
         var se_s = load64(se_cb);
@@ -1016,17 +1033,18 @@ fn tcp_send_ex(se_id, se_data, se_len, se_own, se_prog) {
         var se_una = load64(se_cb + 56);
         if (se_una != se_last) {                                   # ACK progress (a partial ACK included): D6 clock
             se_last = se_una;
-            se_pdl = wq_deadline_after_us(se_prog);
+            se_pdl = tcp_send_cap_clamp(wq_deadline_after_us(se_prog), se_cap);
         }
         if (load64(se_cb + 128) != 0) {                            # a segment in flight — ours or an EARLIER call's
             tcp_unlock(se_g);
             if (sched_clock_us() >= se_pdl) { return se_sent; }    # D6: the committed count, possibly 0
             net_poll();                                            # the ACK may be queued (loopback: our own drain)
-            if (load64(se_cb + 128) == 0) { continue; }            # racy prefilter; re-decided under the lock
+            # Racy prefilter, re-decided under the lock: ACKed, or a partial ACK (D6 restarts at the loop top).
+            if (load64(se_cb + 128) == 0 || load64(se_cb + 56) != se_last) { continue; }
             if (se_spins < NET_BLOCK_SPINS) {
                 se_spins = se_spins + 1;
             } elif (se_blk == 1) {
-                var se_r = tcp_block(se_id, 2, se_tag, se_ep, se_gen, se_pdl);
+                var se_r = tcp_block(se_id, 2, se_tag, se_ep, se_gen, se_pdl, se_last);
                 if (se_r == 1) { return se_sent; }                 # lifecycle ABORT (S7)
                 if (se_r == 2) { se_blk = 0; }
             } else {
@@ -1046,12 +1064,37 @@ fn tcp_send_ex(se_id, se_data, se_len, se_own, se_prog) {
         se_last = load64(se_cb + 56);
         tcp_unlock(se_g);
         se_sent = se_sent + se_chunk;
-        se_pdl = wq_deadline_after_us(se_prog);
+        se_pdl = tcp_send_cap_clamp(wq_deadline_after_us(se_prog), se_cap);
         se_spins = 0;
     }
     return se_sent;
 }
-fn tcp_send_own(conn_id, data, len, sd_own) { return tcp_send_ex(conn_id, data, len, sd_own, TCP_PROGRESS_US); }
+fn tcp_send_own(conn_id, data, len, sd_own) { return tcp_send_ex(conn_id, data, len, sd_own, TCP_PROGRESS_US, 0); }
+# ⭐ 1.57.13 — sock_send_dl#109's body (issue archived/2026-10-02-sock-send-ignores-the-caller-deadline.md: a cyrius TLS
+# write overshot its deadline by up to #48's ~8 s D6 window). `dl_us` is the caller's CEILING on this call, in µs,
+# measured ONCE from entry and NEVER reset by ACK progress — the #47 TCP_CONNECT_US rule, and Linux SO_SNDTIMEO
+# (tcp_sendmsg_locked takes one `timeo` that sk_stream_wait_memory decrements across every wait of the call). A
+# per-wait bound reset on each ACK (FreeBSD sbwait's sb_timeo; the issue's first sketch) would let a peer that ACKs
+# one segment just inside the bound stretch a 16 KB call to ~12 bounds — the overshoot the issue is about. It bounds
+# only the WAITING: a chunk that can go out without a wait still goes (Linux copies into free send space with an
+# expired timeo), so the count returned is what was committed. D6 still applies under it: a peer that stops ACKing
+# returns the call at min(dl_us, TCP_PROGRESS_US), a progressing one at dl_us at the latest.
+#   dl_us == 0 -> tcp_send_own: byte-for-byte #48 (no ceiling; the 8 s D6 window only).
+#   dl_us <  0 -> a spent ceiling: no wait at all (Linux sock_set_timeout maps a negative SO_SNDTIMEO to 0 = no wait).
+#   dl_us >  TCP_SEND_DL_MAX_US -> clamped (overflow-safe on sched_clock_us + dl_us).
+# Never early: wq_deadline_after_us adds a tick in tick mode; the expiry is the first tick at or after it.
+fn tcp_send_dl(conn_id, data, len, sd_own, dl_us) {
+    if (dl_us == 0) { return tcp_send_own(conn_id, data, len, sd_own); }
+    var sd_cap = 1;
+    if (dl_us < 0) {
+        sd_cap = sched_clock_us();
+        if (sd_cap < 1) { sd_cap = 1; }
+    } else {
+        if (dl_us > TCP_SEND_DL_MAX_US) { dl_us = TCP_SEND_DL_MAX_US; }
+        sd_cap = wq_deadline_after_us(dl_us);
+    }
+    return tcp_send_ex(conn_id, data, len, sd_own, TCP_PROGRESS_US, sd_cap);
+}
 fn tcp_send(conn_id, data, len) { return tcp_send_own(conn_id, data, len, 0); }   # in-kernel callers (own 0)
 
 # 1.57.7 (S4): net_poll FIRST (outside the lock), then the ring drain, the rx_read store, the copy to `buf` and

@@ -29,7 +29,7 @@
 # ran after the mcopy).
 
 ring3_seed_init() {
-    R3_GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
+    R3_GNOBOOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}/build/BOOTX64.EFI"   # 1.57.13 review: <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo>
     R3_OVMF_CODE=""
     for _r3c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do
         [ -f "$_r3c" ] && { R3_OVMF_CODE="$_r3c"; break; }

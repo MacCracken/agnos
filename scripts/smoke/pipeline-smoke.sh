@@ -67,7 +67,7 @@ deny() { if strings "$LOG" | grep -qE -- "$1"; then bad "$2"; strings "$LOG" | g
 # ONE BOOT PER CASE: a case that hangs leaves the shell stuck, and the next case must still be measured.
 for smp in ${PIPE_SMOKE_SMP:-1 4}; do
   for pcase in early s2fail; do
-    LOG="$LOGS/pipeline-$pcase-smp$smp.log"; MON="$WORK/mon-$smp.sock"
+    LOG="$LOGS/pipeline-$pcase-smp$smp.log"; MON=$(smoke_qsock "$WORK/mon-$smp.sock")   # 1.57.13: short socket path (smoke_qsock, qemu-dwell.sh: sun_path is 108 bytes)
     if [ "$smp" -gt 1 ]; then ACC="$(smoke_accel "$smp")"; else ACC="-cpu max"; fi
     echo ""
     echo "Boot -smp $smp  case $pcase  accel: $ACC"

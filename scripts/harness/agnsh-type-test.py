@@ -5,7 +5,7 @@
 #
 # Exit 0 = every typed line reached ring 3 and the shell answered it.
 # Exit 1 = it did not (a RESULT). Exit 2 = the run could not be set up (NOT a pass).
-import socket, subprocess, sys, time, os
+import re, socket, subprocess, sys, time, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORK = os.path.join(ROOT, "build/agnsh-smoke")
@@ -20,11 +20,12 @@ IMG  = os.path.join(WORK, "agnos-agnsh.img")
 # to name the command rather than silently regenerate someone else's artifact.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale
+from _qsock import qsock
 refuse_stale(IMG, [os.path.join(ROOT, 'build', 'agnos')],
              'kernel (build/agnos is newer than this baked image)',
              'rm -rf ' + WORK + '   # then re-run the smoke that builds this image')
 SER  = os.path.join(WORK, "serial-type.log")
-MON  = "/tmp/agnos-type.sock"
+MON  = qsock(os.path.join(WORK, "type-mon.sock"))  # 1.57.13: short + per-tree (_qsock.py)
 # ⛔ A RUN THAT COULD NOT BE SET UP IS NOT A PASS, AND IT SAYS SO IN ITS OWN VOICE.
 # This harness BUILDS NOTHING — it boots whatever `scripts/smoke/agnsh-smoke.sh` last left in
 # build/agnsh-smoke/agnos-agnsh.img (CHANGELOG 1.56.42: "builds no image ... so build.sh alone tests a
@@ -68,7 +69,10 @@ def p(*a): print(*a, flush=True)
 # agnsh ever rewords one of these the failure is a loud "2/3 answered", never a silent pass.
 # ⛔ NOT the ECHOED word: agnsh's own `help` output lists "version" and "mode" (:382-383), so counting
 # echoes would let ONE surviving keystroke score 3/3 with the other two lines never delivered.
-ANSWERS = (("help", "show this help"), ("version", "agnoshi 1."), ("mode", "Current mode:"))
+# 1.57.13 merge: `version`'s marker named the agnoshi MAJOR ("agnoshi 1.") and went stale at agnoshi 2.0 — the shell
+# answered `agnoshi 2.0.3` and this harness, which no sweep row runs, scored the answered line unanswered. Any
+# `agnoshi <major>.<minor>` is the shell's answer; the markers are regexes now.
+ANSWERS = (("help", r"show this help"), ("version", r"agnoshi [0-9]+\.[0-9]+"), ("mode", r"Current mode:"))
 
 rc = 1
 try:
@@ -165,7 +169,7 @@ try:
     # filled with `hid: poll idle, N ticks` and a non-empty test would have called that green.
     # The floor is therefore the SHELL'S ANSWER to each line we typed, COUNTED AND PRINTED — a run that
     # reports 1/3 is telling you its own input path broke, which is the only thing this harness is for.
-    answered = [cmd for cmd, marker in ANSWERS if marker in new]
+    answered = [cmd for cmd, marker in ANSWERS if re.search(marker, new)]
     p(f"new serial bytes after typing: {len(new)}")
     p(f"typed lines the shell answered: {len(answered)}/{len(ANSWERS)}  {answered}")
     rc = 0 if len(answered) == len(ANSWERS) else 1

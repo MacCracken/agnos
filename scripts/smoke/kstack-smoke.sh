@@ -32,6 +32,11 @@
 #   kstack: spurious 0xE0 OK         a self-IPI on 0xE0 is EOI'd; the timer keeps ticking
 #   kstack: isr clac OK              AC sampled clear in ISR bodies that interrupted a stac window + every gate's first 3 bytes are clac
 #   kstack: preempt rmw OK           -smp 4: two migrating lock-takers never strand a CPU's preempt count ("n/a (1 cpu)" at -smp 1)
+#   kstack: tick orphan OK           (1.57.13, design k.132 (3)) -smp 4: kmain holds fs_lock 300 ms while an ORPHAN spinning in
+#                                    ring 3 on an AP (with a zombie child) is killed at the tick: that CPU keeps ticking
+#                                    (>= 10), both reaps are OWED (DYING, nothing reaped under the hold), and after the
+#                                    release an idle step / syscall exit reaps both (state 0, no table, CR3 0x1000, memory
+#                                    back). ("n/a (1 cpu)" at -smp 1)
 #   sched: resched gate 0xE0 OK      the 0xE0 gate check at boot
 #   kstack: spurious 0xE1 OK         (1.57.7 S3.8) a self-IPI on the 0xE1 kick vector is EOI'd; the timer keeps ticking
 #   kstack: kick gate DPL0 OK        (1.57.7 S3.8) a ring-3 `int 0xE1` is a #GP (exit 141)
@@ -48,7 +53,9 @@
 # Exit: 0 PASS · 1 FAIL · 2 VOID (the firmware never handed off). Leaves a PLAIN build in build/agnos.
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+# 1.57.13 review: siblings as doom/naad resolve them — <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> (a worktree holds no sibling).
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
@@ -155,6 +162,11 @@ for smp in ${KSTACK_SMP:-1 4}; do
         want "kstack: preempt rmw OK"       "[smp$smp] preempt_disable's RMW is IRQ-saved: every CPU's preempt count returned to 0"
     else
         want "kstack: preempt rmw n/a (1 cpu)" "[smp$smp] single CPU: preempt rmw not applicable"
+    fi
+    if [ "$smp" -gt 1 ]; then
+        want "kstack: tick orphan OK"       "[smp$smp] an orphan killed at the tick while kmain holds fs_lock: its CPU kept ticking, both reaps owed, then reaped in process context (1.57.13)"
+    else
+        want "kstack: tick orphan n/a (1 cpu)" "[smp$smp] single CPU: tick orphan not applicable"
     fi
     want "kstack: done"                     "[smp$smp] the selftest ran to its end (no hang)"
     deny "kstack: FAIL"                     "[smp$smp] no kstack FAIL line"

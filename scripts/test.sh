@@ -231,14 +231,15 @@ test_aarch64() {
     #   ② Even past that probe, the compile-failure branch below printed "SKIP: … (x86 inline asm
     #     not yet ported)" and recorded NOTHING. A broken cross-compile and a working one produced
     #     the same tally.
-    # Together those made "aarch64 is compile-only but green" unfalsifiable. It is not green:
-    # `sh scripts/build.sh --aarch64` fails with 30 reachable undefined functions and ~20 undefined
-    # variables, and had been failing long enough that build/agnos-aarch64 on the dev box was a
-    # MAY 12 artifact. A missing cross-compiler and a failing compile are now both real FAILs.
-    # ⚠ THIS DELIBERATELY TURNS `test.sh --all` RED while the aarch64 port is broken. That is the
-    # point: the previous green was reporting coverage that did not exist. check.sh and both CI
-    # workflows invoke `sh scripts/test.sh` with no argument (x86 only), so nothing that gates a
-    # release changes colour — only the claim about aarch64 does.
+    # From 1.56.51 to 1.57.12 the compile honestly FAILED here (30, then 32-33 reachable undefined
+    # functions; ~20, then 17 undefined variables at 46-47 sites), which turned `test.sh --all` RED
+    # on purpose.
+    # ⭐ 1.57.13 cleared that compile debt (arch/aarch64/stubs.cyr § "1.57.13"), so `--all` is green
+    # again — and a red here now means the stub surface has fallen behind core/ once more: a shared
+    # file reached a name that lives in agnos.cyr's x86_64 block. Stub it there (the shape that file
+    # documents) or guard the x86-only caller. ⚠ COMPILES IS NOT BOOTS: nothing boots this image;
+    # the port is the 1.6x arc. check.sh and both CI workflows invoke `sh scripts/test.sh` with no
+    # argument (x86 only), so this half gates nothing on its own.
     if [ ! -x "$CC_ARM" ]; then
         echo "  aarch64 cross-compiler not found at $CC_ARM"
         echo "  (expected \$CYRIUS_HOME/bin/cycc_aarch64; the legacy cc5_aarch64 name was dropped at cyrius v6.1.0)"
@@ -248,33 +249,55 @@ test_aarch64() {
 
     # Build kernel via cyrius wrapper (cross-compile mode). cd into
     # kernel/ so relative `include "arch/..."` paths resolve.
+    # 1.57.13: the output lives under $ROOT/build like the x86 half's agnos_test — it was the fixed
+    # /tmp/agnos_arm_test, one path shared by every checkout on the box, so two worktrees running
+    # this at once read (and deleted) each other's image.
     mkdir -p $ROOT/build
     PREPPED_ARM="$ROOT/build/agnos_arm_prepped.cyr"
+    ARM_OUT="$ROOT/build/agnos_arm_test"
+    rm -f "$ARM_OUT"
     (echo '#define ARCH_AARCH64' && cat "$KASHI_DIR/src/font_data.cyr" && cat "$REKHA_DIR/fonts/face_data.cyr" \
         && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
-    (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" /tmp/agnos_arm_test >/dev/null 2>&1)
+    (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" "$ARM_OUT" >/dev/null 2>&1)
     rc=$?
     rm -f "$PREPPED_ARM"
     if [ "$rc" = "0" ]; then
         check "aarch64 kernel compiles" "0" "0"
 
         # Size check
-        SZ=$(wc -c < /tmp/agnos_arm_test)
+        SZ=$(wc -c < "$ARM_OUT")
         if [ "$SZ" -gt 50000 ]; then
             check "aarch64 size reasonable (${SZ}B)" "0" "0"
         else
             check "aarch64 size reasonable (${SZ}B)" "0" "1"
         fi
-        file /tmp/agnos_arm_test | grep -q "ARM aarch64"
+        file "$ARM_OUT" | grep -q "ARM aarch64"
         check "aarch64 valid ELF" "0" "$?"
+
+        # ⛔ 1.57.13 — "THE COMPILER SAID OK" IS NOT "EVERY CALL RESOLVED". cycc (6.6.6, both backends)
+        # drops an undefined function from its "reachable undefined" refusal when the name's FIRST
+        # reference sits in an unreachable function, even if a later call site is live — and the
+        # aarch64 backend does not even warn. The live call is emitted as the unresolved placeholder,
+        # an all-zero word (`udf #0`), and the build prints OK. Measured: with only the 32 functions +
+        # 17 variables the compiler reported stubbed, this image compiled "OK" carrying 103 of them —
+        # kprint's fb_print among them, i.e. a trap on the first kernel line. The scan is the shared
+        # scripts/check/placeholder-check.sh (build.sh runs it after every build): FAIL-CLOSED — an
+        # image with no section table or no executable section exits 2 and scores red here, never a
+        # vacuous 0 (the 1.57.13 review: the inline first version read 0 on an e_shnum=0 copy of a holed
+        # image) — and it excludes at most 3 trailing zero words of .text alignment pad (0 or 1 measured,
+        # moving with the layout), not every trailing zero word.
+        PHOUT=$(sh "$ROOT/scripts/check/placeholder-check.sh" "$ARM_OUT" 2>&1) && PHRC=0 || PHRC=$?
+        [ "$PHRC" = "0" ] || echo "$PHOUT" | sed 's/^/    | /'
+        PHHEAD=$(echo "$PHOUT" | head -n 1)
+        check "aarch64 image has no unresolved calls (${PHHEAD#*: })" "0" "$PHRC"
     else
         echo "  aarch64 kernel compile FAILED — rerun for detail:  sh scripts/build.sh --aarch64"
-        echo "  (as of 1.56.51: 30 reachable undefined functions + ~20 undefined variables;"
-        echo "   the arch/aarch64/stubs.cyr surface has not kept up with core/)"
+        echo "  (it compiles since 1.57.13; a failure means a shared file now reaches a name that lives in the"
+        echo "   x86_64 block — stub it in arch/aarch64/stubs.cyr or guard the x86-only caller)"
         check "aarch64 kernel compiles" "0" "1"
     fi
 
-    rm -f /tmp/agnos_arm_test
+    rm -f "$ARM_OUT"
 }
 
 # Parse args

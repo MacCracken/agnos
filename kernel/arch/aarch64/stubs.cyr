@@ -3,7 +3,9 @@
 
 # Variables that core/ references
 var apic_enabled = 0;
-var sched_active = 0;
+# sched_active: declared once, in shared core/proc.cyr (since the aarch split). This file carried a second `var
+# sched_active = 0;` until 1.57.13 — a duplicate module-scope var, which cycc accepts with no diagnostic
+# (scripts/check/check-dup-symbols.sh banner) and which the compile debt hid.
 var tss_kernel_stack = 0x40800000;
 var smp_lock = 0;
 var cpu_count = 1;
@@ -118,6 +120,7 @@ fn tcp_close(a) { return 0 - 1; }
 fn tcp_fd_owner(a) { return 0 - 1; }
 fn tcp_recv_own(a, b, c, d) { return 0; }
 fn tcp_send_own(a, b, c, d) { return 0 - 1; }
+fn tcp_send_dl(a, b, c, d, e) { return 0 - 1; }   # 1.57.13: sock_send_dl#109's body (no TCP on aarch64)
 fn tcp_close_own(a, b) { return 0 - 1; }
 
 # VirtIO-blk stubs
@@ -321,3 +324,161 @@ fn zfs_wr_say(verb) { return 0; }
 # 1.57.12 B11: vfs.cyr's close#6 and fd-table teardown commit a ZFS fd's pending policy-B txg (zfs_wp_close) — no ZFS fd
 # exists on this port, so there is never one to commit.
 fn zfs_wp_close(base) { return 0; }
+
+# ── 1.57.13 — THE COMPILE DEBT ───────────────────────────────────────────────────────────────────────────────────────────
+# `sh scripts/build.sh --aarch64` had failed since the per-CPU / direct-map / FS-in-the-shell work of 1.46.x–1.57.x reached
+# the SHARED files (pmm / heap / proc / vfs / klug / kprint / shell / init) while the subsystems those names live in stayed
+# inside agnos.cyr's x86_64 block: 32 undefined functions and 17 undefined variables the compiler REPORTED, plus 40 more
+# undefined functions it did NOT (below). Every name here is the x86 interface the shared caller already uses, given the
+# value the x86 code itself returns when the hardware or the subsystem is ABSENT — the Linux shape for a configured-out
+# subsystem (include/linux/*.h `#else static inline … { return -ENODEV; }`, e.g. of.h / blkdev.h), so the shared callers'
+# own "not mounted / no NIC / not loaded" arms run. A pure byte helper gets the x86 body verbatim instead (a caller never
+# reads a made-up value). ⛔ This makes the port COMPILE AND LINK; it does not make it work: the port (MMU, atomics, SMP,
+# a block driver, ring 3) is the 1.6x arc, and the x86 machine code the shared files still emit into this image (pmm's
+# xchg locks, cr3_load, klug's and proc's PAUSE) is listed in roadmap.md's aarch64 row — an aarch64 boot would run it.
+#
+# ⛔ THE 40 THE COMPILER DID NOT REPORT (measured 2026-10-13, cyrius 6.6.6, both backends). cycc counts an undefined
+# function as "reachable" only when its FIRST reference sits in a reachable function: a name first called from a dead fn
+# is dropped from the refusal even when a LATER call site is live — and cycc_aarch64 does not even warn. The live call is
+# emitted as the unresolved placeholder (aarch64 `udf #0`, x86 `ud2; ud2`) and the build prints OK. Before this block,
+# kprint's fb_print (first referenced in klug's dead klug_replay_fb) would have been `udf #0` on the first kernel line,
+# and vfs.cyr's fs_spin_lock (first referenced in the dead proc_destroy_fd_table) on every vfs_*_on path. 13 of the 40 had a
+# live call site; all 40 are stubbed, so this image carries no unresolved call at all. Repro + the upstream filing
+# owed: CHANGELOG [1.57.13] § Fixed. The check that does not trust the compiler's count: scripts/check/placeholder-check.sh
+# (no all-zero word in .text; fail-closed). build.sh runs it after every build and REFUSES a holed image, so after adding a
+# name here `sh scripts/build.sh --aarch64` going green is the proof (test.sh --aarch64 and check.sh gate 39 score it too).
+
+# MEMORY — flat physical. pt_init (paging.cyr) leaves the MMU off, so a physical address IS its own address and this
+# port's "direct map" is the identity, base 0 (asm-generic/page.h without an MMU: PAGE_OFFSET 0, __va(x) = x).
+# ⚠ THE IDENTITY IS RIGHT ONLY FOR AN ADDRESS THAT IS RAM ON THIS PORT — on QEMU virt, RAM starts at 0x40000000 (this
+# file's tss_kernel_stack 0x40800000, main.cyr's initrd at 0x40700000). The SHARED callers compute x86 PHYSICAL-LAYOUT
+# addresses, which on virt are flash and GIC / UART / PCIe MMIO, not RAM: proc.cyr's per-slot RSP0 (DIRECTMAP_BASE +
+# region 7: proc_alloc_slot stores proc_rsp0[0] = 0xE10000 under main.cyr's proc_create(0)) and kthread_stack_top
+# (0xF10000 +), and pmm.cyr's frames (i * 0x1000 from phys 4 MB, which heap.cyr's slab_grow and kfont map through
+# pmm_kva_for_access). No DIRECTMAP_BASE value fixes that: the LAYOUT is x86's. Inert today — pmm's xchg lock traps
+# before a frame is handed out, and nothing here reads proc_rsp0 or calls kthread_create / proc_rsp0_top — and listed
+# as 1.6x port work in roadmap.md's aarch64 row (a pmm / region map based at this port's RAM).
+# The page-table-page tripwires (proc.cyr, x86 ELF_PDE_PROBE) have no page tables to guard — their non-probe twins' 0;
+# dm_read_cr3 (klug's covered spill) reads a CR3 this port does not have — 0, as with the MMU off.
+var DIRECTMAP_BASE = 0;
+fn pmm_kva_for_access(phys) { return phys; }
+fn ptpage_alarm_if_live(a) { return 0; }
+fn ptpage_alarm_if_live_2mb(base) { return 0; }
+fn dm_read_cr3() { return 0; }
+
+# CPU IDENTITY + LOCKS — one core (cpu_count = 1 above). x86's pcpu_cpu / tss_get_current_cpu_id read the per-CPU GS / APIC
+# id; here every per-CPU slot is slot 0 (proc.cyr's accessors take their cpu_count < 2 fast path anyway). tss_get_cpu_stack
+# (proc_rsp0_top's fallback) answers this file's tss_kernel_stack — the one kernel stack top this port has. The heap,
+# proc-table, console, fs, vfs and sched locks are no-ops like spin_lock / flock_spin_lock / pipe_spin_lock above.
+fn pcpu_cpu() { return 0; }
+fn tss_get_current_cpu_id() { return 0; }
+fn tss_get_cpu_stack(cpu_id) { return tss_kernel_stack; }
+fn heap_spin_lock() { return 0; }
+fn heap_spin_unlock() { return 0; }
+fn proctab_spin_lock() { return 0; }
+fn proctab_spin_unlock() { return 0; }
+fn console_spin_lock() { return 0; }
+fn console_spin_unlock() { return 0; }
+fn fs_spin_lock() { return 0; }
+fn fs_spin_unlock() { return 0; }
+fn vfs_spin_lock() { return 0; }
+fn vfs_spin_unlock() { return 0; }
+fn sched_spin_lock() { return 0; }
+fn sched_spin_unlock() { return 0; }
+
+# FRAMEBUFFER CONSOLE — none (fb_console.cyr is x86-only; the console is the PL011). x86's own "fb not ready" answers:
+# fb_putc / fb_print / fb_println draw nothing, fb_oob_begin holds nothing (0), so fb_oob_end has nothing to replay.
+fn fb_putc(ch) { return 0; }
+fn fb_print(buf, len) { return 0; }
+fn fb_println(buf, len) { return 0; }
+fn fb_oob_begin() { return 0; }
+fn fb_oob_end(did) { return 0; }
+
+# FILESYSTEMS — ext2 / FAT / exFAT are never mounted here (no block driver: blk_* above refuse). vfs.cyr, klug.cyr's
+# spill, shell.cyr and init.cyr test the *_active flags first, as on an x86 box with no such volume, and the functions
+# refuse like x86's unmounted / unregistered paths (-1; a finder's "not found" 0; a lister's count 0). The leaf cursors and
+# backends are the x86 vars' resting values; ext2_inode_buf keeps the x86 shape (32 u64 = one 256 B inode) so vfs.cyr's
+# &ext2_inode_buf stays in bounds. modeset_latch_blocked (modeset_latch.cyr, x86) names klug's spill file — 0 = x86's
+# default. ZFS (the zfs_active stubs above): no pool, so no path routes to FS_ZFS and the path readers refuse.
+var ext2_active = 0;
+var ext2_write_ok = 0;
+var ext2_inode_buf[32];
+var fat_on_esp = 0;
+var fat_backend = 0;
+var fatfs_leaf_off = 0;
+var fatfs_leaf_len = 0;
+var exfat_active = 0;
+var exfat_on_esp = 0;
+var exfat_backend = 0;
+var exfat_leaf_off = 0;
+var exfat_leaf_len = 0;
+var modeset_latch_blocked = 0;
+fn ext2_get_inode(inode_num, out_buf) { return 0 - 1; }
+fn ext2_path_lookup(path, path_len) { return 0 - 1; }
+fn ext2_open(path, path_len) { return 0 - 1; }
+fn ext2_read_at(ino, off, buf, n) { return 0 - 1; }
+fn ext2_read_at_dma(ino, off, buf, n) { return 0 - 1; }
+fn ext2_write_at(ino, off, src, n) { return 0 - 1; }
+fn ext2_create(dir_ino, name, name_len) { return 0 - 1; }
+fn ext2_print_dir(dir_ino) { return 0 - 1; }
+fn ext2_unlink(dir_ino, name, name_len) { return 0 - 1; }
+fn ext2_rename(sp, sn, snl, dp, dn, dnl) { return 0 - 1; }
+fn ext2_sync() { return 0 - 1; }
+fn blk_flush_on(tag) { return 0 - 1; }
+# Pure byte helpers, not a subsystem: the x86 bodies (ext2.cyr), the 32-bit loads spelled with the 16-bit one.
+fn ext2_load16_le(ptr, off) { return load8(ptr + off) | (load8(ptr + off + 1) << 8); }
+fn ext2_inode_mode(inode) { return ext2_load16_le(inode, 0); }
+fn ext2_inode_filesize(inode) {
+    var lo = ext2_load16_le(inode, 4) | (ext2_load16_le(inode, 6) << 16);
+    var hi = ext2_load16_le(inode, 108) | (ext2_load16_le(inode, 110) << 16);
+    return lo | (hi << 32);
+}
+fn fatfs_resolve_parent(path, pathlen) { return 0 - 1; }
+fn fatfs_find_in_dir(dir_clus, name, namelen, result_ptr) { return 0; }
+fn fatfs_create(name, namelen) { return 0 - 1; }
+fn fatfs_write_file(name, namelen, src, len) { return 0 - 1; }
+fn fatfs_delete(name, namelen) { return 0 - 1; }
+fn fatfs_mkdir(name, namelen) { return 0 - 1; }
+fn fatfs_rmdir(name, namelen) { return 0 - 1; }
+fn fatfs_rename(oldname, oldlen, newname, newlen) { return 0 - 1; }
+fn exfat_resolve_parent(path, pathlen) { return 0 - 1; }
+fn exfat_find_in_dir(start_clus, name, namelen, result_ptr) { return 0 - 1; }
+fn exfat_open(name, namelen) { return 0 - 1; }
+fn exfat_read(first_cluster, no_fat_chain, buf, maxlen) { return 0 - 1; }
+fn exfat_print_dir() { return 0; }
+fn exfat_create(name, namelen) { return 0 - 1; }
+fn exfat_write_file(name, namelen, src, len) { return 0 - 1; }
+fn exfat_delete(name, namelen) { return 0 - 1; }
+fn exfat_mkdir(name, namelen) { return 0 - 1; }
+fn exfat_rmdir(name, namelen) { return 0 - 1; }
+fn exfat_rename(oldname, oldlen, newname, newlen) { return 0 - 1; }
+fn zfs_reloff(path, len) { return 0; }
+fn zfs_file_size(path, len) { return 0 - 1; }
+fn zfs_read_path_at(path, len, off, dst, n) { return 0 - 1; }
+
+# NETWORK — no NIC (pci_scan / virtio_net_init above find none). The addresses are the x86 vars' pre-DHCP 0; nic_ready is
+# 0 so the shell's net verbs print "no network" first; the rest refuse like x86's no-NIC paths (nic_mac zero-fills as
+# r8169.cyr's does).
+var net_ip = 0;
+var net_gateway = 0;
+var net_clock_source = 0;
+fn nic_ready() { return 0; }
+fn nic_mac(out_buf) { memset(out_buf, 0, 6); return 0; }
+fn dns_resolve(host, host_len, out_ip) { return 0 - 1; }
+fn icmp_ping(dst_ip, timeout_ticks) { return 0 - 1; }
+fn ntp_sync(server_ip) { return 0 - 1; }
+fn ntp_now() { return 0; }
+
+# EXEC + PROCESS BIRTH — no ring 3 here (enter_ring3 / spawn_user_proc above refuse). The loader refuses (-1 = "not an
+# executable" to shell `run`, "could not launch" to kybernet, which then drops to the recovery shell); the per-CPU env
+# cells it would consume have nowhere to go. proc_create_user's tail (birth refusal, channel endowment) never runs a
+# child: proc_birth_check above always answers "born" and nothing is ever armed (x86's own "nothing armed" 0).
+# proc_slot_release_unborn is NOT that shape: x86's 0 means "released" (ppid / epoch / CR3 / kill / stop cleared and
+# proc_count collapsed, under proctab_lock), and this stub releases nothing — so it answers x86's refusal, -1. It is
+# reached only through proc_birth_check's 0, which the always-1 stub above never returns; a real aarch64 birth check
+# needs a real release with it, or a refused birth leaves its slot CLAIMING with proc_count un-collapsed.
+fn elf_load_from_file(path, namelen, argv_src, argv_len) { return 0 - 1; }
+fn exec_env_src_set(v) { return 0; }
+fn exec_env_len_set(v) { return 0; }
+fn proc_slot_release_unborn(idx) { return 0 - 1; }
+fn chan_place_into_child(child_pid) { return 0; }

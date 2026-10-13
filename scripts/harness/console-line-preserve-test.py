@@ -48,11 +48,12 @@ IMG  = os.path.join(WORK, "agnos-agnsh.img")
 # to name the command rather than silently regenerate someone else's artifact.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale
+from _qsock import qsock
 refuse_stale(IMG, [os.path.join(ROOT, 'build', 'agnos')],
              'kernel (build/agnos is newer than this baked image)',
              'rm -rf ' + WORK + '   # then re-run the smoke that builds this image')
 SER  = os.path.join(WORK, "serial-conspv.log")
-MON  = "/tmp/agnos-conspv.sock"
+MON  = qsock(os.path.join(WORK, "conspv-mon.sock"))  # 1.57.13: short + per-tree (_qsock.py)
 SHOT_BEFORE = os.path.join(WORK, "conspv-before.ppm")
 SHOT_AFTER  = os.path.join(WORK, "conspv-after.ppm")
 

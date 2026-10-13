@@ -609,6 +609,11 @@ fn role_park(te) {
 
 fn wx_child(role) {
     if (wx_eq(role, "kbdblk") == 1) { return role_kbdblk(); }
+    if (wx_eq(role, "winch-w") == 1) { return role_winch_w(wx_atoi(argv(2))); }
+    if (wx_eq(role, "winch-n") == 1) { return role_winch_n(wx_atoi(argv(2))); }
+    if (wx_eq(role, "noecho-die") == 1) { return role_noecho_die(); }
+    if (wx_eq(role, "noecho-hold") == 1) { return role_noecho_hold(); }
+    if (wx_eq(role, "noecho-sit") == 1) { return role_noecho_sit(wx_atoi(argv(2))); }
     if (wx_eq(role, "hand-w") == 1) { return role_hand_w(wx_atoi(argv(2))); }
     if (wx_eq(role, "hand-h") == 1) { return role_hand_h(wx_atoi(argv(2)), wx_atoi(argv(3))); }
     if (wx_eq(role, "park") == 1) { return role_park(wx_atoi(argv(2))); }
@@ -1693,6 +1698,471 @@ fn ph_kbd() {
     if (nbline == 0) { ok5 = 0; }
     if (e5 != 1) { ok5 = 0; }
     wxk_verdict(ok5, "k5"); wx_kv("partial", r5); wx_kv("settled", s5); wx_kv("nb_line", r5b); wx_kv("child", e5); wx_end();
+    # K6 (1.57.13 review) — this row boots a PRODUCTION kernel: console_mode#110's TTY_SELFTEST geometry bits (0x100 /
+    # 0x200 / 0x400, tty-smoke's knob) must be refused as unknown bits (-1), and the console mode stay 0. tty-smoke runs
+    # only the TTY_SELFTEST image, so this is the one row that executes the production refusal.
+    var k6a = syscall(110, 0x100, 0, 0, 0);
+    var k6b = syscall(110, 0x200, 0, 0, 0);
+    var k6c = syscall(110, 0x400, 0, 0, 0);
+    var k6q = syscall(110, 0, 0, 0, 0);
+    var ok6 = 1;
+    if (k6a != (0 - 1)) { ok6 = 0; }
+    if (k6b != (0 - 1)) { ok6 = 0; }
+    if (k6c != (0 - 1)) { ok6 = 0; }
+    if (k6q != 0) { ok6 = 0; }
+    wxk_verdict(ok6, "k6"); wx_kv("same", k6a); wx_kv("shrink", k6b); wx_kv("restore", k6c); wx_kv("mode", k6q); wx_end();
+    wx_out("WXK-DONE pass="); wx_num(WX_PASS); wx_out(" fail="); wx_num(WX_FAIL); wx_out("\n");
+    return 0;
+}
+
+# ═════════════════════════════ TTY (1.57.13, mode `tty`; driven by scripts/harness/tty-test.py on a TTY_SELFTEST kernel) ═════════════════════════════
+# console_mode#110 (NOECHO / FLUSH — the console's mode, dead with its holder), fd_kind#111, and SIGWINCH (28) to signalfd
+# watchers only; read#5 on console fd 2 and the framebuffer ghost prompt (T9-T11, the 1.57.13 review).
+# Issues: docs/development/issues/archived/2026-10-12-console-line-discipline-has-no-ring3-control.md,
+#         docs/development/issues/archived/2026-10-12-no-way-to-ask-what-an-fd-is.md,
+#         docs/development/issues/archived/2026-10-12-console-grid-changes-without-sigwinch.md.
+# The harness types at each `WXK-READY t<k>` and checks the ECHO on the serial log itself (the console echo is
+# kputc -> COM1): the driver prints nothing between a READY and its LINE, so whatever the console echoed is there.
+fn wxt_cm(set, clear) { return syscall(110, set, clear, 0, 0); }           # console_mode#110
+fn wxt_fk(fd) { return syscall(111, fd, 0, 0, 0); }                         # fd_kind#111
+fn wxt_sfd(mask) { var m[8]; store64(&m, mask); return syscall(18, 0 - 1, &m, 0, 0); }   # signalfd#18
+# Drain signalfd `fd`: how many records named signal `sig` (a signalfd read is non-blocking: 0 = nothing pending).
+fn wxt_count(fd, sig) {
+    var n = 0;
+    var i = 0;
+    while (i < 8) {
+        var rec[8];
+        store64(&rec, 0);
+        var r = syscall(5, fd, &rec, 8, 1);
+        if (r <= 0) { return n; }
+        if ((load64(&rec) & 0xFFFFFFFF) == sig) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+# One go-byte from the driver's pipe (a blocking pipe read: the child sits BLOCKED, #99 state 6, until the driver writes).
+fn wxt_go(rfd) { var b[8]; return syscall(5, rfd, &b, 1, 0); }
+fn wxt_tell(head, k, v) {
+    var o = wx_cat(&wx_ob, 0, head);
+    o = wx_cat(&wx_ob, o, " r");
+    o = wx_catnum(&wx_ob, o, k);
+    o = wx_cat(&wx_ob, o, " v=");
+    o = wx_catnum(&wx_ob, o, v);
+    store8(&wx_ob + o, 10);
+    syscall(1, 1, &wx_ob, o + 1, 0);
+    return 0;
+}
+# winch-w <rfd>: a WATCHER, darshana's tty_open_signalfd shape (sigprocmask#17 SIG_BLOCK bit 28, then signalfd#18 on
+# bit 28). Three rounds (SAME, SHRINK, RESTORE): wait for the go byte, then count the 28 records. Good = round 0 saw
+# none (an unchanged grid is silent) and rounds 1 and 2 saw exactly one each. Exit 0x10 | round bits (good = 0x17).
+fn role_winch_w(rfd) {
+    var m[8];
+    store64(&m, 1 << 28);
+    syscall(17, 0, &m, 0, 0);
+    var sfd = wxt_sfd(1 << 28);
+    if (sfd < 0) { return 0x1F0; }
+    var bits = 0;
+    var k = 0;
+    while (k < 3) {
+        if (wxt_go(rfd) != 1) { return 0x1F1; }
+        var c = wxt_count(sfd, 28);
+        wxt_tell("WXT-CHILD winch-w", k, c);
+        if (k == 0) { if (c == 0) { bits = bits | 1; } }
+        if (k > 0) { if (c == 1) { bits = bits | (1 << k); } }
+        k = k + 1;
+    }
+    wx_close(sfd);
+    return 0x10 | bits;
+}
+# winch-n <rfd>: a NON-watcher that still holds a signalfd (mask bit 10 only). Each round: its own signalfd must read
+# nothing, and a FRESH bit-28 signalfd opened after the post (pending & mask is read at read time) must read nothing
+# either — so bit 28 was never posted to it. Closed again before the next round, so it never becomes a watcher.
+# Exit 0x20 | round bits (good = 0x27).
+fn role_winch_n(rfd) {
+    var sfd = wxt_sfd(1 << 10);
+    if (sfd < 0) { return 0x2F0; }
+    var bits = 0;
+    var k = 0;
+    while (k < 3) {
+        if (wxt_go(rfd) != 1) { return 0x2F1; }
+        var c10 = wxt_count(sfd, 10);
+        var s28 = wxt_sfd(1 << 28);
+        var c28 = 0 - 1;
+        if (s28 >= 0) { c28 = wxt_count(s28, 28); wx_close(s28); }
+        wxt_tell("WXT-CHILD winch-n", k, c28);
+        if (c10 == 0) { if (c28 == 0) { bits = bits | (1 << k); } }
+        k = k + 1;
+    }
+    wx_close(sfd);
+    return 0x20 | bits;
+}
+# noecho-die: set NOECHO, confirm it, and EXIT holding it (never clears). Exit 41 when #110 answered (0 then 1).
+fn role_noecho_die() {
+    var p = wxt_cm(1, 0);
+    var q = wxt_cm(0, 0);
+    if (p == 0) { if (q == 1) { return 41; } }
+    return 49;
+}
+# noecho-sit <rfd>: set NOECHO and sit BLOCKED on the go pipe, never reading the console; exit 0x35 HOLDING the mode
+# (the death clears it). T9b: a mode holder that does not read must not keep anyone else's read waiting.
+fn role_noecho_sit(rfd) {
+    if (wxt_cm(1, 0) < 0) { return 0x3F; }
+    wxt_go(rfd);
+    return 0x35;
+}
+# noecho-hold: set NOECHO, then BLOCK in a keyboard read holding the line and the mode (the driver kills it).
+fn role_noecho_hold() {
+    wxt_cm(1, 0);
+    var b[64];
+    syscall(5, 0, &b, 255, 0);
+    return 48;
+}
+# Wait (<= 10 s) for the NB reader to produce a line (r >= 0); returns it.
+fn wxt_nb_line(p) {
+    var r = 0 - 2;
+    var t = wx_us();
+    while (wx_us() - t < 10000000) {
+        r = wxk_nb(p);
+        if (r >= 0) { return r; }
+        wx_yield();
+    }
+    return r;
+}
+
+# mode `tty` — T0..T11. `WXK-READY t<k>` = the harness may type; `WXK-LINE t<k> <hex>` = what the read returned;
+# `WXK-OK t<k> ...` / `WXK-FAIL t<k> ...` = the driver's own verdict (the harness adds the echo checks).
+fn ph_tty() {
+    wx_phase("tty");
+    # T0 warm: the first key of a session is swallowed (the harness retries Enter)
+    wx_out("WXK-READY t0\n");
+    var r0 = wxk_read("t0");
+    var ok0 = 0;
+    if (r0 > 0) { ok0 = 1; }
+    wxk_verdict(ok0, "t0"); wx_kv("r", r0); wx_end();
+    # T1 the echo is observable: a plain read of `seen1` (the harness requires the echoed text on the serial log)
+    var q1 = wxt_cm(0, 0);
+    wx_out("WXK-READY t1\n");
+    var r1 = wxk_read("t1");
+    var ok1 = wx_line_is(&wx_kb, r1, "seen1");
+    if (q1 != 0) { ok1 = 0; }
+    wxk_verdict(ok1, "t1"); wx_kv("mode", q1); wx_end();
+    # T2 NOECHO on the waiting read: set (prev 0), query (1); two hidden lines (`qjxa<BS>k` edits to `qjxk`), the mode
+    # still set after both (its holder, the driver, lives), clear (prev 1), query (0), then an echoed `seen2`.
+    var p2 = wxt_cm(1, 0);
+    var q2 = wxt_cm(0, 0);
+    wx_out("WXK-READY t2\n");
+    var r2a = wxk_read("t2.0");
+    var ok2 = wx_line_is(&wx_kb, r2a, "qjxk");
+    var r2b = wxk_read("t2.1");
+    if (wx_line_is(&wx_kb, r2b, "wvz") == 0) { ok2 = 0; }
+    var q2b = wxt_cm(0, 0);
+    var c2 = wxt_cm(0, 1);
+    var q2c = wxt_cm(0, 0);
+    wx_out("WXK-READY t2c\n");
+    var r2c = wxk_read("t2.2");
+    if (wx_line_is(&wx_kb, r2c, "seen2") == 0) { ok2 = 0; }
+    if (p2 != 0) { ok2 = 0; }
+    if (q2 != 1) { ok2 = 0; }
+    if (q2b != 1) { ok2 = 0; }
+    if (c2 != 1) { ok2 = 0; }
+    if (q2c != 0) { ok2 = 0; }
+    var bad2 = wxt_cm(4, 0);                                # an unknown bit: -1, nothing changed
+    var bad2b = wxt_cm(0, 2);                               # FLUSH is no mode: clearing it is -1
+    if (bad2 != (0 - 1)) { ok2 = 0; }
+    if (bad2b != (0 - 1)) { ok2 = 0; }
+    wxk_verdict(ok2, "t2"); wx_kv("set", p2); wx_kv("q", q2); wx_kv("q_after", q2b); wx_kv("clear", c2); wx_kv("q_end", q2c);
+    wx_kv("unknown", bad2); wx_kv("clear_flush", bad2b); wx_end();
+    # T3 NOECHO on the NB reader (agnsh's prompt poll): a hidden `nbq` line
+    var p3 = wxt_cm(1, 0);
+    wx_out("WXK-READY t3\n");
+    var r3 = wxt_nb_line(&wx_kb2);
+    wx_hexline("WXK-LINE t3", &wx_kb2, r3);
+    var c3 = wxt_cm(0, 1);
+    var ok3 = wx_line_is(&wx_kb2, r3, "nbq");
+    if (p3 != 0) { ok3 = 0; }
+    if (c3 != 1) { ok3 = 0; }
+    wxk_verdict(ok3, "t3"); wx_kv("set", p3); wx_kv("clear", c3); wx_end();
+    # T4 FLUSH: (a) typeahead `junk` (no Enter) sits in kb_buf while nobody reads; FLUSH; the next line is `kept` alone.
+    # (b) the NB partial line (-3 after `a`; `b` then waits in kb_buf); FLUSH takes both; the NB reader answers -2 and
+    #     the next line is `cd`, not `abcd` / `bcd`.
+    # (c) NOECHO|FLUSH in one call (TCSETSF — darshana's tty_echo_off): typeahead `zzz` gone, `pw` hidden.
+    wx_out("WXK-READY t4a\n");
+    wx_sleep(2500);
+    var p4 = wxt_cm(2, 0);
+    var q4 = wxt_cm(0, 0);
+    wx_out("WXK-READY t4b\n");
+    var r4 = wxk_read("t4");
+    var ok4 = wx_line_is(&wx_kb, r4, "kept");
+    wx_out("WXK-READY t4c\n");
+    var r4p = 0 - 2;
+    var t4 = wx_us();
+    while (wx_us() - t4 < 10000000) {
+        r4p = wxk_nb(&wx_kb2);
+        if (r4p != (0 - 2)) { break; }
+        wx_yield();
+    }
+    wx_sleep(1000);                                         # the rest of `ab` lands in kb_buf: the flush takes BOTH stores
+    var p4b = wxt_cm(2, 0);
+    var n4 = wxk_nb(&wx_kb2);
+    wx_out("WXK-READY t4d\n");
+    var r4d = wxt_nb_line(&wx_kb2);
+    wx_hexline("WXK-LINE t4d", &wx_kb2, r4d);
+    if (wx_line_is(&wx_kb2, r4d, "cd") == 0) { ok4 = 0; }
+    wx_out("WXK-READY t4e\n");
+    wx_sleep(2500);
+    var p4e = wxt_cm(3, 0);
+    wx_out("WXK-READY t4f\n");
+    var r4f = wxk_read("t4f");
+    if (wx_line_is(&wx_kb, r4f, "pw") == 0) { ok4 = 0; }
+    var c4 = wxt_cm(0, 1);
+    if (p4 != 0) { ok4 = 0; }
+    if (q4 != 0) { ok4 = 0; }
+    if (r4p != (0 - 3)) { ok4 = 0; }
+    if (p4b != 0) { ok4 = 0; }
+    if (n4 != (0 - 2)) { ok4 = 0; }
+    if (p4e != 0) { ok4 = 0; }
+    if (c4 != 1) { ok4 = 0; }
+    wxk_verdict(ok4, "t4"); wx_kv("flush", p4); wx_kv("q", q4); wx_kv("partial", r4p); wx_kv("flush_nb", p4b);
+    wx_kv("nb_after", n4); wx_kv("tcsetsf", p4e); wx_kv("clear", c4); wx_end();
+    # T5 the mode dies with its holder: (a) a child sets NOECHO and EXITS holding it; (b) a child sets NOECHO, blocks in a
+    # read holding the line, and is KILLED (kill#16 9 -> wait status 265). After each, the driver's read is ECHOED.
+    var c5 = wx_spawn("noecho-die", 0 - 1, 0 - 1, 0 - 1);
+    var e5 = wxk_reap(c5, 5000);
+    var q5 = wxt_cm(0, 0);
+    wx_out("WXK-READY t5\n");
+    var r5 = wxk_read("t5");
+    var ok5 = wx_line_is(&wx_kb, r5, "seen5");
+    var c5b = wx_spawn("noecho-hold", 0 - 1, 0 - 1, 0 - 1);
+    var s5 = wxk_settle(c5b);
+    var k5 = syscall(16, c5b, 9, 0, 0);
+    var e5b = wxk_reap(c5b, 5000);
+    wx_out("WXK-READY t5b\n");
+    var r5b = wxk_read("t5b");
+    if (wx_line_is(&wx_kb, r5b, "seen6") == 0) { ok5 = 0; }
+    if (e5 != 41) { ok5 = 0; }
+    if (q5 != 0) { ok5 = 0; }
+    if (s5 == 0) { ok5 = 0; }
+    if (k5 != 0) { ok5 = 0; }
+    if (e5b != 265) { ok5 = 0; }
+    wxk_verdict(ok5, "t5"); wx_kv("exit", e5); wx_kv("q", q5); wx_kv("settled", s5); wx_kv("kill", k5); wx_kv("killed", e5b); wx_end();
+    # T6 fd_kind#111: the console (0/1/2), an ext2 file, an ext2 directory, both pipe ends, a closed pipe end, a
+    # signalfd, an epoll, a timerfd, and invalid fds (negative, 32, 99, a cyrius-tagged socket handle 0x40000000).
+    var f0 = wxt_fk(0);
+    var f1 = wxt_fk(1);
+    var f2 = wxt_fk(2);
+    var ff = wx_open("/wx/mode");
+    var kf = wxt_fk(ff);
+    wx_close(ff);
+    var kfc = wxt_fk(ff);
+    var fd6 = syscall(7, "/wx", 3, 0x800, 0);
+    var kd = wxt_fk(fd6);
+    wx_close(fd6);
+    wx_pipe(&wx_fds);
+    var pr = load64(&wx_fds);
+    var pw = load64(&wx_fds + 8);
+    var kpr = wxt_fk(pr);
+    var kpw = wxt_fk(pw);
+    wx_close(pr);
+    var kprc = wxt_fk(pr);
+    wx_close(pw);
+    var sf6 = wxt_sfd(1 << 10);
+    var ks = wxt_fk(sf6);
+    wx_close(sf6);
+    var ep6 = syscall(19, 0, 0, 0, 0);
+    var ke = wxt_fk(ep6);
+    wx_close(ep6);
+    var tf6 = syscall(22, 0, 0, 0, 0);
+    var kt = wxt_fk(tf6);
+    wx_close(tf6);
+    var kn = wxt_fk(0 - 1);
+    var k32 = wxt_fk(32);
+    var k99 = wxt_fk(99);
+    var ktag = wxt_fk(0x40000000);
+    var ok6 = 1;
+    if (f0 != 1) { ok6 = 0; }
+    if (f1 != 1) { ok6 = 0; }
+    if (f2 != 1) { ok6 = 0; }
+    if (kf != 2) { ok6 = 0; }
+    if (kfc != (0 - 1)) { ok6 = 0; }
+    if (kd != 3) { ok6 = 0; }
+    if (kpr != 4) { ok6 = 0; }
+    if (kpw != 4) { ok6 = 0; }
+    if (kprc != (0 - 1)) { ok6 = 0; }
+    if (ks != 7) { ok6 = 0; }
+    if (ke != 8) { ok6 = 0; }
+    if (kt != 9) { ok6 = 0; }
+    if (kn != (0 - 1)) { ok6 = 0; }
+    if (k32 != (0 - 1)) { ok6 = 0; }
+    if (k99 != (0 - 1)) { ok6 = 0; }
+    if (ktag != (0 - 1)) { ok6 = 0; }
+    wxk_verdict(ok6, "t6"); wx_kv("fd0", f0); wx_kv("fd1", f1); wx_kv("fd2", f2); wx_kv("file", kf); wx_kv("closed", kfc);
+    wx_kv("dir", kd); wx_kv("pipe_r", kpr); wx_kv("pipe_w", kpw); wx_kv("pipe_closed", kprc); wx_kv("signalfd", ks);
+    wx_kv("epoll", ke); wx_kv("timerfd", kt); wx_kv("neg", kn); wx_kv("fd32", k32); wx_kv("fd99", k99); wx_kv("tagged", ktag);
+    wx_end();
+    # T7 SIGWINCH through the TTY_SELFTEST geometry knob (#110 CM_T_*): a watcher (winch-w) and a non-watcher holding a
+    # bit-10 signalfd (winch-n), both BLOCKED on the go pipe while the driver moves the geometry. SAME = no post;
+    # SHRINK = one 28 to the watcher only (cols halve); RESTORE = one more (the grid is back). The driver holds no
+    # signalfd: a fresh bit-28 one opened at the end must read nothing.
+    var ws0 = syscall(60, 0, 0, 0, 0);
+    wx_pipe(&wx_fds);                                       # ONE go pipe per child: a fast child must never read the other's byte
+    var gr = load64(&wx_fds);
+    var gw = load64(&wx_fds + 8);
+    wx_pipe(&wx_fds);
+    var hr = load64(&wx_fds);
+    var hw = load64(&wx_fds + 8);
+    var cw = wx_spawn("winch-w", gr, 0 - 1, 0 - 1);
+    var cn = wx_spawn("winch-n", hr, 0 - 1, 0 - 1);
+    var one[8];
+    store64(&one, 0x67);
+    var st = 0;
+    var ws1 = 0 - 1;
+    var ws2 = 0 - 1;
+    var ws3 = 0 - 1;
+    var wsq = 0 - 1;
+    var k7 = 0;
+    while (k7 < 3) {
+        if (wxk_settle(cw) == 1) { if (wxk_settle(cn) == 1) { st = st + 1; } }
+        if (k7 == 0) { ws1 = wxt_cm(0x100, 0); }
+        if (k7 == 1) { ws2 = wxt_cm(0x200, 0); wsq = syscall(60, 0, 0, 0, 0); }
+        if (k7 == 2) { ws3 = wxt_cm(0x400, 0); }
+        syscall(1, gw, &one, 1, 0);
+        syscall(1, hw, &one, 1, 0);
+        k7 = k7 + 1;
+    }
+    var ew = wxk_reap(cw, 5000);
+    var en = wxk_reap(cn, 5000);
+    wx_close(gr);
+    wx_close(gw);
+    wx_close(hr);
+    wx_close(hw);
+    var sd = wxt_sfd(1 << 28);
+    var cd = wxt_count(sd, 28);
+    wx_close(sd);
+    var ok7 = 1;
+    if (st != 3) { ok7 = 0; }
+    if (ws1 != ws0) { ok7 = 0; }
+    if (((ws2 >> 16) & 0xFFFF) != (((ws0 >> 16) & 0xFFFF) / 2)) { ok7 = 0; }
+    if ((ws2 & 0xFFFF) != (ws0 & 0xFFFF)) { ok7 = 0; }
+    if (wsq != ws2) { ok7 = 0; }
+    if (ws3 != ws0) { ok7 = 0; }
+    if (ew != 0x17) { ok7 = 0; }
+    if (en != 0x27) { ok7 = 0; }
+    if (cd != 0) { ok7 = 0; }
+    if (ws0 <= 0) { ok7 = 0; }
+    wxk_verdict(ok7, "t7"); wx_kv("ws0", ws0); wx_kv("same", ws1); wx_kv("shrink", ws2); wx_kv("winsize", wsq); wx_kv("restore", ws3);
+    wx_kv("settled", st); wx_kv("watcher", ew); wx_kv("nonwatcher", en); wx_kv("driver28", cd); wx_end();
+    # T8 a signalfd reads a signal >= 32 (the defect found beside T7: vfs_read_signalfd's walk stopped at 31, so a
+    # pending bit 40 read as "nothing" forever): kill#16(self, 40), then a bit-40 signalfd reads 40 once, then 0.
+    var me8 = syscall(2, 0, 0, 0, 0);
+    var k8 = syscall(16, me8, 40, 0, 0);
+    var s8 = wxt_sfd(1 << 40);
+    var r8[8];
+    store64(&r8, 0);
+    var n8 = syscall(5, s8, &r8, 8, 1);
+    var v8 = load64(&r8) & 0xFFFFFFFF;
+    var n8b = syscall(5, s8, &r8, 8, 1);
+    wx_close(s8);
+    var ok8 = 1;
+    if (k8 != 0) { ok8 = 0; }
+    if (n8 != 4) { ok8 = 0; }
+    if (v8 != 40) { ok8 = 0; }
+    if (n8b != 0) { ok8 = 0; }
+    wxk_verdict(ok8, "t8"); wx_kv("kill", k8); wx_kv("read", n8); wx_kv("sig", v8); wx_kv("again", n8b); wx_end();
+    # T9 (1.57.13 review) — the mode is the CONSOLE's, never the line's: it applies to whoever reads and holds nothing.
+    # (a) the driver holds NOECHO and a CHILD reads the console (`sudo`'s shape): the child's line `cq` is read, HIDDEN,
+    #     and the child exits — under the first cut (a mode kept the line owned) the child waited for the line forever.
+    # (b) a child sets NOECHO and sits on a pipe, never reading: the driver's NB poll (agnsh's prompt) still gets its
+    #     line `nbh` and its blocking read `bh`, both hidden — the first cut answered -2 forever / waited forever; the
+    #     child exits holding the mode, the mode reads 0 again, and the driver's `seen9` is ECHOED.
+    var p9 = wxt_cm(1, 0);
+    var o9 = wx_cat(&wx_line, 0, "/bin/waitx kbdblk t9a cq");
+    var c9 = syscall(43, &wx_line, o9, 0, 0);
+    var s9 = wxk_settle(c9);
+    wx_out("WXK-READY t9a\n");
+    var e9 = wxk_reap(c9, 15000);
+    var c9c = wxt_cm(0, 1);
+    wx_pipe(&wx_fds);
+    var g9r = load64(&wx_fds);
+    var g9w = load64(&wx_fds + 8);
+    var c9s = wx_spawn("noecho-sit", g9r, 0 - 1, 0 - 1);
+    var q9 = 0;
+    var t9 = wx_us();
+    while (wx_us() - t9 < 5000000) {
+        q9 = wxt_cm(0, 0);
+        if (q9 == 1) { break; }
+        wx_sleep(10);
+    }
+    wx_out("WXK-READY t9b\n");
+    var r9b = wxt_nb_line(&wx_kb2);
+    wx_hexline("WXK-LINE t9b", &wx_kb2, r9b);
+    var l9b = wx_line_is(&wx_kb2, r9b, "nbh");               # now: wxk_read below reuses wx_kb2 for its header
+    wx_out("WXK-READY t9c\n");
+    var r9c = wxk_read("t9c");
+    var l9c = wx_line_is(&wx_kb, r9c, "bh");                 # now: the t9d read below reuses wx_kb
+    var one9[8];
+    store64(&one9, 0x67);
+    syscall(1, g9w, &one9, 1, 0);
+    var e9s = wxk_reap(c9s, 5000);
+    wx_close(g9r);
+    wx_close(g9w);
+    var q9e = wxt_cm(0, 0);
+    wx_out("WXK-READY t9d\n");
+    var r9d = wxk_read("t9d");
+    var ok9 = 1;
+    if (p9 != 0) { ok9 = 0; }
+    if (s9 != 1) { ok9 = 0; }
+    if (e9 != 1) { ok9 = 0; }
+    if (c9c != 1) { ok9 = 0; }
+    if (q9 != 1) { ok9 = 0; }
+    if (l9b == 0) { ok9 = 0; }
+    if (l9c == 0) { ok9 = 0; }
+    if (e9s != 0x35) { ok9 = 0; }
+    if (q9e != 0) { ok9 = 0; }
+    if (wx_line_is(&wx_kb, r9d, "seen9") == 0) { ok9 = 0; }
+    wxk_verdict(ok9, "t9"); wx_kv("set", p9); wx_kv("settled", s9); wx_kv("child_read", e9); wx_kv("clear", c9c);
+    wx_kv("q_held", q9); wx_kv("nb", r9b); wx_kv("blk", r9c); wx_kv("holder", e9s); wx_kv("q_dead", q9e); wx_end();
+    # T10 (1.57.13 review) — a read on console fd 2 / fd 1 is the cooked line: fd 1 non-blocking with nothing typed is
+    # -2 (WOULD_BLOCK, not a wedge), and a BLOCKING read of fd 2 issued with NO key pending returns `fd2r` when the
+    # harness types it (it waits >= 1 s first) — ECHOED, like any cooked read. Until 1.57.13 a console fd other than 0
+    # went to serial_dev_read, whose no-key wait was a hlt at IF=0: the CPU never woke.
+    var n10 = syscall(5, 1, &wx_kb2, 8, 1);
+    var k10 = wxt_fk(2);
+    wx_out("WXK-READY t10\n");
+    var r10 = syscall(5, 2, &wx_kb, 255, 0);
+    wx_hexline("WXK-LINE t10", &wx_kb, r10);
+    var ok10 = wx_line_is(&wx_kb, r10, "fd2r");
+    if (n10 != (0 - 2)) { ok10 = 0; }
+    if (k10 != 1) { ok10 = 0; }
+    wxk_verdict(ok10, "t10"); wx_kv("nb_fd1", n10); wx_kv("kind_fd2", k10); wx_kv("r", r10); wx_end();
+    # T11 (1.57.13 review) — THE GHOST PROMPT, framebuffer-side (the harness screendumps; COM1 cannot show it). Clear
+    # the console (ED 2J homes the cursor), NOECHO, a prompt with NO newline at row 0, a hidden read, clear the mode,
+    # then the program's own "\n" and three lines. The prompt must stay on row 0 and appear on no other row: before
+    # fb_line_end the hidden Enter left the fb line live, so every later print erased row 0's prompt and replayed it
+    # under the cursor. Also fd_kind on a kernel memfile (the /fonts intercept: VFS_MEMFILE, the initrd's tag) = 2.
+    var ff11 = syscall(7, "/fonts/default.ttf", 18, 0, 0);
+    var kf11 = wxt_fk(ff11);
+    if (ff11 >= 0) { wx_close(ff11); }
+    var p11 = wxt_cm(1, 0);
+    var esc11[8];
+    store8(&esc11, 27);
+    store8(&esc11 + 1, 91);
+    store8(&esc11 + 2, 50);
+    store8(&esc11 + 3, 74);
+    syscall(1, 1, &esc11, 4, 0);
+    wx_out("GHOSTPW: ");
+    var r11 = syscall(5, 0, &wx_kb, 255, 0);
+    var c11 = wxt_cm(0, 1);
+    wx_out("\n");
+    wx_out("WXK-G1 after the hidden line\n");
+    wx_out("WXK-G2 after the hidden line\n");
+    wx_out("WXK-READY t11shot\n");
+    wx_sleep(4000);
+    wx_hexline("WXK-LINE t11", &wx_kb, r11);
+    var ok11 = wx_line_is(&wx_kb, r11, "gpw");
+    if (p11 != 0) { ok11 = 0; }
+    if (c11 != 1) { ok11 = 0; }
+    if (kf11 != 2) { ok11 = 0; }
+    wxk_verdict(ok11, "t11"); wx_kv("set", p11); wx_kv("clear", c11); wx_kv("memfile", kf11); wx_end();
     wx_out("WXK-DONE pass="); wx_num(WX_PASS); wx_out(" fail="); wx_num(WX_FAIL); wx_out("\n");
     return 0;
 }
@@ -1707,6 +2177,8 @@ fn wx_driver() {
         wx_verdict(0, "clock"); wx_out(" uptime_us#95 is -1 (TSC refused) — nothing timed"); wx_end();
     } elif (wx_mode_tok("kbd") == 1) {
         ph_kbd();                                       # S3d B2: the keyboard phases only (wait-kbd-test.py types)
+    } elif (wx_mode_tok("tty") == 1) {
+        ph_tty();                                       # 1.57.13: #110 / #111 / SIGWINCH (tty-test.py types)
     } else {
         # P8 FIRST: its klug witness is latched once per boot, so it must run before any other phase's waits
         if (wx_want("migrate", "P8") == 1) { ph_migrate(); }

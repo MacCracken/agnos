@@ -20,6 +20,372 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.13] — 2026-10-13 — repairs: VT-d queued invalidation, a ceiling on `sock_send`, the console from ring 3, tick deaths reaped in process context, aarch64 compiles
+
+The repair minor (operator ruling 2026-09-21: 1.57.x = arising-issue repairs; the aarch64 compile debt later in the
+cycle, the port itself 1.6x). Five tracks, each implemented, adversarially reviewed and fixed on its own, then merged
+and read together (§ Fixed — the merge). **Three syscall numbers MINTED: `sock_send_dl`#109, `console_mode`#110,
+`fd_kind`#111** (ABI §3.2); the next free number is #112. The cyrius peers are filed there
+(`cyrius/docs/development/issues/2026-10-13-agnos-sys-sock-send-dl-109-peer.md`, `…-console-mode-110-peer.md`,
+`…-fd-kind-111-peer.md`), so `check.sh`'s `syscall ABI` gate is **red BY DESIGN** — "kernel 111 · abi-doc 111 ·
+cyrius 108" — and the sweep's `baseline check.sh` row carries the KNOWN RED mark on exactly that gate (the 1.57.10
+precedent). Five issues closed and archived: `2026-09-26-vt-d-queued-invalidation`,
+`2026-10-02-sock-send-ignores-the-caller-deadline`, `2026-10-12-console-line-discipline-has-no-ring3-control`,
+`2026-10-12-no-way-to-ask-what-an-fd-is`, `2026-10-12-console-grid-changes-without-sigwinch` — no open issue file
+remains. **Built, gated, NOT burned.**
+
+### Added
+
+- **VT-d queued invalidation** (`kernel/arch/x86_64/iommu.cyr`; issue `2026-09-26-vt-d-queued-invalidation`, archived).
+  Whenever ECAP.QI is set, every context-cache and IOTLB invalidation goes through the invalidation queue: one 4 KB queue
+  page (256 × 128-bit descriptors, IQA.QS = 0, DW = 0), GCMD.QIE (bit 26) with a GSTS.QIES wait, each invalidation
+  followed by an invalidation-wait descriptor (type 5 | SW, Status Data = a sequence number in bits 63:32) whose status
+  write lands in a status page reached through `dma_kva`, and FSTS's IQE (bit 4) / ICE (bit 5) / ITE (bit 6) checked on
+  every poll. IQE recovery copies the wait over the malformed descriptor, clears IQE and rewrites IQT; the descriptor is
+  reported NOT performed. A wait that outlasts the bound (1 M polls) STALLS the queue: that call is reported NOT
+  performed and the next submission gives the wait one more full bound. A stall that does not settle then, QIES clear at
+  submit, an unrecoverable IQE, an ITE or a queue with no room marks the queue dead (`iommu: queued invalidation DEAD -
+  <reason>`, said lock-free by `iommu_init`'s refusals, the boot DMA check and — once — the grant path), and every later
+  invalidation counts as `inv_fail`. Descriptors: context-cache global `0x11`; IOTLB `0x2 | G<<4 | DR 0x80 | DW 0x40 | DID<<16`,
+  page-selective high qword = address | AM. The register interface stays as the fallback (no ECAP.QI, no memory for the
+  queue). The unit line ends ` inv=queued|register`; a queue line `IOMMU: queued invalidation - queue 0x… status 0x…
+  submitted=N` follows it; the boot DMA check line gains ` qi= iqe= ite= ice= stall=`. Prior art: Linux
+  `drivers/iommu/intel/dmar.c` (`dmar_enable_qi`, `__dmar_enable_qi`, `qi_submit_sync`, `qi_check_fault`,
+  `dmar_disable_qi`) and `iommu.c` (`qi_flush_context`, `qi_flush_iotlb`); FreeBSD `sys/x86/iommu/intel_qi.c` (IQH-based
+  room, sequence-numbered status word); VT-d spec §6.5.2. `docs/architecture/dma-cpu-pointers.md` § "VT-d: the grant model".
+- **`VTD_REGISTER_INV`** build flag (test-only): the queue is never enabled, so the register interface is booted on QEMU.
+- **`vtd-smoke` covers both interfaces**: boots A (CM=1) and B (CM=0) run the queue, oracled by QEMU's `vtd_inv_qi_*` /
+  `vtd_inv_desc*` trace (the exact descriptors, the status page and sequence of every wait, no register invalidation while
+  QIE is set, GCMD = QIE, SRTP|QIE, TE|QIE); new boot AR (A's machine, `VTD_SELFTEST=1 VTD_REGISTER_INV=1`) runs the
+  register interface with the 1.57.10 checks and no queue event, and boot BR (B's machine: -smp 4 KVM, CM=0, 4-level)
+  runs it too, so the CM=0 register check is reached. `VTD_SELFTEST` gains arm D, `vtdst: qi recovery`: a type-0
+  descriptor raises IQE, is recovered, and the queue keeps working (IQH == IQT, FSTS clear, not dead); arm E,
+  `vtdst: own structures` (the unit's own memory out of every device's reach — the Fixed entry below); and arm F,
+  `vtdst: qi stall`: a wait held back from the unit stalls the queue, is handed over late and settles, the queue drained.
+- **`IOMMU: own structures - chunk 0x… chunks=N pages=N - never granted`**, after the unit line.
+
+- **`sock_send_dl`#109 — `sock_send`#48 with a caller ceiling** (issue
+  [2026-10-02-sock-send-ignores-the-caller-deadline](docs/development/issues/archived/2026-10-02-sock-send-ignores-the-caller-deadline.md),
+  filed from cyrius 6.6.14: one #48 against a peer that stops ACKing held a cyrius TLS write up to ~8 s past its
+  deadline, because #48's D6 progress window is pinned at `TCP_PROGRESS_US`). `(conn_id, buf, len, timeout_us)` →
+  the committed count (possibly 0) / -1; ABI §3.2 row. `timeout_us` bounds the call's WAITING, **measured once from
+  entry and never re-armed by ACK progress** — Linux SO_SNDTIMEO (`tcp_sendmsg_locked` keeps one `timeo` that
+  `sk_stream_wait_memory` decrements across the call's waits) and agnos's own #47 ceiling; when it fires the call
+  returns the committed count, as SO_SNDTIMEO returns the partial count (agnos's 0 = "no progress yet" where Linux says
+  EAGAIN). `0` = exactly #48 (the call goes through `tcp_send_own`); `< 0` = no wait (Linux maps a negative
+  SO_SNDTIMEO to no wait); D6 still applies under it, so a stalled peer returns at `min(timeout_us, ~8 s)`. Same
+  validation, ownership and copy as #48 (`tcp_auth` first, `is_user_range`, AC=1 from the entry STAC). A new number,
+  not an `a4` on #48 (the #100 rule: `a4` is a stale register in every shipped three-argument caller). Mechanism:
+  `tcp_send_ex` gains an absolute ceiling `se_cap` (0 for every existing caller) that `tcp_send_cap_clamp` applies to
+  each of its three D6 deadlines; `tcp_send_dl` is the arm's body. ⭐ **Decision (recorded in the arm, `tcp_send_dl`
+  and the ABI row): a ceiling, not the issue's per-progress bound** (`min(a4, TCP_PROGRESS_US)` as `se_prog`, FreeBSD
+  `sbwait`'s per-wait `sb_timeo`) — a peer that ACKs inside every bound re-arms it on each segment; measured on that
+  mutant, a reader taking 512 B every 50 ms held a 300 ms call for 1.63 s. The cyrius peer (`SYS_SOCK_SEND_DL`,
+  `_agnos_sock_send_dl` passing the time left) is cyrius's to land (filed:
+  `cyrius/docs/development/issues/2026-10-13-agnos-sys-sock-send-dl-109-peer.md`); the ABI gate reads kernel 111
+  (#110 / #111 below) against cyrius 108 until the peers land.
+- **`scripts/smoke/sock-send-dl-smoke.sh`** (new sweep row; tests/sockwait mode "t", phases N11–N13, `-smp 1` + `-smp
+  4`): a local reader that reads nothing (its 2 KB ring fills: a zero window) — a 300 ms ceiling returns 2049
+  committed in ~303 ms, a second call (the probe still in flight) 0 in ~305 ms, a negative one 0 in < 1 ms, ceiling 0
+  the #48 8.0 s, a ceiling above the D6 window (20 s on LO, INT64_MAX — the 2^40 clamp — on IP) still the D6 8.0 s,
+  and the stream stays byte-exact; a trickling reader cannot stretch the ceiling (N11t: 4609 in ~305
+  ms); #109 on a conn the caller does not own is -1 every way and sends nothing (N12); a HOST peer that stops reading
+  (SO_RCVBUF 2048; ~1.49 MB fills SLIRP's and the host's buffers) — 300 ms → ~300-310 ms, 0 → 8.0 s, and after a GO dial
+  the host receives exactly the committed total, pattern-verified. Negatives, each red and the source restored
+  byte-identical: the arm passing 0 for the ceiling (c1 8.0 s, W1 8.0 s), the arm without `tcp_auth` acting as the
+  conn's owner (r1 = r2 = 5, 10 bytes leaked), the per-progress sketch (N11t 1.63 s), and `tcp_send_dl` passing
+  `TCP_SEND_DL_MAX_US` as its D6 window (the over-D6 call 15.4 s, back only when the reader drained).
+- **tcp-smoke arm `tcp: dlpart`** (TCP_SELFTEST): a partial ACK of the call's own segment followed by a stall returns
+  a 300 ms #109 ceiling (`tcp_send_dl`) in 0.30–0.31 s with the committed 100 — `tcp_send_ex`'s ACK-progress D6 site,
+  which no ring-3 peer reaches (an agnos or SLIRP receiver never takes part of a segment). Negative: that site without
+  `tcp_send_cap_clamp` → 8.0 s.
+
+- **`console_mode`#110(set, clear) → the previous flags / -1** — the console's mode from ring 3 (issue
+  `archived/2026-10-12-console-line-discipline-has-no-ring3-control`; consumer darshana 1.3.0 `tty_echo_off` /
+  `tty_flush_input`). `CM_NOECHO` = 1 (a mode: every cooked-line read of the console stores and edits as before but
+  echoes nothing — no byte, no `BS SP BS`, no newline); `CM_FLUSH` = 2 (an action, `set` only: discard the key ring's
+  typeahead and the NB partial line, holding the line for the flush only — it waits for a reader mid-line). Any other
+  bit, or FLUSH in `clear`, → -1. The mode is the console's: it applies to whoever reads (the setter's child included),
+  never takes or keeps the line, and dies with the process that last set it (exit, fault, kill). `(0, 0)` queries,
+  `(0, NOECHO)` clears. ABI § 3.2.
+- **`fd_kind`#111(fd) → kind / -1** — what the caller's fd is (issue `archived/2026-10-12-no-way-to-ask-what-an-fd-is`;
+  darshana `tty_isatty`): 1 CONSOLE · 2 FILE · 3 DIR · 4 PIPE · 5 CHAN · 6 SOCKET · 7 SIGNALFD · 8 EPOLL · 9 TIMERFD ·
+  10 DEVICE; -1 for a closed fd, `fd < 0`, `fd >= 32` and a cyrius tagged socket handle. ABI § 3.2.
+- **SIGWINCH (28)** — raised when the console grid (`winsize`#60) actually changes, once the kernel has redrawn the
+  console for it, posted only to processes holding a `signalfd`#18 whose mask has bit 28 (issue
+  `archived/2026-10-12-console-grid-changes-without-sigwinch`). ABI § 4.9.
+- **`TTY_SELFTEST=1`** build flag: `console_mode`#110 also accepts `set` = `0x100` (same geometry), `0x200` (halve the
+  width), `0x400` (restore) — a geometry knob through the real `fb_set_geom`, for the SIGWINCH gate. A production
+  kernel refuses those bits (`wait-kbd-smoke.sh` K6).
+- **`scripts/smoke/tty-smoke.sh`** (+ `scripts/harness/tty-test.py`, `tests/waits/waitx` mode `tty`), sweep row
+  "1.57.13 console mode #110 …" (group `waits`; 73 rows at the merge, with `sock-send-dl-smoke`): NOECHO on the waiting and NB readers (backspace editing
+  included) read off COM1 against a positive control, the mode cleared by its holder's exit and kill, FLUSH of
+  typeahead and of the NB partial line, NOECHO|FLUSH, `fd_kind` on 17 fds, SIGWINCH to a watcher only, a holder's
+  child reading hidden and a non-reading holder keeping nobody waiting (T9), a blocking read of console fd 2 (T10),
+  and the framebuffer ghost-prompt check by HMP screendump (T11); `-smp 1` + `-smp 4`. ktest T8g (the mode's holder
+  liveness; an empty-ring `kb_read_scancode`).
+
+- **`kstack-smoke`: `kstack: tick orphan OK`** (`KSTACK_SELFTEST`, -smp 4; `n/a (1 cpu)` at -smp 1). kmain holds
+  `fs_lock` for 300 ms while an ORPHAN with a ZOMBIE child spins in ring 3 on an AP and is SIGKILLed at its tick;
+  requires ≥ 10 ticks on that CPU during the hold, both reaps owed (DYING, nothing reaped under the hold), and both
+  reaped after the release (state 0, ppid 0, no fd table, CR3 `0x1000`, ≤ 16 pages of the free pool not back). Measured:
+  29 ticks, both reaped, 0 pages lost. With the deferral removed: 1 tick, the death not done — FAIL. The phase also
+  plants a pipe's write end in the zombie's table and its read end in the orphan's: during the hold neither may count
+  (`pipe_w=0 pipe_r=0`; with `pipe_ends_open`'s DYING skip removed, `1 1` — FAIL), and both owed runners, called by
+  kmain under its own `fs_lock`, must refuse at once (`refused=1/0/1`; with `zfs_wp_owed_run`'s unconditional take
+  restored the boot self-deadlocks at the phase — FAIL).
+- **`smoke_qsock <path>`** (`scripts/smoke/lib/qemu-dwell.sh`) and its Python twin **`scripts/harness/_qsock.py`**: a
+  QEMU UNIX socket's path is `${XDG_RUNTIME_DIR:-/tmp}/agnos-q.<first 12 hex of md5(<path>)>/<basename>` (≈ 45 B,
+  wherever the tree lives). The hash-named directory is used only when `lstat` says it is a real directory (never a
+  symlink) owned by this uid with no group / other bits; anything else gets `mktemp -d` in the same base. `set -e`-safe;
+  directories of the rule untouched for a day are pruned recursively by both twins. A host check
+  (symlink / 0777 / squatted-file-under-`set -e` / recursive prune / no-follow prune / twin agreement) passes 12/12.
+
+### Changed
+
+- **NEW `scripts/check/placeholder-check.sh` — the unresolved-call placeholder gate, WIRED into `build.sh` (every
+  x86_64 and aarch64 build), `test.sh --aarch64` and `check.sh` (gate 39, `aarch64 compiles with no unresolved
+  calls`: `build.sh --aarch64` plus the gate's own PASS line).** It scans the section table's PROGBITS +
+  SHF_EXECINSTR sections for cycc's placeholders (§ Fixed, the cycc count) — aarch64 4-aligned all-zero words (at
+  most 3 trailing alignment words excluded), x86 `0F 0B 0F 0B 90` (`ud2; ud2; nop`, the 5-byte `call rel32`'s
+  stand-in) — and, for x86, the compile's `warning: undefined function` lines (the only place a hole is NAMED, so
+  `build.sh` now captures the compiler's stderr and replays it unchanged). FAIL-CLOSED: no section table, no
+  executable section, an unknown machine or no python3 is exit 2, never a vacuous 0 (no program-header fallback:
+  cycc's RWX PT_LOAD spans `.rodata`). A refused image is moved to `build/agnos{,-aarch64}.placeholder-refused`
+  (exit 1; x86 plain and flag builds alike — a placeholder is a trap, not a bound). `release.yml`'s compile test
+  inherits the refusal and requires the gate's PASS line before recording `compiled`; its failure arm now says a
+  failed aarch64 compile is a REGRESSION (it said "aarch64 is RED"). Mutation-proven: the `ext2_path_lookup` stub
+  dropped → refused, 9 (`test.sh --aarch64` 3/4, the check.sh row red); an x86 dead fn + a live call to an undefined
+  name in `core/kprint.cyr` → refused, 2 placeholders + the named warning; the holed aarch64 image with `e_shnum` = 0
+  → exit 2; five zeroed tail words of `.text` → 2. Every image built today reads 0.
+- **`test.sh --aarch64` / `--all`: the aarch64 half has a fourth check — no unresolved calls in the image**
+  (`placeholder-check.sh` above; Python, no aarch64 binutils). The bare "compiles" check passed an image carrying 103
+  unresolved call sites (§ Fixed, the cycc count). ⛔ Its first, inline version FAILED OPEN (1.57.13 review): it read
+  only section-table executable sections, so an image with no section table scored 0 = PASS — the e_shnum=0 copy of a
+  9-hole image did — and it stripped every trailing zero word of `.text`, not just the alignment pad (five zeroed tail
+  words read 0). Replaced by the shared fail-closed gate. The image is now
+  written to `$ROOT/build/agnos_arm_test` (was the fixed `/tmp/agnos_arm_test`, shared by every checkout on the box).
+  `test.sh --all` **8/8** (x86 4 + aarch64 4; it was 4 passed + 1 aarch64 FAIL from 1.56.51 to 1.57.12).
+- **`release.yml`: a successful aarch64 compile records `aarch64=compiled` and is NOT published.** The old success arm
+  staged and published `agnos-aarch64`; with the build green that would have shipped a never-booted kernel. `built`
+  (= publish) stays reserved for an aarch64 boot gate (the 1.6x port); the three verdict readers (checksums, payload
+  verify, the release job's asset list) gained a `compiled` arm (skip; a staged `agnos-aarch64` under `compiled` is a
+  hard failure, as under `absent`). Simulated locally for every verdict × staged/unstaged.
+
+- **A tick death's reaps run in process context.** A process killed at the timer tick (`via=tick`) leaves its orphan
+  reap and the reap of each zombie child it leaves to the next syscall exit of any process (`proc_b1`) or the next idle
+  step of any CPU (`sched_idle_step`), whichever first finds `fs_lock` free (`syscall.cyr` `proc_orphan_owed_run`);
+  until then each such slot is DYING (state 4). A zombie child of a tick-killed parent is reaped as an orphan and prints
+  `lifecycle: #<seq> orphan pid=0x<p> reaped`. The drain takes `fs_lock` with the new `fs_spin_trylock` (`smp.cyr`, one
+  xchg) or does nothing and is retried — it never waits out another context's commit — and runs non-preemptibly from
+  its claim to its last publish; the idle step enters it at IF=1. While a reap is owed, a DYING slot whose death is
+  done is not a pipe end (`pipe_ends_open`), so a reader beside a dead writer still sees EOF and a writer beside a dead
+  reader still gets EPIPE, as before 1.57.13.
+- **`zfs_wp_owed_run` (the ZFS commit a tick death owes) takes `fs_lock` by trylock** and is retried at the next B1
+  when it is held; it used to take it unconditionally, so every syscall exit on every CPU waited out a running commit
+  at IF=0. `proc_b1` skips `lifecycle_park_or_abort`'s `sched_lock` when no kill or stop is pending for the caller.
+- **Every smoke's QEMU monitor / VNC socket goes through `smoke_qsock`** (agnsh-type, aethersafha, doom, fg,
+  hid-mouse-deferred, pipeline, shutdown, whirl, `tool/fb-ansi-screendump.sh`) and the sweep-row harnesses through
+  `_qsock.py` (console-line-preserve, vtd-iommu, wait-kbd, zfs-ring3).
+- **Sibling roots default through `SIBLINGS_ROOT`**: `doom-smoke`, `doom-audio-smoke`, `naad-ring3-smoke`, every smoke
+  this release touched (aethersafha — `AE_ROOT` too —, kstack, hid-mouse-deferred, shutdown, whirl, fault-kill,
+  fp-ring3; fg and pipeline through `lib/ring3-seed.sh`), `tool/fb-ansi-screendump.sh`, and
+  `sweep.sh`'s exported roots (gnoboot, agnoshi, kashi, rekha, naad, cyrius-doom — now exported in the serial mode too, before
+  the baseline build) take an explicit `<NAME>_ROOT`, else
+  `${SIBLINGS_ROOT:-$ROOT/..}/<repo>` — the rule `stage-tools.sh` and `syscall-abi-check.sh` already follow.
+
+- **A VT-d unit with VER major ≥ 6 is no longer refused** when the queue is in use; it is refused only on the register
+  interface (`iommu: translation NOT enabled - VER >= 6.0 and queued invalidation is not in use`). The ECAP.IRO = 0
+  refusal likewise applies to the register interface only.
+
+- **`fb_set_geom`** compares `fb_winsize()` before and after its stores and returns 1 on a change; its callers
+  (`mdo_native`, `gpu_scanout_matchgeom`, the `TTY_SELFTEST` knob) post SIGWINCH (`sched.cyr` `console_winch_post`)
+  after their console clear and lines.
+- **`kb_read_scancode`** re-checks `kb_head != kb_tail` under `input_lock` and returns 0 on an empty ring; `kbscan`#42
+  stops on 0.
+- **`read`#5 routes every console fd** (`fd_is_console`: fd 0, 1, 2 or a dup that is the console device) to the cooked
+  line readers, blocking or NB by a4 as on fd 0; x86 `serial_dev_read` is `kbd_read_blocking`.
+
+### Fixed
+
+- **`sh scripts/build.sh --aarch64` compiles and links again** (the compile debt; operator ruling 2026-09-21 — the
+  port itself stays 1.6x, nothing boots this image). `arch/aarch64/stubs.cyr` § 1.57.13 adds **72** functions and
+  **17** variables: the **32** undefined functions + **17** undefined variables (47 sites) the compiler reported and
+  the **40** functions it did not (below) — every one the x86 interface the shared caller already uses, valued as
+  x86 answers with the hardware or subsystem absent (`DIRECTMAP_BASE = 0` and `pmm_kva_for_access(p) = p` on the
+  MMU-off flat map; one core, no-op locks; no framebuffer; ext2 / FAT / exFAT / ZFS
+  never mounted; no NIC; the ELF loader refuses). The stubs change no shared file: on their own the x86_64 images
+  are **byte-identical** to 1.57.12's (plain `b337e26f…` and six flag builds compared). aarch64 image at the merge
+  **642,000 B** (`build.sh`), **775,040 B** (`test.sh`, with kashi's font data); 641,504 B on the track alone.
+- **cycc under-counts reachable undefined functions** (cyrius 6.6.6, both backends; **already fixed upstream in cyrius 6.6.9** — "A reachable undefined call is refused
+  even when an unreachable fn called it first", gated by cyrius `undefined_tail_call_refused.sh`; reproduced here on
+  6.6.6 and refused on 6.7.9; agnos takes the fix with the 1.57.14 pin move to 6.6.20, so nothing is filed). An undefined function whose FIRST reference sits in an unreachable function is dropped
+  from the "reachable undefined" refusal even when a later call site is live; `cycc_aarch64` does not warn at all,
+  `cycc` warns without refusing. The live call is emitted as the unresolved placeholder (aarch64 `udf #0`, x86
+  `ud2; ud2`) and the build prints `OK`. Repro: `fn d() { u(1); return 0; }  fn l() { u(2); return 0; }  l();` →
+  `OK`, a placeholder in `l`. In this tree it hid **40** names behind the 32 reported — **13** with live call sites
+  (`fb_print` from `kprint`, `fs_spin_lock` / `fs_spin_unlock` from every `vfs_*_on`, `ext2_get_inode`,
+  `ext2_path_lookup`, eight FAT/exFAT entry points), **103** placeholder words in the image. All x86_64 images measured
+  today carry **0**.
+- **`arch/aarch64/stubs.cyr` `proc_slot_release_unborn` answered x86's "released" (0) while releasing nothing** (1.57.13
+  review). It answers x86's refusal (-1) now, annotated: it is reached only through `proc_birth_check`'s 0, which the
+  always-1 stub never returns — a real aarch64 birth check needs a real release, or a refused birth leaves its slot
+  CLAIMING with `proc_count` un-collapsed. The stub file's MEMORY header no longer calls the identity "the direct map"
+  without qualification: it is right only for addresses that are RAM on this port, and the shared callers' region-7
+  and pmm-frame addresses are x86 layout (roadmap's aarch64 row, 1.6x).
+- **`var sched_active` was declared twice in the aarch64 build** (`stubs.cyr` and shared `core/proc.cyr`, since the
+  aarch split; cycc accepts a duplicate module-scope `var` with no diagnostic). The stub's copy is gone.
+
+- **A process killed at the timer tick no longer spins on `fs_lock` inside the ISR** (design
+  `docs/development/proposals/2026-10-09-zfs-write.md` k.132 (3), k.135; since 1.57.7 S7). Its orphan reap and its
+  zombie children's reaps took `fs_lock` (`proc_destroy_fd_table`), heap and pmm in the timer ISR with the vector in
+  service; a ZFS commit holds `fs_lock` for up to seconds, and that CPU took no tick until it ended. (The tick path
+  still takes `pmm_lock` through one release — `shm_release_pid` → `shm_free` → `pmm_free_2mb`, a short bitmap hold;
+  INV-L2 now says so.)
+- **`doom-smoke` and `naad-ring3-smoke` failed in seconds from a worktree** (1.57.12 sweep rows 33 / 69): they read
+  only `DOOM_ROOT` / `NAAD_ROOT` or `$ROOT/..`, never `SIBLINGS_ROOT`.
+- **`naad-ring3-smoke` wrote into the naad repo** (`build/naadex`, and what `cyrius build` resolves there): naadex is
+  built from a copy of the naad sources in `build/naad-ring3-src/`; the sibling is only read.
+- **`hid-mouse-deferred` and `pipeline` VOIDed under `SWEEP_JOBS=4`** (1.57.11, 1.57.12): a worker copy's socket path
+  exceeded the 108-byte `sun_path` and QEMU refused the monitor. Proven green under `SWEEP_JOBS=4` in a worker-copy
+  layout whose old socket paths were 212–230 B; with the long path restored both VOID.
+- Fixed `/tmp` paths shared by every tree and worker copy: the doom, doom-audio, aethersafha, naad, fault-kill and
+  fp-ring3 build logs (now under the tree's `build/`); the whirl, agnsh-type, console-line-preserve and wait-kbd
+  monitor sockets (two trees running one harness bound one path). Other smokes that are not sweep rows still name
+  fixed `/tmp` logs, and the untouched smokes still default gnoboot through `$ROOT/..` (the sweep exports every root,
+  so inside a sweep they resolve; standalone from a worktree, set `GNOBOOT_ROOT`).
+
+- **The VT-d unit's own memory was reachable by every device** (`iommu.cyr`; since 1.57.10 for the tables). The root,
+  context and SL tables — and, in this cut's first form, the invalidation queue and status pages — were `pmm_alloc`
+  pages; `pmm_alloc` allocates top-down, into the 2 MB region the replayed pre-init xHCI grant had opened read/write in
+  the domain every device shares (vtd-smoke boot A: RTADDR `0xffe1000`, queue `0xffe3000`, status `0xffe2000`, under the
+  leaf `0xfe00083` virtio-net translated through). A device could rewrite the SL tables, write the status word early, or
+  forge a wait descriptor whose Status Address the unit writes untranslated. Every such page is now carved from an own
+  2 MB chunk no grant can ever cover (`iommu_own_grow`: above the default 16 MB, no pending or RMRR grant, not granted
+  already); `iommu_map_2mb` and `iommu_register_dma` refuse an own-chunk address. The code comment, the architecture doc
+  and the issue's Resolution had said the queue pages were "not granted"; corrected.
+- **A queue that stalled or died on a grant after the boot DMA check was never reported**: the grant path now says it,
+  once, lock-free (klug + COM1, the REFUSED line's shape).
+- **A slow but working queue was killed for the rest of the boot** at its first timeout (Linux and FreeBSD wait without
+  a bound): a timeout now stalls it, and only a wait still incomplete after a second full bound is DEAD.
+- **A queue firmware left enabled is drained before QIE is cleared** (`iommu_qi_disable`, Linux `dmar_disable_qi`): IQH ==
+  IQT is awaited (bounded) first. Until 1.57.13 `iommu_init` cleared QIE at once, which the spec forbids with requests
+  pending and QEMU refuses (QIES stays set), so translation was refused.
+
+- **#48's D6 clock after a partial ACK consumed before the wait arms.** `tcp_wait_done`'s mode-2 re-check stopped only
+  on the held segment being fully ACKed, so a partial ACK delivered by the sender's own `net_poll` (every loopback
+  ACK) or by a drain racing the arm left the sender asleep until the OLD D6 deadline, and D6 restarted from there: up
+  to 2 × `TCP_PROGRESS_US` (16 s) with no progress after the partial ACK. `tcp_block` takes the SND.UNA the sender
+  decided on (mode 2; 0 for #47) and `tcp_wait_done` stops on any change; `tcp_send_ex`'s post-poll prefilter
+  re-decides on it. tcp-smoke arm `tcp: d6part`: a block with a stale snapshot returns in 4–188 µs (was its full
+  2 s); a 600 ms D6 after a partial ACK returns in 0.60–0.61 s (was 1.21 s).
+
+- **A `signalfd` could not read a signal ≥ 32** (`vfs.cyr` `vfs_read_signalfd`): its walk stopped at 31 while
+  `kill`#16 posts 1..63, so a watched pending bit 32..63 read as 0 ("nothing pending") forever and was never cleared
+  — and `epoll_wait`#21 kept reporting the fd readable. The walk now covers 1..63. Found beside SIGWINCH's delivery
+  path; gated by `tty-smoke.sh` T8 (`kill`#16 self 40 → a bit-40 signalfd reads 40 once; mutation M-TTY5 red).
+- **A read of console fd 1 or 2 hung the CPU.** `read`#5 sent only fd 0 to the cooked line; any other console fd
+  reached `serial_dev_read`, whose no-key wait was a `hlt` in syscall context at IF=0 (it also ignored line ownership
+  and echoed nothing). Gated by `tty-smoke.sh` T10 (mutation M-TTY7: the box wedged).
+- **A line ended without a drawn newline left the framebuffer line live** — a Ctrl-D, and a hidden Enter under
+  `CM_NOECHO`: every later print erased the row and replayed the prompt under the cursor. The readers now end the line
+  (`fb_console.cyr` `fb_line_end`). Gated by `tty-smoke.sh` T11, a screendump (mutation M-TTY8: prompt erased from
+  row 0, replayed on row 4).
+- **A consumer racing a second `kb_tail` writer could step `kb_tail` past `kb_head`** (the ring then read as 255
+  queued scancodes, replayed into the next reader): `kb_read_scancode` took the slot without re-checking empty under
+  `input_lock`. Gated by ktest T8g (mutation M-TTY9 red).
+
+### Fixed — the merge (the five tracks read together)
+
+- **A tick-killed process still read LIVE to the console's liveness tests while its reap was owed** (the carry track's
+  owed reap × the tty track's "the mode dies with its holder"). `console_mode`#110's NOECHO and the console line DO die
+  at the tick: a tick death runs `proc_death_release` — `kbd_line_release_pid` among it — inside the timer ISR; only the
+  orphan / zombie REAP is owed to a process context. But `kbd_mode_now` (the dead-holder backstop) and
+  `kbd_line_owner_live_locked` (the dead-owner reclaim) counted any state ≥ 1 as live, and a tick death now leaves its
+  slot DYING (4) with its death done for as long as `fs_lock` stays busy, so a death path that missed its clear would
+  have kept the console mute and the line owned until the drain. Both read a DYING slot whose death is done as dead
+  (`proc.cyr` `lc_dying_done`; `pipe_ends_open` uses the same helper). Gated by `kstack-smoke`'s `tick orphan` phase
+  (-smp 4): O holds NOECHO and owns the line when it is SIGKILLed at its tick under kmain's `fs_lock`; during the hold,
+  the reap still owed, the mode, its holder and the line owner read 0 (cleared AT the tick), and re-planted as a
+  missed clear would leave them, a DYING-done O is no holder and no owner — `mode=1/1/0/0/0/0`. Negative N-MODE (the
+  `lc_dying_done` test removed from both): `mode=1/1/0/0/1/1`, `FAIL tick orphan (a DYING-done holder / owner still
+  reads live)`, kstack 30/2.
+- **SIGWINCH reached a tick-killed process waiting for its owed reap** (carry × tty). `console_winch_post` treated
+  every state ≠ 0 as a watcher candidate and walked its fd table under `sched_lock` — a DYING slot's table the owed
+  drain frees under `fs_lock` alone, and once freed `vfs_fd_table_of` answers kmain's `vfs_table` for it. It skips a
+  DYING slot whose death is done (`lc_dying_done`).
+- **The tty track's new harness bypassed the carry track's socket and sibling rules**: `tty-test.py` bound its HMP
+  monitor at `$ROOT/build/tty-mon.sock` — inside a sweep worker copy, the 108-byte `sun_path` class — and found gnoboot
+  only through `GNOBOOT_ROOT` or `$ROOT/..`. It uses `_qsock.py`'s `qsock()` and `${SIBLINGS_ROOT:-$ROOT/..}` now.
+- **`agnsh-type-test.py` scored an answered line unanswered**: its `version` marker named agnoshi's MAJOR
+  (`agnoshi 1.`) and went stale at agnoshi 2.0 — the shell answered `agnoshi 2.0.3` and the harness (no sweep row runs
+  it; the tty and carry tracks both touched the typed-input path, so the merge ran it) read 2/3. The markers are
+  regexes now (`agnoshi [0-9]+\.[0-9]+`): 3/3 on the merged tree.
+- **The syscall ABI bookkeeping, once for three mints**: `roadmap.md`'s allocation line said "0–108 … next free is
+  #109" and "the ABI gate is GREEN" — it reads 0–111, next free #112, and the gate red BY DESIGN with the three cyrius
+  filings; sweep row 1 (`baseline check.sh`) carries the KNOWN RED mark on exactly the ABI gate's two FAIL lines (the
+  1.57.10 shape, dropped at 1.57.11 when the peer landed). Each track had left the line for the merge.
+- **aarch64 after the merge**: every new shared name resolves — `sock_send_dl`'s `tcp_send_dl` is stubbed (the sock
+  track), `SIG_WINCH`, `lc_dying_done` and `proc_destroy_fd_table_held` are defined in shared files, and the rest
+  (`proc_orphan_owed*`, `fs_spin_trylock`, the `console_mode` / `fd_kind` / SIGWINCH code, the VT-d queue) live in
+  x86-only files no shared caller reaches. `build.sh --aarch64` 642,000 B with 0 placeholders; `test.sh --all` 8/8;
+  the include set carries no duplicate module-scope definition.
+
+### Closeout
+
+- `build/agnos` **2,773,064 B** (+18,472 B over 1.57.12's 2,754,592 B: the VT-d queue and own chunk, `#109`–`#111`,
+  SIGWINCH, the owed reaps; built against the pinned kashi 1.1.0 / rekha 0.9.0 exports). LOAD end **`0x3b4ee8`** —
+  **307,480 B** under gate 34's `0x400000`. Every flag build through the placeholder gate (0 placeholders each) and
+  image-layout (headroom): plain 307,480 · **`ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 ZFS_WRITE_OPS=1` 165,448 (binding)** ·
+  `RING3_SELFTEST=1` 225,640 · `ZFS_WRITE_OPS=1` 224,328 · `KTEST=1 THREAD_SELFTEST=1 KSTACK_SELFTEST=1 KSTACK_HW=1`
+  238,536 · `EDGE_ABI_SELFTEST=1` 243,552 · `TEST=1 KTEST=1` 245,880 · `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1` 248,552 ·
+  `KSTACK_SELFTEST=1 KSTACK_HW=1` 251,760 · `DMA_SHADOW_SELFTEST=1 RAMDISK_ENABLE=1` 256,736 · `TCP_SELFTEST=1` 260,560
+  · `BOOTCR3_KEEP_GNOBOOT_CR3=1` 291,304 · `VTD_SELFTEST=1` 297,080 (+ `VTD_REGISTER_INV=1` 297,096) · `ICMP_SELFTEST=1`
+  303,368 · `TCP_LISTEN_SMOKE=1` 306,104 · `TTY_SELFTEST=1` 306,952 · `FP_RING3_SELFTEST=1` 307,360 ·
+  `NAAD_RING3_SELFTEST=1` 307,352 · `LOOPBACK_SELFTEST=1` 307,480. aarch64 642,000 B, 0 placeholders.
+- **Gates on the merged tree (each once):** `check.sh` **38/39** — the one red is the `syscall ABI` gate, red BY DESIGN
+  ("kernel 111 · abi-doc 111 · cyrius 108"; the peers filed in cyrius) · `test.sh --all` **8/8** (x86 4 + aarch64 4) ·
+  `build.sh --aarch64` OK, 0 placeholders · every flag build above through the placeholder gate and image-layout ·
+  `agnsh-smoke` PASS (both `boot: … OK` layout lines) · the typed-input harness (`agnsh-type-test.py`) 3/3 ·
+  `KTEST=1 ktest.sh` **380/0**, 13/13 boot self-tests · `sweep.sh` with `SWEEP_ONLY` over the union of the tracks' rows
+  and the rows the interactions touch, `SWEEP_JOBS=4` (worker copies at `<worktrees>/.<tree>.sweep.<pid>.wN`):
+  **30/30** in 999 s, **0 serial retries** — `hid-mouse-deferred`, `pipeline`, `doom` and `naad-ring3` green in the
+  parallel layout (the `sun_path` and sibling-root fixes); vtd 178/0 (four boots), dma-shadow 29/0, tcp 66/0,
+  loopback 9/0, tcp-listen 4/0, tcp-inbound 60/0, sock-owner 95/0, sock-wait 70/0, sock-send-dl 48/0, icmp 12/0,
+  tty 108/0, wait-kbd 46/0, fg default + recovery `-smp 1` / `-smp 4`, nbread, console live line, ktest-smoke 2/2,
+  kstack 64/0 (`tick orphan … mode=1/1/0/0/0/0`), lifecycle 181/0, fault-kill, spawn 133/0, doom, naad-ring3,
+  hid-mouse-deferred 22/0, ipc-wait 50/0, pipeline 12/0, FP/SSE, FP-ring3, shutdown. The full sweep is the release
+  phase's (not run at the merge).
+- **The release phase (2026-10-13), the full sweep once:** `sweep.sh` **72/73** (`SWEEP_JOBS=4`, wall **5,110 s**: the
+  parallel phase 4,966 s, then the exclusive `tsc` 86 s and `kvm-net-boot` 51 s). The one red is row 1
+  `baseline check.sh`, **KNOWN RED by design**: its only FAIL lines are the `syscall ABI` gate's ("kernel 111 · abi-doc
+  111 · cyrius 108", `#109`–`#111` absent from cyrius), so it got one attempt and no retry. Every other row passed on
+  its first attempt: **0 serial retries, no row re-run**. **23 firmware VOIDs inside 16 rows**, every one
+  `gnoboot: fail @ EBS` (the kernel never ran), each relaunched by `qemu_dwell_kernel` inside its row, which then passed:
+  zfs read 3 (v28 ×2, mirror-b), zfs write 2 (ashift9, ashift9-grown), net-csum 2, fault-kill 2, ring3 2, fp-area 2,
+  and one each in tsc, spawn, exFAT write, ext2 write, the ext2 multi-backend probe, fssys, kstack (`-smp 4`), nbread,
+  chan-ring3 and naad-ring3. The ZFS write row took **4,957 s** (21 lanes, 12 rw pools committed and accepted by
+  OpenZFS). The TCP rows (26–33) needed no retry. In the inbound-TCP row, the A3 burst served 10/10 on all three
+  variants (msix, vectors0, `-smp 4`) on the first attempt. After the sweep: `check.sh` **38/39** run on its own (the
+  same one red) · `test.sh --all` **8/8** · plain and the binding flag build re-measured, unchanged — plain 2,773,064 B,
+  LOAD end `0x3b4ee8`, **307,480 B**; `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 ZFS_WRITE_OPS=1` 2,915,096 B, `0x3d79b8`,
+  **165,448 B**; 0 placeholders in each. Boot checkpoints from the sweep's logs: `ktest-smoke` at `-smp 1` and
+  `-smp 4` printed `AGNOS kernel v1.57.13`, both `boot: … OK` layout lines, `Userland exec complete` and
+  `TOTAL: 380 passed, 0 failed`, with 13/13 KTEST boot self-tests; `agnsh-smoke` **PASS** on the plain kernel (row
+  72's image build: both layout lines, the room carve-out, agnoshi 2.0.3 in ring 3). Version verify: `VERSION` 1.57.13
+  matches this header, `kernel/version.cyr`'s three banners (21 / 31 / 34 B) and `kernel/agnos.cyr`'s header. The tag
+  is the operator's.
+- **CLAUDE.md closeout step 3 (dead-code audit) stays WAIVED** by the operator's standing rule *grow before refactor*.
+- **Open**: the cyrius peers for `#109`–`#111` (filed there; the ABI gate's by-design red); the cycc under-count of
+  reachable undefined functions (§ Fixed) is fixed upstream in cyrius 6.6.9 and arrives with 1.57.14's pin move to
+  6.6.20 (until then `placeholder-check.sh` refuses its placeholders); the
+  iron-only VT-d paths (ITE / ICE, VER ≥ 6, a firmware-left queue's drain, a second own chunk); `fault_kill_current`
+  still reaps an orphan inside the exception handler (no vector in service — the ownership-lock latency class, not
+  k.132 (3)); ~70 smokes that are not sweep rows still default gnoboot through `$ROOT/..` and ~40 non-row harnesses
+  bind fixed `/tmp/agnos-*.sock` names (the sweep exports every root; standalone runs set `GNOBOOT_ROOT`); the
+  inbound-TCP first-attempt failure the sock track saw once (`-smp 4`, A3: 482 bytes with no `GET `) did not recur,
+  at the merge or in the release sweep, and is not filed.
+
 ## [1.57.12] — 2026-10-09 — the ZFS write path, and the kernel image makes room for it
 
 The roadmap's top item, second half. Operator rulings: 2026-10-09 **read in 1.57.11, write in 1.57.12**; 2026-10-10

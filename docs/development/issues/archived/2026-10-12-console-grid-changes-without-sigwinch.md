@@ -1,6 +1,28 @@
 # 2026-10-12 — A live modeset changes the console grid, but no running program is told: the kernel never raises SIGWINCH
 
-**Status:** 🟡 **OPEN** — filed from darshana **1.2.0** (the 1.1.4 audit of its AGNOS signalfd peers).
+**Status:** ✅ **RESOLVED in agnos 1.57.13** — the issue's PROPOSED shape. `fb_set_geom` (`fb_console.cyr`), the one
+function every geometry move goes through (`mdo_native`'s live modeset, `gpu_scanout_matchgeom`'s early and late
+match), compares `fb_winsize()` before and after its stores and answers 1 only when the packed grid changed; its
+CALLER then posts, once its console is settled (after `mdo_native`'s clear and lines, after `gpu_scanout_matchgeom`'s
+clear and klug replay — the 1.57.13 review moved the post out of `fb_set_geom`, where a watcher's redraw on another
+CPU could be wiped by the clear that followed): `console_winch_post()` (`sched.cyr`) ORs bit 28 (`SIG_WINCH`,
+`proc.cyr`) under `sched_lock` — through the existing atomic OR — into exactly the live user processes holding a
+`signalfd#18` whose mask has bit 28, so a non-watcher never holds a stale bit that a signalfd or `epoll_wait` it opens
+later would report as a fresh resize. (A child spawned without `SPAWN_F_CLEANFD` inherits a watcher's signalfd and is a
+watcher too, as on Linux. The first cut's rationale — that a stray bit would spin `pause#14` — was wrong: `pause`
+reads only kill/stop.) Prior art: Linux `tty_do_resize` (compare the old winsize, signal only
+on a change) and `sig_ignored()` (SIGWINCH is default-ignore and dropped at generation unless blocked — a signalfd
+consumer blocks it). **Evidence:** no live modeset is reachable under QEMU, so a `TTY_SELFTEST` build adds a geometry
+knob on `console_mode#110` that drives the same `fb_set_geom`; `scripts/smoke/tty-smoke.sh` phase T7
+(`tests/waits/waitx` mode `tty`, `-smp 1` + `-smp 4`): a same-grid call posts nothing, SHRINK and RESTORE post one 28
+each to the bit-28 watcher, a process holding a bit-10 signalfd and the driver (no signalfd) get nothing. Mutation
+M-TTY3 (post to every live user process) turns T7 red (`nonwatcher=33 driver28=1`); M-TTY11 (`fb_set_geom` claims a
+change on every call) turns it red too (`watcher=22`: the same-grid call posted). The post-after-clear ordering in
+`mdo_native` / `gpu_scanout_matchgeom` is reached only on AMD display silicon and is argued from the code. **What it broke:** nothing found —
+`fb_set_geom` is reached only from kmain at boot and from the `#93` modeset syscall, neither holding `sched_lock` (the
+post's lock); at boot `proc_count` is 0 or only kernel slots exist, so the walk posts nothing. The related
+observation below (no console key raises SIGINT) stays a design choice, not a defect.
+*(Filed from darshana **1.2.0** — the 1.1.4 audit of its AGNOS signalfd peers.)*
 **Checked against:** agnos **1.57.11** — `kernel/arch/x86_64/fb_console.cyr` (`fb_set_geom` :452,
 `fb_width`/`fb_height` :470/:476, `fb_scale` :657, `fb_winsize` :673), `kernel/core/syscall.cyr`
 (`mdo_native`, the success path ~7407; `winsize#60` arm; `gpu_modeset_op#93` → `gpu_modeset_op_sys` ~11079),

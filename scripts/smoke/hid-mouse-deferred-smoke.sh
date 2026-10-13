@@ -21,7 +21,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
+GNOBOOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}/build/BOOTX64.EFI"   # 1.57.13 review: <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo>
 OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS=/usr/share/edk2/x64/OVMF_VARS.4m.fd
 [ -f "$GNOBOOT" ]   || { echo "ERROR: gnoboot not built at $GNOBOOT — this gate measured NOTHING"; exit 1; }
@@ -95,7 +95,7 @@ else ok "the deferred-drain instrument is compiled out of production"; fi
 
 boot() {   # $1 kernel copy, $2 smp, $3 label; sets LOG; returns 1 on VOID
     W="$WORK/$3"; mkdir -p "$W"
-    IMG="$W/d.img"; LOG="$LOGS/$3.log"; MON="$W/mon.sock"; DONE="$W/injected"
+    IMG="$W/d.img"; LOG="$LOGS/$3.log"; MON=$(smoke_qsock "$W/mon.sock"); DONE="$W/injected"   # 1.57.13: short socket path (smoke_qsock, qemu-dwell.sh: sun_path is 108 bytes)
     dd if=/dev/zero of="$IMG" bs=1M count=64 status=none                               || die "[$3] image: dd of the 64 MB disk failed"
     parted -s "$IMG" mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on >/dev/null 2>&1 || die "[$3] image: parted failed"
     mformat -i "$IMG"@@1048576 -F                                                      || die "[$3] image: mformat of the ESP failed"

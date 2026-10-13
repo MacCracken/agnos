@@ -345,6 +345,46 @@ smoke_accel() {
     return 0
 }
 
+# smoke_qsock <path> (1.57.13) — the path a QEMU UNIX socket (-monitor / -qmp / -vnc unix:) should be bound at, for a
+# socket the smoke would otherwise put at <path>. Prints it (a fresh directory, mode 0700, already created).
+# ⛔ WHY: sun_path holds 108 bytes (unix(7): `char sun_path[108]`, NUL included), and a sweep worker copy's build dir
+# alone is ~75 (.../.<tree>.sweep.<pid>.w<K>/build/<smoke>/...). QEMU refused the monitor ("UNIX socket path ... is too
+# long"), the boot never started, and hid-mouse-deferred and pipeline scored VOID under SWEEP_JOBS=4 at both 1.57.11 and
+# 1.57.12 — green only on the serial retry in the main tree. A socket under the smoke's own WORK dir can never be
+# made short enough by naming: the tree's location is the operator's, not the smoke's.
+# ⭐ THE RULE: ${XDG_RUNTIME_DIR:-/tmp}/agnos-q.<12 hex of md5(<path>)>/<basename of <path>> — ~45 bytes wherever the
+# tree lives. Deterministic per (tree, smoke, socket): a re-run in the same tree reuses its directory, two trees or two
+# worker copies never share one (each names a different <path>), and a QEMU of one run can never answer another run's
+# monitor (the fixed /tmp/agnos-*.sock names the older harnesses use collide exactly that way across trees).
+# Prior art: OpenSSH's ControlPath (`%C`, a hash of the connection, documented for the sun_path limit) and systemd's
+# per-user sockets under $XDG_RUNTIME_DIR; libvirt keeps its QEMU monitors under /run/libvirt/qemu, never in the
+# domain's (arbitrarily deep) storage directory. The Python harnesses use the same rule (scripts/harness/_qsock.py).
+# ⚠ The hash-named directory is used ONLY when it is a real directory (never a symlink — `[ -d ]` / `[ -O ]` follow
+# one, so the name is lstat-checked first), owned by this uid, with no group / other bits (mode & 077 == 0). Anything
+# else at that name — a symlink, someone else's directory, a 0777 one, a plain file — gets `mktemp -d` in the same base
+# instead (a fresh 0700 directory). Directories of this rule (real directories, mine) untouched for a day are pruned on
+# each call, recursively, so worker copies (a new <path> per run) leave no litter. (1.57.13 review: a symlink at the
+# hash name redirected a run's sockets — and doom-smoke's `rm -f` of them — into any directory the user owns.)
+# ⚠ SAFE UNDER `set -e` (shutdown-smoke runs with it): every command that may fail here ends `|| :` or is a test, so a
+# squatted name reaches the mktemp fallback instead of aborting the caller inside its command substitution.
+_qs_dir_ok() {
+    [ ! -L "$1" ] && [ -d "$1" ] && [ -O "$1" ] || return 1
+    case "$(stat -c %a "$1" 2>/dev/null || :)" in *00) return 0 ;; esac
+    return 1
+}
+smoke_qsock() {
+    _qs_base="${XDG_RUNTIME_DIR:-/tmp}"
+    { [ -d "$_qs_base" ] && [ -w "$_qs_base" ]; } || _qs_base=/tmp
+    find "$_qs_base" -maxdepth 1 -name 'agnos-q.*' -type d -user "$(id -u)" -mmin +1440 -exec rm -rf {} + 2>/dev/null || :
+    _qs_h=$(printf '%s' "$1" | md5sum | cut -c1-12)
+    _qs_d="$_qs_base/agnos-q.$_qs_h"
+    [ -L "$_qs_d" ] || mkdir -p -m 700 "$_qs_d" 2>/dev/null || :
+    if ! _qs_dir_ok "$_qs_d"; then _qs_d=$(mktemp -d "$_qs_base/agnos-q.XXXXXXXXXXXX") || return 1; fi
+    touch "$_qs_d" 2>/dev/null || :                 # fresh for the prune above
+    printf '%s/%s\n' "$_qs_d" "$(basename "$1")"
+    return 0
+}
+
 # smoke_require_image <image> <expected flags> (1.57.7 IMG-fix, reviews A6/B6) — refuse to boot a kernel this smoke
 # was not written for. ⛔ WHY: doom-smoke leaves a DOOM_SELFTEST kernel in build/agnos, and shutdown-smoke — which
 # boots whatever build/agnos is on disk — then booted it and scored all three arms PASS (1.57.7 IMG run, set aside

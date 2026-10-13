@@ -23,8 +23,10 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"                 # agnos repo root
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-AE_ROOT="${AE_ROOT:-$ROOT/../aethersafha}"
+# 1.57.13 review: siblings as doom/naad resolve them — <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> (a worktree holds no sibling).
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
+AE_ROOT="${AE_ROOT:-$SIBLINGS/aethersafha}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -40,13 +42,17 @@ AE="$AE_ROOT/build/aethersafha-agnos"
 [ -f "$AE" ]      || { echo "ERROR: aethersafha-agnos not built — (cd $AE_ROOT && cyrius build --agnos src/main.cyr build/aethersafha-agnos)"; exit 1; }
 
 echo "[1/4] Building AETHERSAFHA_SELFTEST kernel..."
-if ! env AETHERSAFHA_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/ae-smoke-build.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/ae-smoke-build.log)"; tail -5 /tmp/ae-smoke-build.log; exit 1
+# 1.57.13: the build log is the TREE's (it was /tmp/ae-smoke-build.log — one file for every tree and worker copy).
+mkdir -p "$ROOT/build"; AE_BLOG="$ROOT/build/ae-smoke-build.log"
+if ! env AETHERSAFHA_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$AE_BLOG" 2>&1; then
+    echo "  BUILD-FAIL (see $AE_BLOG)"; tail -5 "$AE_BLOG"; exit 1
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
 
 WORK="$ROOT/build/ae-smoke"; LOGS="$ROOT/build/ae-smoke-logs"
 rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # 1.57.13: short socket path (smoke_qsock, qemu-dwell.sh: sun_path is 108 bytes)
+VNC_SOCK=$(smoke_qsock "$WORK/vnc.sock"); MON_SOCK=$(smoke_qsock "$WORK/mon.sock")
 IMG="$WORK/agnos-ae.img"
 PART_OFFSET=$(( 33 * 1048576 ))
 PART_BYTES=$(( 200 * 1048576 ))
@@ -78,8 +84,8 @@ qemu-system-x86_64 \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-AE" \
-    -vnc "unix:$WORK/vnc.sock" \
-    -monitor "unix:$WORK/mon.sock,server,nowait" \
+    -vnc "unix:$VNC_SOCK" \
+    -monitor "unix:$MON_SOCK,server,nowait" \
     -serial "file:$SLOG" -no-reboot &
 QPID=$!
 trap 'kill $QPID 2>/dev/null' EXIT
@@ -93,7 +99,7 @@ sleep "${AE_RENDER_WAIT:-8}"
 
 echo "[4/4] Screendump + checks..."
 PPM="$WORK/aethersafha.ppm"
-python3 - "$WORK/mon.sock" "$PPM" <<'PY'
+python3 - "$MON_SOCK" "$PPM" <<'PY'
 import socket, sys, time
 sock, out = sys.argv[1], sys.argv[2]
 s = socket.socket(socket.AF_UNIX); s.connect(sock); time.sleep(0.4)

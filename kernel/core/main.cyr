@@ -7814,6 +7814,178 @@ fn kst_phase_rmw() {
     return 0;
 }
 
+# PHASE (1.57.13, design k.132 (3)) — A TICK-KILLED ORPHAN WHILE ANOTHER CPU HOLDS fs_lock. kmain holds fs_lock for
+# 300 ms (as a ZFS commit does, k.126) while O — an ORPHAN (its recorded parent incarnation names no live process)
+# spinning in ring 3 on an AP (W with its gate off: no syscall, so its kill can only land at the TICK) with a ZOMBIE
+# child Z — is killed. The tick death must OWE both reaps (syscall.cyr proc_orphan_owed_run), never take fs_lock in
+# the ISR:
+#   ticks  O's CPU keeps taking timer ticks through the hold (>= 10 in 300 ms; 100 Hz). Before 1.57.13 its ISR spun
+#          on fs_lock in proc_reap_child(Z) / proc_reap_orphan(O) with the vector in service, and that CPU's tick count
+#          froze at the killing tick (negative N-ORPH: the deferral removed -> ticks <= 1, this phase FAILs);
+#   owed   at the end of the hold O's death is done, O and Z are DYING (4) and both owed — nothing reaped them yet;
+#   reaped after the release a PROCESS context (an idle step or a syscall exit) reaps both within 2 s: state 0, ppid 0
+#          (the reaped mark), no fd table, CR3 0x1000, nothing owed, and the free pool back within 16 pages of its
+#          level before the two spawns (an unfreed address space is >= 1,536 pages).
+#   pipes  (1.57.13 review) Z holds a pipe's WRITE end and O its READ end (planted in their own tables, seen by
+#          pipe_ends_open while both live): during the hold, with both DYING (4) and their reaps owed, neither end may
+#          count — EOF / EPIPE stay visible (vfs.cyr pipe_ends_open skips a 4 whose death is done). Negative N-PIPE:
+#          that skip removed -> pipe_w=1 pipe_r=1, this phase FAILs. The reap frees the buffer (last reference).
+#   refuse (1.57.13 review) both owed runners called by kmain WHILE it holds fs_lock must refuse at once — zfs_wp_owed
+#          stays 1, proc_orphan_owed_run reaps 0 and both bits stay owed. Pre-review zfs_wp_owed_run took fs_lock
+#          unconditionally: this call self-deadlocks there (negative N-ZOWED: the boot hangs at this phase).
+#   mode   (1.57.13 merge, the tty x carry interaction) O holds console_mode#110 NOECHO and owns the console line: both
+#          die AT THE TICK (proc_death_release runs in the ISR; only the reap is owed), so during the hold, with the reap
+#          still owed, the mode, its holder and the line owner read 0; re-planted as a death path that missed its clear
+#          would leave them, a DYING-done O is no holder and no owner (proc.cyr lc_dying_done). Negative N-MODE.
+# -smp > 1 only: at -smp 1 kmain's hold would keep O off the only CPU.
+fn kst_phase_tickorphan() {
+    if (cpu_count < 2) { kprintln("kstack: tick orphan n/a (1 cpu)", 31); return 0; }
+    var to_free0 = pmm_free_count();
+    var to_zpg = kst_page_new();
+    var to_opg = kst_page_new();
+    if (to_zpg == 0 || to_opg == 0) { kprintln("kstack: FAIL tick orphan: no data page", 38); return 0; }
+    var to_z = kst_spawn(&kst_payload_w, to_zpg, 0, 0, 0, 0);      # never runs: it becomes O's zombie
+    var to_o = kst_spawn(&kst_payload_w, to_opg, 0, 0, 0, 0);      # gate [+24] = 0: a pure ring-3 spin
+    if (to_z < 0 || to_o < 0) { kprintln("kstack: FAIL tick orphan: spawn", 31); return 0; }
+    store64(&proc_ppid + to_o * 8, 15);                            # a parent incarnation nobody has: O is an ORPHAN
+    store64(&proc_ppid_epoch + to_o * 8, 0x7EADBEEF00000001);
+    store64(&proc_ppid + to_z * 8, to_o);                          # Z is a child of THIS incarnation of O
+    store64(&proc_ppid_epoch + to_z * 8, proc_epoch_get(to_o));
+    # 1.57.13 review: one pipe buffer, its WRITE end in Z's own table and its READ end in O's (the highest free fd of
+    # each — both tables are copies of kmain's, kst_spawn -> proc_create_user -> vfs_fd_inherit).
+    var to_pb = kmalloc(4096);
+    var to_tz = proc_fd_base_get(to_z);
+    var to_tot = proc_fd_base_get(to_o);
+    if (to_pb == 0 || to_tz == 0 || to_tz == &vfs_table || to_tot == 0 || to_tot == &vfs_table) {
+        kprintln("kstack: FAIL tick orphan: no pipe buffer / private fd tables", 60); return 0;
+    }
+    store64(to_pb, 0);
+    store64(to_pb + 8, 0);
+    var to_fd = 31;
+    while (to_fd > 3 && kis_tag(to_tz + to_fd * 32, VFS_FREE) == 0) { to_fd = to_fd - 1; }
+    ktag_set(to_tz + to_fd * 32, VFS_PIPE);
+    kpayload_set(to_tz + to_fd * 32, 0, 0);
+    kpayload_set(to_tz + to_fd * 32, 1, 1);                        # Z: is_write_end = 1
+    kpayload_set(to_tz + to_fd * 32, 2, to_pb);
+    to_fd = 31;
+    while (to_fd > 3 && kis_tag(to_tot + to_fd * 32, VFS_FREE) == 0) { to_fd = to_fd - 1; }
+    ktag_set(to_tot + to_fd * 32, VFS_PIPE);
+    kpayload_set(to_tot + to_fd * 32, 0, 0);
+    kpayload_set(to_tot + to_fd * 32, 1, 0);                       # O: is_write_end = 0 (the read end)
+    kpayload_set(to_tot + to_fd * 32, 2, to_pb);
+    var to_pw0 = pipe_ends_open(to_pb, 1);                         # both live (CLAIMING): both ends count — not vacuous
+    var to_pr0 = pipe_ends_open(to_pb, 0);
+    if (to_pw0 != 1 || to_pr0 != 1) {
+        kprint("kstack: FAIL tick orphan: planted pipe ends not seen w=", 55); kprint_num(to_pw0);
+        kprint(" r=", 3); kprint_num(to_pr0); kprintln("", 0);
+        return 0;
+    }
+    # 1.57.13 merge (tty x carry): O HOLDS console_mode#110's NOECHO and OWNS the console line, as a hidden-password reader
+    # killed at its tick would — planted under input_lock (the cells' lock), before the hold.
+    var to_if = kbd_irq_save();
+    input_spin_lock();
+    kbd_line_mode = CM_NOECHO;
+    kbd_mode_holder = to_o + 1;
+    kbd_mode_ep = proc_epoch_get(to_o);
+    kbd_line_owner = to_o + 1;
+    kbd_line_ep = proc_epoch_get(to_o);
+    var to_m0 = kbd_mode_now();                                    # CM_NOECHO: the plant is in force (not vacuous)
+    var to_l0 = kbd_line_owner_live_locked();                      # 1
+    input_spin_unlock();
+    kbd_irq_restore(to_if);
+    fs_spin_lock();                                                # THE HOLD: kmain is non-preemptible, so O runs on an AP
+    proc_set_state(to_o, 1);
+    var to_t = kst_now_us();
+    while (kst_now_us() - to_t < 1000000) {
+        if (proc_get_state(to_o) == 2) { if (on_cpu_get(to_o) > 0) { break; } }
+        asm { 0xF3; 0x90; }                                        # pause (no GPR touched)
+    }
+    var to_c = on_cpu_get(to_o);
+    if (to_c < 1 || to_c > 3) {
+        fs_spin_unlock();
+        kprint("kstack: FAIL tick orphan: O never ran on an AP (on_cpu=", 55); kprint_num(to_c); kprintln(")", 1);
+        return 0;
+    }
+    proc_set_state(to_z, 0);                                       # Z exits: a zombie of a LIVE parent (not reusable)
+    store64(&proc_death_done + to_z * 8, 1);                       # ... with its death DONE, as a real final hold marks it
+    var to_f = kbd_irq_save();
+    sched_spin_lock();
+    proc_kill_mark_locked(to_o, 9);                                # SIGKILL pending: O's CPU takes it at its next tick
+    sched_spin_unlock();
+    kbd_irq_restore(to_f);
+    var to_k0 = load64(&cpu_user_ticks + to_c * 8) + load64(&cpu_kern_ticks + to_c * 8);
+    kst_spin_us(300000);
+    var to_k1 = load64(&cpu_user_ticks + to_c * 8) + load64(&cpu_kern_ticks + to_c * 8);
+    var to_done = lc_done(to_o);
+    var to_so = lc_st(to_o);
+    var to_sz = lc_st(to_z);
+    var to_ow = (proc_orphan_owed >> to_o) & (proc_orphan_owed >> to_z) & 1;
+    var to_pw = pipe_ends_open(to_pb, 1);                          # Z dead (4, done): its write end -> 0 (EOF visible)
+    var to_pr = pipe_ends_open(to_pb, 0);                          # O dead (4, done): its read end -> 0 (EPIPE visible)
+    # MODE (1.57.13 merge): O's mode and line died AT THE TICK — proc_death_release ran in the ISR — while its reap is
+    # still owed (fs_lock is mine): all three cells 0. Then the BACKSTOP: re-plant them as a death path that MISSED its
+    # clear would leave them; O is DYING (4) with its death done, so the holder and the owner must read DEAD
+    # (lc_dying_done in kbd_mode_now / kbd_line_owner_live_locked; negative N-MODE: that test removed -> 1/1, FAIL).
+    var to_mm = kbd_line_mode + kbd_mode_holder;
+    var to_lo = kbd_line_owner;
+    to_if = kbd_irq_save();
+    input_spin_lock();
+    kbd_line_mode = CM_NOECHO;
+    kbd_mode_holder = to_o + 1;
+    kbd_mode_ep = proc_epoch_get(to_o);
+    kbd_line_owner = to_o + 1;
+    kbd_line_ep = proc_epoch_get(to_o);
+    var to_m1 = kbd_mode_now();
+    var to_l1 = kbd_line_owner_live_locked();
+    kbd_line_mode = 0;
+    kbd_mode_holder = 0;
+    kbd_mode_ep = 0;
+    kbd_line_owner = 0;
+    kbd_line_ep = 0;
+    input_spin_unlock();
+    kbd_irq_restore(to_if);
+    var to_zo = zfs_wp_owed;                                       # REFUSE: both owed runners, fs_lock held by ME
+    zfs_wp_owed = 1;
+    zfs_wp_owed_run();
+    var to_zr = zfs_wp_owed;                                       # 1 = refused (nothing taken, nothing committed)
+    zfs_wp_owed = to_zo;
+    var to_on = proc_orphan_owed_run();                            # 0 = refused
+    var to_ow2 = (proc_orphan_owed >> to_o) & (proc_orphan_owed >> to_z) & 1;
+    fs_spin_unlock();
+    var to_r = 0;
+    to_t = kst_now_us();
+    while (kst_now_us() - to_t < 2000000) {
+        to_r = 1;
+        if (lc_st(to_o) != 0 || lc_pp(to_o) != 0 || proc_fd_base_get(to_o) != 0 || proc_get_cr3(to_o) != 0x1000) { to_r = 0; }
+        if (lc_st(to_z) != 0 || lc_pp(to_z) != 0 || proc_fd_base_get(to_z) != 0 || proc_get_cr3(to_z) != 0x1000) { to_r = 0; }
+        if (((proc_orphan_owed >> to_o) & 1) != 0 || ((proc_orphan_owed >> to_z) & 1) != 0) { to_r = 0; }
+        if (to_r == 1) { break; }
+        arch_wait();
+    }
+    var to_free1 = pmm_free_count();
+    kprint("kstack: tick orphan O=", 22); kprint_num(to_o); kprint(" Z=", 3); kprint_num(to_z);
+    kprint(" cpu=", 5); kprint_num(to_c); kprint(" ticks_in_hold=", 15); kprint_num(to_k1 - to_k0);
+    kprint(" done=", 6); kprint_num(to_done); kprint(" st=", 4); kprint_num(to_so); kprint("/", 1); kprint_num(to_sz);
+    kprint(" owed=", 6); kprint_num(to_ow); kprint(" reaped=", 8); kprint_num(to_r);
+    kprint(" free_lost=", 11); kprint_num(to_free0 - to_free1);
+    kprint(" pipe_w=", 8); kprint_num(to_pw); kprint(" pipe_r=", 8); kprint_num(to_pr);
+    kprint(" refused=", 9); kprint_num(to_zr); kprint("/", 1); kprint_num(to_on); kprint("/", 1); kprint_num(to_ow2);
+    kprint(" mode=", 6); kprint_num(to_m0); kprint("/", 1); kprint_num(to_l0); kprint("/", 1); kprint_num(to_mm);
+    kprint("/", 1); kprint_num(to_lo); kprint("/", 1); kprint_num(to_m1); kprint("/", 1); kprint_num(to_l1);
+    kprintln("", 0);
+    if (to_k1 - to_k0 < 10) { kprintln("kstack: FAIL tick orphan (its CPU stopped ticking: the ISR spun on fs_lock)", 75); return 0; }
+    if (to_done != 1 || to_so != 4 || to_sz != 4 || to_ow != 1) { kprintln("kstack: FAIL tick orphan (the tick death did not owe both reaps)", 64); return 0; }
+    if (to_pw != 0 || to_pr != 0) { kprintln("kstack: FAIL tick orphan (a dead table's pipe end still counts: EOF / EPIPE withdrawn)", 86); return 0; }
+    if (to_zr != 1 || to_on != 0 || to_ow2 != 1) { kprintln("kstack: FAIL tick orphan (an owed runner did not refuse a held fs_lock)", 71); return 0; }
+    if (to_m0 != CM_NOECHO || to_l0 != 1) { kprintln("kstack: FAIL tick orphan (the planted mode / line owner was not in force)", 73); return 0; }
+    if (to_mm != 0 || to_lo != 0) { kprintln("kstack: FAIL tick orphan (the mode / line outlived the tick death until the reap)", 81); return 0; }
+    if (to_m1 != 0 || to_l1 != 0) { kprintln("kstack: FAIL tick orphan (a DYING-done holder / owner still reads live)", 71); return 0; }
+    if (to_r != 1) { kprintln("kstack: FAIL tick orphan (not reaped after the release)", 55); return 0; }
+    if (to_free0 - to_free1 > 16) { kprintln("kstack: FAIL tick orphan (memory not returned)", 46); return 0; }
+    kprintln("kstack: tick orphan OK", 22);
+    return 0;
+}
+
 fn kstack_selftest_verify() {
     if (kst_setup_ok == 0) { kprintln("kstack: FAIL setup did not complete", 35); return 0; }
     kst_accel_line();
@@ -7831,6 +8003,7 @@ fn kstack_selftest_verify() {
     kst_phase_kickdpl0();
     kst_phase_isrclac();                                # after frame (mode 1) and pause (mode 5): the AC samples
     kst_phase_rmw();
+    kst_phase_tickorphan();                             # 1.57.13 (k.132 (3)): a tick-killed orphan never spins on fs_lock
     kprint("kstack: isr samples=", 20); kprint_num(kst_isr_samples);
     kprint(" bad=", 5); kprint_num(kst_isr_bad); kprintln("", 0);
     if (kst_isr_samples > 0 && kst_isr_bad == 0) { kprintln("kstack: isr cannot block OK", 27); } else { kprintln("kstack: FAIL isr body preemptible", 33); }

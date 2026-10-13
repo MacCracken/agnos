@@ -17,7 +17,9 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+# 1.57.13 review: siblings as doom/naad resolve them — <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> (a worktree holds no sibling).
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
 FP_ROOT="$ROOT/tests/fp"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
@@ -28,9 +30,10 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd stri
 done
 
 echo "[1/4] Building fpex (--agnos) + the FP_RING3_SELFTEST kernel..."
-( cd "$FP_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build fpex.cyr build/fpex --agnos ) >/tmp/fpex-build.log 2>&1 || { echo "  BUILD-FAIL (fpex)"; tail -5 /tmp/fpex-build.log; exit 1; }
-if ! env FP_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/fpex-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/fpex-kbuild.log)"; tail -5 /tmp/fpex-kbuild.log; exit 1
+mkdir -p "$ROOT/build"   # 1.57.13 review: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+( cd "$FP_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build fpex.cyr build/fpex --agnos ) >"$ROOT/build/fpex-build.log" 2>&1 || { echo "  BUILD-FAIL (fpex)"; tail -5 "$ROOT/build/fpex-build.log"; exit 1; }
+if ! env FP_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/fpex-kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $ROOT/build/fpex-kbuild.log)"; tail -5 "$ROOT/build/fpex-kbuild.log"; exit 1
 fi
 
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"

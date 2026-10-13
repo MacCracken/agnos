@@ -6,6 +6,10 @@
 # Seeded as /bin/agnsh (the driver, launched by kybernet on a PLAIN kernel — D19) AND /bin/sockw (every child role,
 # selected by argv). scripts/smoke/sock-wait-smoke.sh seeds /sw/mode ("all" | "wire" | "d" = N6 only), /sw/hostport (a host sink on
 # 127.0.0.1, reached as 10.0.2.2) and /sw/closedport (a host port nothing listens on: SLIRP answers with RST).
+# ⭐ 1.57.13: mode "t" (scripts/smoke/sock-send-dl-smoke.sh) runs N0 + N11-N13 only — sock_send_dl#109, the caller
+# ceiling (issue archived/2026-10-02-sock-send-ignores-the-caller-deadline.md) — against a local reader that reads
+# nothing (the 2 KB conn ring fills: a zero window) and, through /sw/stallport, a HOST peer that stops reading
+# (a tiny SO_RCVBUF; once SLIRP's buffer fills the window is 0). "all" does not run them (the sock-wait row is unchanged).
 # The driver prints `SOCKW-PHASE <name>` before each phase, CONTINUES after a FAIL (the verdict is the full list),
 # ends `SOCKW-DONE` then `SOCKW-EXIT 0` and exits 0 (a non-zero exit drops kybernet into the emergency shell).
 # Children are reaped with WAIT_BLOCK (#4 0x100|pid). Every timing is on uptime_us#95; #95 == -1 -> SOCKW-FAIL.
@@ -30,6 +34,7 @@ var S_HP = 0;
 var S_CP = 0;
 var S_WIRE = 0;         # /sw/mode "wire": N0 + N8 only
 var S_CLOSED = 18999;   # a local port nothing listens on (agnos sends no RST: the dial is silent)
+var S_SP = 0;           # 1.57.13 mode "t": the host stall peer's port (/sw/stallport)
 
 fn s_flush() { if (S_LN > 0) { syscall(1, 1, &s_lb, S_LN, 0); } S_LN = 0; return 0; }
 fn s_putc(ch) {
@@ -106,6 +111,7 @@ fn s_recv(c, b, n) { return syscall(49, c, b, n, 0); }
 fn s_close(c) { return syscall(50, c, 0, 0, 0); }
 fn s_netcfg(f) { return syscall(61, f, 0, 0, 0); }
 fn s_ping(ip, ms) { return syscall(100, ip, ms, 0, 0); }          # icmp_echo_ex#100
+fn s_send_dl(c, b, n, us) { return syscall(109, c, b, n, us); }   # sock_send_dl#109 (1.57.13): a4 = the ceiling, µs
 fn s_pat(i) { return (i * 7 + 3) & 0xFF; }
 
 # #99 cpu ticks (low 32 bits of +56) of `pid`, -1 if not listed.
@@ -135,6 +141,7 @@ fn s_readmode() {
     syscall(6, fd, 0, 0, 0);
     if (n > 0) { if (load8(&s_f) == 119) { S_WIRE = 1; } }            # 'w'
     if (n > 0) { if (load8(&s_f) == 100) { S_WIRE = 2; } }            # 'd': N6 only (a debugging knob)
+    if (n > 0) { if (load8(&s_f) == 116) { S_WIRE = 3; } }            # 't': N11-N13, sock_send_dl#109 (1.57.13)
     return 0;
 }
 
@@ -227,6 +234,7 @@ fn s_read_verify(c, slow, cap_us) {
             }
             if (bad == 0) { got = got + r; }
             if (slow == 1) { s_sleep(20); }
+            if (slow == 2) { s_sleep(50); }                         # 1.57.13 N11 trickle: ACK progress every ~50 ms
         } elif (r < 0) {
             break;
         } else {
@@ -322,6 +330,110 @@ fn role_pingsilent(ip, ms) {
     if (r != (0 - 1)) { return 1; }
     if (t < 1400000 || t > 2500000) { return 2; }
     return 0;
+}
+
+# sdl <ip> <port> <len>: sock_send_dl#109 (1.57.13) against a reader that reads nothing for 24 s (its 2 KB ring fills:
+# a zero window, then 1-byte persist probes the full ring drops — no ACK progress). Six calls on one conn:
+#   c1  300 ms ceiling, fresh conn     -> the committed count (the ring + the probe in flight) after ~300 ms
+#   c2  300 ms ceiling, c1's probe still in flight -> 0 after ~300 ms (it waits for the earlier segment first)
+#   c3  a NEGATIVE ceiling             -> 0 with no wait (a spent ceiling)
+#   c4  ceiling 0                      -> exactly #48: the committed count after the ~8 s D6 window
+#   c5  a ceiling ABOVE the D6 window  -> D6 still applies under it: back after ~8 s, not at the ceiling. LO passes
+#       20 s, IP passes INT64_MAX (the 2^40 clamp). The reader drains ~15 s after c5 starts, so a call that ignored
+#       D6 under a ceiling would come back > 12 s late (or at the 20 s ceiling) — never in the band.
+#   c6  ceiling 0, the rest            -> completes the stream once the reader drains
+# Exit bits: 1 = c1 out of [2048, len)  2 = c1 took out of [295 ms, 1.5 s]  4 = c2 not 0 or out of [295 ms, 1.5 s]
+# 8 = c3 not 0 or slower than 100 ms  16 = c4 < 0 or out of [7 s, 12 s]  32 = c1+..+c6 != len
+# 64 = c5 < 0 or out of [7 s, 12 s].
+# ("Never early" with a 5 ms allowance: uptime_us#95 and the kernel's sched_clock_us are two reads of the clock.)
+fn role_sdl(ip, port, len) {
+    s_fill();
+    var c = s_connect(ip, port, 0);
+    if (c < 0) { s_out("SOCKW-DL-NOCONN\n"); return 127; }
+    var sent = 0;
+    var t0 = s_us();
+    var n1 = s_send_dl(c, &s_big, len, 300000);
+    var t1 = s_us() - t0;
+    if (n1 > 0) { sent = n1; }
+    t0 = s_us();
+    var n2 = s_send_dl(c, &s_big + sent, len - sent, 300000);
+    var t2 = s_us() - t0;
+    if (n2 > 0) { sent = sent + n2; }
+    t0 = s_us();
+    var n3 = s_send_dl(c, &s_big + sent, len - sent, 0 - 1);
+    var t3 = s_us() - t0;
+    if (n3 > 0) { sent = sent + n3; }
+    t0 = s_us();
+    var n4 = s_send_dl(c, &s_big + sent, len - sent, 0);
+    var t4 = s_us() - t0;
+    if (n4 > 0) { sent = sent + n4; }
+    var ceil5 = 20000000;
+    if (ip != 0x7F000001) { ceil5 = 0x7FFFFFFFFFFFFFFF; }
+    t0 = s_us();
+    var n5 = s_send_dl(c, &s_big + sent, len - sent, ceil5);
+    var t5 = s_us() - t0;
+    if (n5 > 0) { sent = sent + n5; }
+    var tries = 0;
+    while (sent < len && tries < 4) {
+        var n6 = s_send_dl(c, &s_big + sent, len - sent, 0);
+        if (n6 < 0) { break; }
+        sent = sent + n6;
+        tries = tries + 1;
+    }
+    s_out("SOCKW-DL-RET"); s_kv("c1", n1); s_kv("us1", t1); s_kv("c2", n2); s_kv("us2", t2); s_kv("c3", n3);
+    s_kv("us3", t3); s_kv("c4", n4); s_kv("us4", t4); s_kv("c5", n5); s_kv("us5", t5); s_kv("sent", sent); s_nl();
+    s_close(c);
+    var e = 0;
+    if (n1 < 2048 || n1 >= len) { e = e | 1; }
+    if (t1 < 295000 || t1 > 1500000) { e = e | 2; }
+    if (n2 != 0 || t2 < 295000 || t2 > 1500000) { e = e | 4; }
+    if (n3 != 0 || t3 > 100000) { e = e | 8; }
+    if (n4 < 0 || t4 < 7000000 || t4 > 12000000) { e = e | 16; }
+    if (sent != len) { e = e | 32; }
+    if (n5 < 0 || t5 < 7000000 || t5 > 12000000) { e = e | 64; }
+    return e;
+}
+# sdltrickle <ip> <port> <len>: the ceiling is measured ONCE from entry, never re-armed by ACK progress. The reader
+# takes 512 B every ~50 ms (16 KB needs >= 1.6 s), so ACK progress arrives well inside every 300 ms: a ceiling
+# re-armed on progress (FreeBSD sbwait's per-wait sb_timeo; the issue's first sketch) would never fire and the call
+# would return `len` after ~1.6 s. Exit bits: 1 = c1 not in (0, len)  2 = c1 took out of [295 ms, 1.5 s]
+# 4 = the rest (ceiling 0) did not complete the stream.
+fn role_sdltrickle(ip, port, len) {
+    s_fill();
+    var c = s_connect(ip, port, 0);
+    if (c < 0) { s_out("SOCKW-DL-NOCONN\n"); return 7; }
+    var t0 = s_us();
+    var n1 = s_send_dl(c, &s_big, len, 300000);
+    var t1 = s_us() - t0;
+    var sent = 0;
+    if (n1 > 0) { sent = n1; }
+    var tries = 0;
+    while (sent < len && tries < 4) {
+        var n2 = s_send_dl(c, &s_big + sent, len - sent, 0);
+        if (n2 < 0) { break; }
+        sent = sent + n2;
+        tries = tries + 1;
+    }
+    s_out("SOCKW-DL-TRICKLE-RET"); s_kv("c1", n1); s_kv("us1", t1); s_kv("sent", sent); s_nl();
+    s_close(c);
+    var e = 0;
+    if (n1 <= 0 || n1 >= len) { e = e | 1; }
+    if (t1 < 295000 || t1 > 1500000) { e = e | 2; }
+    if (sent != len) { e = e | 4; }
+    return e;
+}
+# dlforeign <cid>: #109 on a conn this process does not own (the driver's) must be -1 every way — bounded, unbounded
+# and len 0 (ownership is checked FIRST, as on #48). Exit bits: 1 / 2 / 4 = the call that was not -1.
+fn role_dlforeign(cid) {
+    var r1 = s_send_dl(cid, "XXXXX", 5, 300000);
+    var r2 = s_send_dl(cid, "XXXXX", 5, 0);
+    var r3 = s_send_dl(cid, "XXXXX", 0, 300000);
+    s_out("SOCKW-DL-FOREIGN-CHILD"); s_kv("cid", cid); s_kv("r1", r1); s_kv("r2", r2); s_kv("r3", r3); s_nl();
+    var e = 0;
+    if (r1 != (0 - 1)) { e = e | 1; }
+    if (r2 != (0 - 1)) { e = e | 2; }
+    if (r3 != (0 - 1)) { e = e | 4; }
+    return e;
 }
 
 # ═════════════════════════════════════ DRIVER PHASES ═════════════════════════════════════
@@ -595,10 +707,139 @@ fn ph_n10(port) {
     return 0;
 }
 
+# N11 — sock_send_dl#109 (1.57.13): the ceiling against a local zero window, 0 = #48, a ceiling above the D6 window
+# still returns at D6, the stream stays exact.
+fn ph_n11(ip, port) {
+    var l = s_listen(port);
+    var p = s_spawn("sdl", ip, port, 16384);
+    var a = s_accept_wait(l);
+    var got = 0;
+    if (a >= 0) {
+        s_sleep(24000);                                             # c1-c5 take ~16.6 s; then drain everything
+        got = s_read_verify(a, 0, 20000000);
+        s_close(a);
+    }
+    var e = s_reap(p);
+    if (l >= 0) { s_close(l); }
+    if (e >= 0 && (e & 15) == 0) { s_ok("DL-BOUND-"); s_out(s_ipname(ip)); s_kv("exit", e & 15); s_nl(); }   # its own bits
+    else { s_fail("DL-BOUND-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
+    if (e >= 0 && (e & 16) == 0) { s_ok("DL-ZERO-IS-48-"); s_out(s_ipname(ip)); s_nl(); }
+    else { s_fail("DL-ZERO-IS-48-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
+    if (e >= 0 && (e & 64) == 0) { s_ok("DL-OVER-D6-"); s_out(s_ipname(ip)); s_nl(); }
+    else { s_fail("DL-OVER-D6-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
+    if (e >= 0 && (e & 32) == 0 && got == 16384) { s_ok("DL-STREAM-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_nl(); }
+    else { s_fail("DL-STREAM-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_kv("exit", e); s_nl(); }
+    return 0;
+}
+
+# N11t — the ceiling is a deadline from entry, not a progress window: a trickling reader cannot stretch the call.
+fn ph_n11t(ip, port) {
+    var l = s_listen(port);
+    var p = s_spawn("sdltrickle", ip, port, 16384);
+    var a = s_accept_wait(l);
+    var got = 0;
+    if (a >= 0) {
+        got = s_read_verify(a, 2, 20000000);
+        s_close(a);
+    }
+    var e = s_reap(p);
+    if (l >= 0) { s_close(l); }
+    if (e == 0 && got == 16384) { s_ok("DL-TRICKLE-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_nl(); }
+    else { s_fail("DL-TRICKLE-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_kv("exit", e); s_nl(); }
+    return 0;
+}
+
+# N12 — #109 on a conn the caller does not own is -1 and sends nothing; the owner's own #109 on it still works.
+fn ph_n12(port) {
+    var l = s_listen(port);
+    var c = 0 - 1;
+    var a = 0 - 1;
+    if (l >= 0) { c = s_connect(0x7F000001, port, 0); }
+    if (c >= 0) { a = s_accept_wait(l); }
+    var e = 0 - 999;
+    var leak = 0 - 999;
+    var own = 0 - 999;
+    var got = 0;
+    if (a >= 0) {
+        var p = s_spawn("dlforeign", c, 0 - 999999, 0 - 999999);
+        e = s_reap(p);
+        s_sleep(100);
+        leak = s_recv(a, &s_rb, 64);                                # 0: nothing arrived from the foreign calls
+        own = s_send_dl(c, "hello", 5, 300000);
+        var t0 = s_us();
+        while (got < 5 && s_us() - t0 < 2000000) {
+            var r = s_recv(a, &s_rb + got, 5 - got);
+            if (r > 0) { got = got + r; } elif (r < 0) { break; } else { s_sleep(1); }
+        }
+    }
+    if (a >= 0) { s_close(a); }
+    if (c >= 0) { s_close(c); }
+    if (l >= 0) { s_close(l); }
+    if (e == 0 && leak == 0 && own == 5 && got == 5) { s_ok("DL-FOREIGN-REFUSED"); s_nl(); }
+    else { s_fail("DL-FOREIGN-REFUSED"); s_kv("exit", e); s_kv("leak", leak); s_kv("own", own); s_kv("got", got); s_nl(); }
+    return 0;
+}
+
+# N13 — the wire: a HOST peer that stops reading (tiny SO_RCVBUF). Push 8 KB #109 calls (2 s ceiling) until one comes
+# back short: SLIRP's buffer and the host socket's are full, the window is 0. Then W1: a 300 ms ceiling returns the
+# committed count after ~300 ms; W2: ceiling 0 behaves as #48 (>= 7 s, the D6 window). A second dial tells the peer
+# to drain; a last 1-byte #109 returns 1 only once every byte before it is ACKed; the peer must receive exactly
+# `total` pattern bytes (the smoke compares SOCKW-DLW total= with HOST-STALL got=). Every send starts at stream
+# offset `total`: s_big + (total & 0xFF) carries s_pat(total) (s_pat has period 256).
+fn ph_n13() {
+    if (S_SP <= 0) { s_fail("DLW nostallport"); s_nl(); return 0; }
+    s_fill();
+    var c = s_connect(0x0A000202, S_SP, 0);
+    if (c < 0) { s_fail("DLW noconn"); s_nl(); return 0; }
+    var total = 0;
+    var calls = 0;
+    var full = 0;
+    var tp = s_us();
+    while (calls < 2000 && s_us() - tp < 60000000) {
+        var n = s_send_dl(c, &s_big + (total & 0xFF), 8192, 2000000);
+        calls = calls + 1;
+        if (n < 0) { break; }
+        total = total + n;
+        if (n < 8192) { full = 1; break; }
+    }
+    var tfill = s_us() - tp;
+    var t0 = s_us();
+    var n1 = s_send_dl(c, &s_big + (total & 0xFF), 8192, 300000);
+    var t1 = s_us() - t0;
+    if (n1 > 0) { total = total + n1; }
+    t0 = s_us();
+    var n2 = s_send_dl(c, &s_big + (total & 0xFF), 8192, 0);
+    var t2 = s_us() - t0;
+    if (n2 > 0) { total = total + n2; }
+    var g = s_connect(0x0A000202, S_SP, 0);                     # GO: the peer starts draining the first conn
+    if (g >= 0) { s_close(g); }
+    var fin = 0;
+    var tries = 0;
+    while (fin != 1 && tries < 6) {
+        fin = s_send_dl(c, &s_big + (total & 0xFF), 1, 0);
+        if (fin < 0) { break; }
+        tries = tries + 1;
+    }
+    if (fin == 1) { total = total + 1; }
+    s_sleep(2000);                                              # SLIRP ACKs from its own buffer: let it reach the host
+    s_out("SOCKW-DLW"); s_kv("total", total); s_kv("calls", calls); s_kv("full", full); s_kv("fill_us", tfill);
+    s_kv("w1", n1); s_kv("us1", t1); s_kv("w2", n2); s_kv("us2", t2); s_kv("go", g); s_kv("fin", fin); s_nl();
+    s_close(c);
+    s_sleep(1000);                                              # the FIN reaches the peer before the driver exits
+    if (full == 1 && n1 >= 0 && t1 >= 295000 && t1 <= 1500000) { s_ok("DLW-BOUND"); s_kv("us", t1); s_nl(); }
+    else { s_fail("DLW-BOUND"); s_kv("full", full); s_kv("w1", n1); s_kv("us", t1); s_nl(); }
+    if (n2 >= 0 && t2 >= 7000000) { s_ok("DLW-ZERO-IS-48"); s_kv("us", t2); s_nl(); }
+    else { s_fail("DLW-ZERO-IS-48"); s_kv("w2", n2); s_kv("us", t2); s_nl(); }
+    if (fin == 1 && g >= 0) { s_ok("DLW-DRAINED"); s_kv("total", total); s_nl(); }
+    else { s_fail("DLW-DRAINED"); s_kv("go", g); s_kv("fin", fin); s_nl(); }
+    return 0;
+}
+
 fn s_driver() {
     s_readmode();
     S_HP = s_readnum("/sw/hostport");
     S_CP = s_readnum("/sw/closedport");
+    if (S_WIRE == 3) { S_SP = s_readnum("/sw/stallport"); }
     if (syscall(35, &s_si, 128, 0, 0) == 0) { S_NCPU = load64(&s_si + 32); }
     if (S_NCPU < 1) { S_NCPU = 1; }
     if (S_NCPU > 4) { S_NCPU = 4; }
@@ -614,6 +855,11 @@ fn s_driver() {
         s_phase("N8"); ph_n8();
     } elif (S_WIRE == 2) {
         s_phase("N6"); ph_n6(0x7F000001);
+    } elif (S_WIRE == 3) {
+        s_phase("N11"); ph_n11(0x7F000001, 19161); ph_n11(S_IP, 19162);
+        ph_n11t(0x7F000001, 19163); ph_n11t(S_IP, 19164);
+        s_phase("N12"); ph_n12(19171);
+        s_phase("N13"); ph_n13();
     } else {
         s_phase("N1"); ph_n1(0x7F000001, 19101); ph_n1(S_IP, 19102);
         s_phase("N2"); ph_n2(0x7F000001, 19111); ph_n2(S_IP, 19112);
@@ -646,6 +892,9 @@ fn main(): i64 {
         if (s_eq(r, "dial") == 1) { return role_dial(a, b); }
         if (s_eq(r, "ping") == 1) { return role_ping(a, b, c); }
         if (s_eq(r, "pingsilent") == 1) { return role_pingsilent(a, b); }
+        if (s_eq(r, "sdl") == 1) { return role_sdl(a, b, c); }
+        if (s_eq(r, "dlforeign") == 1) { return role_dlforeign(a); }
+        if (s_eq(r, "sdltrickle") == 1) { return role_sdltrickle(a, b, c); }
         s_out("SOCKW-CHILD-BAD-ROLE\n");
         return 98;
     }

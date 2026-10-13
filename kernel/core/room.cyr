@@ -39,7 +39,8 @@
 # a slot whose declaration, poison or name disagree, any `&NAME` left in kernel/, and the array coming back into the
 # image as `var NAME[N]`.
 # aarch64: this file is in agnos.cyr's x86_64 block only. The shared files' pointers (klug_buf, sec_wfile_buf) stay
-# their poison there — an aarch64 room_init belongs to the 1.6x port (the aarch64 build does not link today).
+# their poison there — an aarch64 room_init belongs to the 1.6x port (the aarch64 build compiles and links since
+# 1.57.13, arch/aarch64/stubs.cyr; nothing boots it, and no aarch64 path calls room_init, so the poison stands).
 
 var ROOM_POISON = 0xFFFFA00000000000;   # slot SS's pointer is ROOM_POISON + (SS << 32) until room_init
 var ROOM_MAGIC  = 0x4D4F4F52534F4E47;   # "GNOSROOM" — header word 0 (DMA_SHADOW_SELFTEST reads it under a shadow CR3)

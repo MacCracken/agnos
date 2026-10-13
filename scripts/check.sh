@@ -87,6 +87,19 @@ echo ""
 echo "--- Build ---"
 sh "$ROOT/scripts/build.sh" > /dev/null 2>&1 && rc=0 || rc=$?
 check "x86_64 build" $rc
+# ⭐ 1.57.13 — the aarch64 build, with the unresolved-call placeholder gate (scripts/check/placeholder-check.sh).
+# aarch64 compiles and links since 1.57.13, and cycc_aarch64's own "OK" cannot be trusted: it drops an undefined
+# function whose first reference sits in a dead fn from its refusal, without a warning, and emits every call to it as
+# `udf #0` — the build said OK over 103 of them before the 1.57.13 stubs. build.sh --aarch64 scans its image and
+# REFUSES a holed one (exit 1), so this row goes red when a shared file reaches a name the aarch64 stubs do not
+# define. Nothing else that runs automatically sees it: test.sh is x86-only here and in CI, and release.yml's compile
+# test is soft. ⚠ Not vacuous on a build.sh that lost its gate: the row also requires the gate's own PASS line.
+# Compiles is not boots — nothing boots this image (the port is 1.6x).
+A64_LOG="$CHECK_LOGS/aarch64-build.log"
+sh "$ROOT/scripts/build.sh" --aarch64 > "$A64_LOG" 2>&1 && A64_RC=0 || A64_RC=$?
+[ "$A64_RC" = "0" ] && grep -q '^  placeholders: PASS: aarch64: 0 unresolved-call placeholders' "$A64_LOG" && rc=0 || rc=1
+check "aarch64 compiles with no unresolved calls (build.sh --aarch64 + placeholder gate)" $rc
+[ "$rc" = "0" ] || { echo "    build.sh --aarch64 exited $A64_RC — the tail of $A64_LOG:"; tail -n 15 "$A64_LOG" | sed 's/^/    /'; }
 
 # Source hygiene
 # kprint/kprintln take (string, length) and the compiler does NOT verify the two agree — short truncates the
@@ -372,7 +385,8 @@ check "host ZFS codec oracle (checksums, lz4/lzjb/zle/inflate, ZAP hash, writer 
 # CI break the first gate in this file exists for), an unreachable kashi checkout, a cycc that is not
 # on PATH — reads here as a clean tree. That is the same shape as the 1.56.44 gates found unrunnable.
 # The build rc is now captured and asserted, and the number of build-output lines grep actually
-# scanned is PRINTED beside the verdict: a healthy x86_64 build emits 8 non-empty lines (measured), a
+# scanned is PRINTED beside the verdict: a healthy x86_64 build emits 8 non-empty lines (measured then; 10 at 1.57.13,
+# build.sh's placeholder-gate line among them), a
 # build that died before invoking the compiler emits 3, so a run reporting "3 build lines scanned" is
 # reporting that its own producer died rather than that the tree is clean. Floor set at 5 — three
 # lines of headroom under the healthy count, two above the dead one.
@@ -387,7 +401,7 @@ ARITY_VAC=""
 [ "$ARITY_BUILD_RC" = "0" ] \
     || ARITY_VAC="build.sh exited $ARITY_BUILD_RC — a build that did not compile emits no arity warnings, so an empty result here is not evidence"
 [ -n "$ARITY_VAC" ] || [ "$ARITY_LINES" -ge 5 ] \
-    || ARITY_VAC="build.sh produced $ARITY_LINES non-empty line(s); this gate is vacuous below 5 (a healthy build emits 8)"
+    || ARITY_VAC="build.sh produced $ARITY_LINES non-empty line(s); this gate is vacuous below 5 (a healthy build emits 10)"
 [ -z "$ARITY_VAC" ] && [ -z "$ARITY" ] && rc=0 || rc=$?
 check "call arity (no cycc argument-count warnings; $ARITY_LINES build lines scanned)" $rc
 [ -z "$ARITY_VAC" ] || echo "    VACUOUS: $ARITY_VAC — see $ARITY_LOG"

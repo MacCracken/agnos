@@ -11,7 +11,9 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+# 1.57.13 review: siblings as doom/naad resolve them — <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> (a worktree holds no sibling).
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
 
 OVMF_CODE=""
 for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do
@@ -38,6 +40,8 @@ fi
 
 W="$ROOT/build/fb-ansi-screendump"
 rm -rf "$W"; mkdir -p "$W"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # 1.57.13: short socket paths (smoke_qsock: sun_path is 108 bytes)
+VNC_SOCK=$(smoke_qsock "$W/vnc.sock"); MON_SOCK=$(smoke_qsock "$W/mon.sock")
 ESP="$W/esp.img"
 dd if=/dev/zero of="$ESP" bs=1M count=64 status=none
 parted -s "$ESP" mklabel gpt mkpart ESP fat32 1MiB 100% set 1 esp on >/dev/null 2>&1
@@ -52,8 +56,8 @@ qemu-system-x86_64 -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$W/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "virtio-blk-pci,drive=esp0" \
-    -vnc "unix:$W/vnc.sock" \
-    -monitor "unix:$W/mon.sock,server,nowait" \
+    -vnc "unix:$VNC_SOCK" \
+    -monitor "unix:$MON_SOCK,server,nowait" \
     -serial "file:$W/serial.log" -no-reboot >/dev/null 2>&1 &
 QPID=$!
 
@@ -76,7 +80,7 @@ for i in $(seq 1 20); do
     sleep 1
     grep -aq "fb-ansi-visual: painted" "$W/serial.log" 2>/dev/null && { PAINTED=1; break; }
 done
-python3 - "$W/mon.sock" "$W/ansi.ppm" <<'PY'
+python3 - "$MON_SOCK" "$W/ansi.ppm" <<'PY'
 import socket, sys, time
 sock, out = sys.argv[1], sys.argv[2]
 s = socket.socket(socket.AF_UNIX); s.connect(sock); time.sleep(0.4)

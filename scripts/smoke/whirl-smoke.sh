@@ -21,7 +21,9 @@ set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+# 1.57.13 review: siblings as doom/naad resolve them — <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> (a worktree holds no sibling).
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
 
 OVMF_CODE_CANDIDATES="/usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd"
 OVMF_VARS_CANDIDATES="/usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd"
@@ -42,7 +44,8 @@ ROOTFS="$ROOT/build/rootfs"
 [ -f "$ROOTFS/bin/whirl" ] || { echo "ERROR: $ROOTFS/bin/whirl missing — run stage-tools.sh --build"; exit 1; }
 
 WORK="$ROOT/build/whirl-smoke"; rm -rf "$WORK"; mkdir -p "$WORK"
-IMG="$WORK/agnos-whirl.img"; SER="$WORK/serial.log"; MON="/tmp/agnos-whirl-mon.sock"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # 1.57.13: short socket path (smoke_qsock, qemu-dwell.sh: sun_path is 108 bytes) — it was a fixed /tmp name every tree shared
+IMG="$WORK/agnos-whirl.img"; SER="$WORK/serial.log"; MON=$(smoke_qsock "$WORK/mon.sock")
 PART_OFFSET=$(( 33 * 1048576 )); PART_BYTES=$(( 95 * 1048576 )); PART_BLOCKS=$(( PART_BYTES / 4096 ))
 EXT2_FEATURES="${EXT2_FEATURES:-^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg}"
 

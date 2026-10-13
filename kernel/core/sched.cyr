@@ -1662,6 +1662,60 @@ fn proc_sig_locked(t, sig, lm, tree) {
     atomic_or64(&proc_signals + t * 8, 1 << sig);                       # SIGTERM & co: a bit, no default action (D3)
     return 0;
 }
+
+# ═══════════════ 1.57.13 — SIGWINCH (28): THE CONSOLE GRID CHANGED (issue 2026-10-12-console-grid-changes-without-sigwinch) ═══════════════
+# fb_set_geom (fb_console.cyr) compares fb_winsize() before and after its stores and answers 1 ONLY when the packed
+# (cols, rows) changed — Linux tty_do_resize's shape (drivers/tty/tty_io.c: memcmp the old winsize, return when equal,
+# else kill_pgrp(SIGWINCH)), so a same-grid modeset or the boot matcher's idempotent second call stays silent. Its
+# CALLER posts, once its console is settled (mdo_native after the clear and its lines, gpu_scanout_matchgeom after the
+# clear and the klug replay): a watcher that redraws on the signal must never have the redraw wiped by a later clear.
+# ⛔ WHO RECEIVES IT: a live USER process holding a signalfd#18 whose mask has bit 28 — nobody else. Under D3 a signal
+# is a bit with no default action that stays pending until a signalfd read clears it, so a bit posted to every process
+# would sit pending forever in each non-consumer — and a signalfd or an epoll_wait#21 it opened later would report that
+# stale bit as a fresh resize. (pause#14 does not read pending bits — lifecycle_pending_self is kill/stop only — so it
+# is not what this protects.) A signalfd is an fd: a child forked or spawned without SPAWN_F_CLEANFD inherits a copy of
+# its parent's bit-28 signalfd (vfs_fd_inherit) and is a watcher too, as under Linux. Linux reaches the same place by
+# another road: SIGWINCH's default action is "ignore" and kernel/signal.c sig_ignored() DROPS an ignored signal at generation
+# unless it is BLOCKED — and a signalfd consumer blocks it (darshana tty_open_signalfd: sigprocmask SIG_BLOCK, then
+# signalfd). Here the signalfd IS the consumer, so "holds a watching signalfd" is the whole test (FreeBSD tdsendsignal
+# also forgets an ignored signal immediately).
+# Posted through the existing atomic OR (D-4: vfs_read_signalfd clears one bit with `lock and`). sched_lock (the IF=0
+# innermost leaf, kbd_irq_save first like proc_signal_deliver) holds the liveness test against a death publish; the fd
+# tables are only READ (an 8-byte tag + an 8-byte mask per entry), so a racing close or open costs at most one stray or
+# one missed bit, never a fault. No wake: a pending bit wakes nobody (D3); a watcher polls its signalfd (epoll_wait#21
+# reports it readable). Returns how many processes got the bit (the TTY_SELFTEST knob prints it).
+fn proc_watches_sig(pid, sig) {
+    var ws_t = vfs_fd_table_of(pid);
+    var ws_fd = 0;
+    while (ws_fd < 32) {
+        var ws_b = ws_t + ws_fd * 32;
+        if (ktag(ws_b) == VFS_SIGNALFD) {
+            if (((kpayload(ws_b, 2) >> sig) & 1) == 1) { return 1; }
+        }
+        ws_fd = ws_fd + 1;
+    }
+    return 0;
+}
+fn console_winch_post() {
+    var wp_n = 0;
+    var wp_f = kbd_irq_save();
+    sched_spin_lock();
+    var wp_q = 0;
+    while (wp_q < proc_count) {
+        if (lc_st(wp_q) != 0 && lc_dying_done(wp_q) == 0) {   # 1.57.13 merge: a tick death waiting DYING for its owed reap is not a watcher
+            if (proc_is_user(wp_q) == 1) {
+                if (proc_watches_sig(wp_q, SIG_WINCH) == 1) {
+                    atomic_or64(&proc_signals + wp_q * 8, 1 << SIG_WINCH);
+                    wp_n = wp_n + 1;
+                }
+            }
+        }
+        wp_q = wp_q + 1;
+    }
+    sched_spin_unlock();
+    kbd_irq_restore(wp_f);
+    return wp_n;
+}
 # The kill#16 body (1 <= sig <= 63; flags 0 or KILL_TREE). Authorization is RE-CHECKED under the lock (no TOCTOU vs a
 # recycle). KILL_TREE: the root plus every epoch-validated descendant in the SAME hold — the member set and every
 # transition are one snapshot, and a birth racing it either is in the set or sees its creator's mark (proc_birth_check).
@@ -1719,8 +1773,11 @@ fn lifecycle_after_unlock(lm) {
 
 # (B) THE TICK — timer_handler on EVERY CPU, between its preempt_enable and do_context_switch, with the pid it already
 # read. ⛔ INV-L2: it acts ONLY on a CPL3-interrupted frame. That is what makes it legal for the death chain to take,
-# from the timer ISR, locks the smp.cyr banner otherwise calls non-ISR (proctab, fs via proc_destroy_fd_table, heap,
-# pmm, flock, chan/snd/shm, console if a callee kprints): a CPU interrupted in ring 3 holds no kernel lock, so no
+# from the timer ISR, locks the smp.cyr banner otherwise calls non-ISR (proctab, flock, chan/snd/shm, console if a
+# callee kprints, pmm only through shm_release_pid -> shm_free's 2 MB release — and, until 1.57.13, fs / heap / pmm
+# through an orphan's or a zombie child's reap: those reaps are now OWED to a process context, syscall.cyr
+# proc_orphan_owed_run, because fs_lock is held for whole ZFS commits and this ISR spun on it with the vector in
+# service — design k.132 (3); no fs_lock and no heap lock since): a CPU interrupted in ring 3 holds no kernel lock, so no
 # same-CPU holder can exist; other-CPU holders are ordinary contention (fault_kill_current runs the same chain from a
 # CPL3 exception on the same argument). do_context_switch's early-out guards are replicated: if it would not switch, a
 # death here would iretq a dead process. Returns the action (0 none · 1 died · 2 stopped · 3 dropped a stop).
@@ -1777,14 +1834,20 @@ fn proc_tick_lifecycle(isr_rsp, tl_p) {
 fn proc_b1_check(me) {
     if (me < 0) { return 0; }
     if (me >= 16) { return 0; }
-    if ((load64(&proc_kill_pending + me * 8) | load64(&proc_stop_pending + me * 8) | klug_spill_owed | zfs_wp_owed) == 0) { return 0; }
+    if ((load64(&proc_kill_pending + me * 8) | load64(&proc_stop_pending + me * 8) | klug_spill_owed | zfs_wp_owed | proc_orphan_owed) == 0) { return 0; }
     return proc_b1(me);
 }
 # A stop parks here with the syscall's result preserved on the process's own kernel stack; after SIGCONT the syscall
 # returns its real value (kill(self, 19) returns 0). A kill never returns.
 fn proc_b1(me) {
+    if (proc_orphan_owed != 0) { proc_orphan_owed_run(); }   # 1.57.13 (k.132 (3)): the reaps a tick death owed (syscall.cyr)
     if (klug_spill_owed != 0) { klug_spill_owed_run(); }
     if (zfs_wp_owed != 0) { zfs_wp_owed_run(); }    # 1.57.12 B11 review: a ZFS commit a death in the timer ISR owed
+    # 1.57.13 (review of k.135): no kill and no stop pending for me -> lc_park_action is CONTINUE; skip its sched_lock.
+    # While an owed runner keeps refusing a busy fs_lock, EVERY syscall exit on every CPU comes through here — they must
+    # not all queue on sched_lock for a CONTINUE. The same lock-free read proc_b1_check made a moment ago (a kill that
+    # lands after it is taken at the next tick on a CPL3 frame, or the next B1, as it always was).
+    if ((lc_kp(me) | lc_sp(me)) == 0) { return 0; }
     if (lifecycle_park_or_abort(me, VIA_B1) == 0) { return 0; }
     var b1_k = lc_kp(me);
     proc_exit_current(128 + b1_k, b1_k);
@@ -2050,6 +2113,20 @@ fn execwait_note_first() {
 var sched_idle_refusals[4];   # consecutive "found READY work but the yield refused" per CPU (reset on a hlt / a yield)
 var sched_idle_refused_said = 0;
 fn sched_idle_step() {
+    # ⭐ 1.57.13 (k.132 (3)): an idle CPU reaps what a tick death owed (syscall.cyr proc_orphan_owed_run) — process
+    # context, no lock held, BEFORE the cli below; so a tick-killed orphan's memory and pipes come back even when no
+    # process makes a syscall (Linux: the next task on the CPU, the idle included, drops a dead task's mm in
+    # finish_task_switch). Here, not in kernel_idle_loop: an AP's idle is its ap_entry context, which loops on this step
+    # directly (smp.cyr) — measured: with the drain in kernel_idle_loop only, no AP ever ran it. One load when nothing
+    # is owed. The drain never waits for fs_lock (it trylocks) and runs preempt-held from claim to publish (its banner).
+    # ⛔ AT IF=1 (review): the step is re-entered IF=0 after its own `sti; pause; cli` returns (the fenced-READY and
+    # refused-yield paths below), and the drain's fence spin and leaf locks must not run with this CPU deaf to its tick
+    # and its IPIs. The idle holds no lock and no preempt count here, so opening interrupts is what its hlt does anyway.
+    # REGISTER CONTRACT: `sti` — no inputs, no outputs, no GPR touched (RFLAGS.IF only).
+    if (proc_orphan_owed != 0) {
+        asm { 0xFB; }
+        proc_orphan_owed_run();
+    }
     asm { 0xFA; }                                      # cli — contract: no inputs/outputs; closes the check->hlt window
     var is_c = pcpu_cpu();                             # the idle is pinned: this is its only CPU
     if (is_c < 4) { store64(&cpu_in_halt + is_c * 8, 1); store64(&cpu_kickable + is_c * 8, 1); }
@@ -2322,6 +2399,9 @@ fn t8_reset() {
     kbd_line_ep = 0;
     kbd_line_waiters = 0;
     nbline_pos = 0;
+    kbd_line_mode = 0;                                 # 1.57.13: console_mode#110's mode and its holder
+    kbd_mode_holder = 0;
+    kbd_mode_ep = 0;
     kb_tail = kb_head;
     return 0;
 }
@@ -2431,6 +2511,36 @@ fn test_kbd() {
     test_assert(t8f_line == 1, "T8f the NB line is hi LF", 24);
     test_assert_eq(t8f_o3, 0, "T8f the completed line released the line", 40);
     test_assert_eq(t8f_t2, 1, "T8f another reader can take it now", 34);
+    # T8g (1.57.13 review) — console_mode#110's mode is the CONSOLE's: a LIVE holder's NOECHO applies to every reader
+    # and never holds the line; a dead holder's (stale epoch) is no mode; the holder's death path clears it. Then
+    # kb_read_scancode on an EMPTY ring answers 0 and leaves kb_tail alone (the under-lock re-check a FLUSH or a second
+    # consumer racing kb_has_key needs — without it kb_tail stepped past kb_head and 255 old scancodes replayed).
+    kbd_line_mode = 1;
+    kbd_mode_holder = tk_i + 1;
+    kbd_mode_ep = proc_epoch_get(tk_i);
+    var t8g_s1 = kbd_echo_suppressed();
+    var t8g_o1 = kbd_line_try_take(tk_k);
+    kbd_line_release(tk_k);
+    var t8g_o2 = kbd_line_owner;
+    kbd_mode_ep = proc_epoch_get(tk_i) + 1;
+    var t8g_s2 = kbd_echo_suppressed();
+    kbd_mode_ep = proc_epoch_get(tk_i);
+    kbd_line_release_pid(tk_i);
+    var t8g_m = kbd_line_mode;
+    var t8g_h = kbd_mode_holder;
+    t8_reset();
+    var t8g_t0 = kb_tail;
+    var t8g_sc = kb_read_scancode();
+    var t8g_t1 = kb_tail;
+    t8_reset();
+    test_assert_eq(t8g_s1, 1, "T8g a live holder's NOECHO applies to every reader", 50);
+    test_assert_eq(t8g_o1, 1, "T8g the mode does not hold the line", 35);
+    test_assert_eq(t8g_o2, 0, "T8g a release frees the line under a mode", 41);
+    test_assert_eq(t8g_s2, 0, "T8g a stale-epoch holder's mode is no mode", 42);
+    test_assert_eq(t8g_m, 0, "T8g the holder's death clears the mode", 38);
+    test_assert_eq(t8g_h, 0, "T8g the holder's death clears the holder", 40);
+    test_assert_eq(t8g_sc, 0, "T8g an empty-ring read answers 0", 32);
+    test_assert_eq(t8g_t1, t8g_t0, "T8g an empty-ring read leaves kb_tail alone", 43);
     return 0;
 }
 

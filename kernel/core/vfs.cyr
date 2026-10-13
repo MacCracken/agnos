@@ -279,6 +279,18 @@ fn proc_destroy_fd_table(pid, do_flush) {
     # and the selftests).
     preempt_disable();
     fs_spin_lock();
+    proc_destroy_fd_table_held(pid, do_flush);
+    fs_spin_unlock();
+    preempt_enable();
+    return 0;
+}
+# ⭐ 1.57.13 (review of k.135) — THE BODY, fs_lock HELD BY THE CALLER (preempt raised by the lock). proc_destroy_fd_table
+# is the lock bracket around it; the owed orphan drain (syscall.cyr proc_orphan_owed_run) calls it directly under the
+# fs_lock it WON with fs_spin_trylock, so its check and its take are one step and it never waits for a commit.
+fn proc_destroy_fd_table_held(pid, do_flush) {
+    var t = proc_fd_base_get(pid);
+    if (t == 0) { return 0; }
+    if (t == &vfs_table) { proc_fd_base_set(pid, 0); return 0; }
     var fd = 0;
     while (fd < 32) {
         var base = t + fd * 32;
@@ -304,8 +316,6 @@ fn proc_destroy_fd_table(pid, do_flush) {
     # must never walk a table block that is already back on the slab free list.
     proc_fd_base_set(pid, 0);
     kfree_sized(t, 1024);
-    fs_spin_unlock();
-    preempt_enable();
     return 0;
 }
 
@@ -846,7 +856,10 @@ fn vfs_read_signalfd(base, buf, count) {
     var pending = load64(&proc_signals + proc_current_get() * 8);
     var matched = pending & sigmask;
     if (matched == 0) { return 0; }
-    for (var s = 1; s < 32; s = s + 1) {
+    # ⛔ 1.57.13: the walk covers EVERY signal kill#16 can post (1..63). It stopped at 31, so a signalfd watching a
+    # signal >= 32 saw `matched != 0`, found no bit and answered 0 ("nothing pending") forever while the bit stayed
+    # pending — the record was unreadable and the pending bit never cleared. Found beside SIGWINCH's delivery path.
+    for (var s = 1; s < 64; s = s + 1) {
         var bit = 1 << s;
         if ((matched & bit) != 0) {
             # ⛔ 1.57.7 (S7, D-4): clear ONE bit ATOMICALLY. This stored the stale `pending` snapshot back, erasing
@@ -1280,8 +1293,17 @@ fn pipe_ends_open(buf, wend) {
         # sets it, so skipping pid 0 made an OPEN write end invisible and the selftest's
         # "empty with a live writer" assertion failed. Only SPAWNED procs can be dead-but-unreaped,
         # and they are the only ones this exclusion exists for.
+        # ⛔ 1.57.13 (review of k.132 (3)) — NOR IS A DYING (4) TABLE WHOSE DEATH IS DONE. A tick death now leaves its own
+        # slot, and every zombie child it had, in state 4 with the table still attached until a process context reaps it
+        # (syscall.cyr proc_orphan_owed_run) — and a zombie moved 0 -> 4 had already given this scan its EOF / EPIPE.
+        # Counting those tables WITHDREW that answer: a reader beside a dead writer blocked again, a writer beside a dead
+        # reader kept filling the pipe, until the drain ran. lc_done == 1 is the final hold's mark (proc_death_finish,
+        # under proctab + sched, scrubbed at the slot's next alloc), so a 4 whose death is done is dead in every sense;
+        # a 4 still mid-death (a CLAIMED target, done 0) keeps counting, exactly as before.
         if (pid > 0) {
-            if (proc_get_state(pid) == 0) { tbl = 0; }
+            var pe_s = proc_get_state(pid);
+            if (pe_s == 0) { tbl = 0; }
+            if (lc_dying_done(pid) == 1) { tbl = 0; }               # proc.cyr: a 4 whose death is done
         }
         if (tbl != 0) {
             var f = 0;
