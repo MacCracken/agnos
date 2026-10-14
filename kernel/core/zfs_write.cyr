@@ -5871,21 +5871,34 @@ fn zfs_wp_sync() {
 # (B11 review) THE EXIT HOOK (syscall.cyr proc_death_release — every death: exit#0, a fault, a kill at B1, a claim, a
 # wait's ABORT, the tick): a pending txg one of the dying process's ZFS fds names commits ("exit") BEFORE the death is
 # published — not when a parent reaps it, which a parent that never waits never does. Inside an interrupt handler (isr
-# 1: VIA_TICK, D-34 — IF=0, the timer vector in service; or wherever apic_in_service says so) nothing commits: the
-# commit is OWED (zfs_wp_owed) to the next B1 of any process (sched.cyr proc_b1, as klug_spill_owed) and ages the
-# pending txg for every ZFS entry meanwhile (zfs_wp_aged); sync#12 / power_flush commit it as ever. Takes fs_lock — no
-# caller holds it (proc_destroy_fd_table's contract, which the orphan's reap runs from the same paths). 0.
+# 1: VIA_TICK, D-34 — IF=0, the timer vector in service; or wherever apic_in_service says so) nothing commits and
+# fs_lock is not taken: the commit is OWED (zfs_wp_owed) to the next B1 of any process (sched.cyr proc_b1, as
+# klug_spill_owed) and ages the pending txg for every ZFS entry meanwhile (zfs_wp_aged); sync#12 / power_flush commit it
+# as ever. A ring-3 fault (VIA_FAULT) commits here like exit#0 (isr 0: its exception handler is exit#0's context class).
+# Takes fs_lock — no caller holds it (proc_destroy_fd_table's contract, which the orphan's reap runs from the same
+# paths) — ⭐ 1.57.14: ONLY for a table that holds a ZFS FILE fd at all (the lock-free look below, every path). Until
+# 1.57.14 it took fs_lock first, so with a pool imported EVERY death — exit#0, a fault, a kill at B1, a claim — waited
+# out any other CPU's commit at IF=0, ZFS fds or not. ⛔ The look is on the fd's TYPE, never on zfs_wp_ref: zfs_commit
+# clears zfs_wp_ref FIRST and holds fs_lock for the whole commit, so "no fd names zfs_wp_ref" read without the lock
+# cannot tell "nothing pending" from "being committed right now" — and the second must be waited out under the lock
+# before the publish (durable at exit). A table with no ZFS file fd has nothing for this hook either way. 0.
 fn zfs_release_pid(pid, isr) {
     var t = proc_fd_base_get(pid);
     if (t == 0 || zfs_active == 0) { return 0; }
-    if (isr == 1 || apic_in_service() == 1) {
-        # no lock in the handler: a racy look — a stale zfs_wp_ref can only make the owed commit an early one
-        var k = 0;
-        while (k < 32) {
-            var b = t + k * 32;
-            if (ktag(b) == VFS_ZFS_FILE && zfs_wp_ref != 0 && kpayload(b, 2) == zfs_wp_ref) { zfs_wp_owed = 1; }
-            k = k + 1;
+    var zl = 0;                                   # 0 no ZFS file fd · 1 one at least · 2 one names zfs_wp_ref (racy)
+    var k = 0;
+    while (k < 32) {
+        var b = t + k * 32;
+        if (ktag(b) == VFS_ZFS_FILE) {
+            if (zl == 0) { zl = 1; }
+            if (zfs_wp_ref != 0 && kpayload(b, 2) == zfs_wp_ref) { zl = 2; }
         }
+        k = k + 1;
+    }
+    if (zl == 0) { return 0; }
+    if (isr == 1 || apic_in_service() == 1) {
+        # no lock in the handler: the racy look — a stale zfs_wp_ref can only make the owed commit an early one
+        if (zl == 2) { zfs_wp_owed = 1; }
         return 0;
     }
     preempt_disable();

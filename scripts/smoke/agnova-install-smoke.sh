@@ -13,8 +13,8 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-AGNOVA_ROOT="${AGNOVA_ROOT:-$ROOT/../agnova}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+AGNOVA_ROOT="${AGNOVA_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/agnova}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -23,15 +23,27 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd stri
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing tool '$tool'"; exit 1; }
 done
 
-echo "[1/4] Building agnova (--agnos) + the AGNOVA_INSTALL_SELFTEST kernel..."
-( cd "$AGNOVA_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 CYRIUS_NO_WARN_SHADOW_LIB=1 cyrius build --agnos src/main.cyr build/agnova-agnos ) >/tmp/agnova-build.log 2>&1 || { echo "  BUILD-FAIL (agnova --agnos)"; tail -8 /tmp/agnova-build.log; exit 1; }
-if ! env AGNOVA_INSTALL_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/agnova-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/agnova-kbuild.log)"; tail -8 /tmp/agnova-kbuild.log; exit 1
+[ -d "$AGNOVA_ROOT" ] || { echo "ERROR: agnova repo not found at $AGNOVA_ROOT (set AGNOVA_ROOT=)"; exit 1; }
+
+# ⛔ 1.57.14 — NEVER WRITE INTO THE SIBLING (naad-ring3-smoke.sh's rule since 1.57.13). agnova used to be built INSIDE
+# $AGNOVA_ROOT, so every run wrote build/agnova-agnos — and whatever `cyrius build` resolves (lib/, cyrius.lock) — into
+# the agnova repo. Now the sources it reads (cyrius.cyml, VERSION, cyrius.lock, src/, lib/, dist/ — never .git or
+# rust-old/) are copied to this tree's build/agnova-install-src/ and agnova is built there; the logs are the tree's
+# (they were fixed /tmp paths shared by every tree).
+ABUILD="$ROOT/build/agnova-install-src"; ALOG="$ROOT/build/agnova-install-logs"
+rm -rf "$ABUILD" "$ALOG"; mkdir -p "$ABUILD" "$ALOG"
+for _n in cyrius.cyml VERSION cyrius.lock src lib dist; do
+    [ -e "$AGNOVA_ROOT/$_n" ] && cp -a "$AGNOVA_ROOT/$_n" "$ABUILD/"
+done
+echo "[1/4] Building agnova (--agnos, from a copy of the agnova sources in build/agnova-install-src) + the AGNOVA_INSTALL_SELFTEST kernel..."
+( cd "$ABUILD" && mkdir -p build && CYRIUS_NO_WARN_PIN_DRIFT=1 CYRIUS_NO_WARN_SHADOW_LIB=1 cyrius build --agnos src/main.cyr build/agnova-agnos ) >"$ALOG/agnova-build.log" 2>&1 || { echo "  BUILD-FAIL (agnova --agnos, see $ALOG/agnova-build.log)"; tail -8 "$ALOG/agnova-build.log"; exit 1; }
+if ! env AGNOVA_INSTALL_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ALOG/kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $ALOG/kbuild.log)"; tail -8 "$ALOG/kbuild.log"; exit 1
 fi
 
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
-AGNOVA="$AGNOVA_ROOT/build/agnova-agnos"
+AGNOVA="$ABUILD/build/agnova-agnos"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
 [ -f "$AGNOVA" ]  || { echo "ERROR: agnova-agnos not built at $AGNOVA"; exit 1; }
 echo "  build/agnos $(stat -c %s "$AGNOS") B   /bin/agnova $(stat -c %s "$AGNOVA") B"

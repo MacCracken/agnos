@@ -72,7 +72,7 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
+GNOBOOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 
 for tool in qemu-system-x86_64 mformat mmd mcopy parted strings; do
@@ -85,8 +85,9 @@ OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x
 [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS_SRC" ] || { echo "ERROR: OVMF not found"; exit 1; }
 
 echo "[1/3] Building the SMP_STACK_SELFTEST kernel..."
-if ! env SMP_STACK_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/ap-stack-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/ap-stack-kbuild.log)"; tail -8 /tmp/ap-stack-kbuild.log; exit 1
+mkdir -p "$ROOT/build"   # 1.57.14: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+if ! env SMP_STACK_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/ap-stack-kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $ROOT/build/ap-stack-kbuild.log)"; tail -8 "$ROOT/build/ap-stack-kbuild.log"; exit 1
 fi
 [ -f "$AGNOS" ] || { echo "ERROR: agnos not built"; exit 1; }
 echo "  build/agnos $(stat -c %s "$AGNOS") B"

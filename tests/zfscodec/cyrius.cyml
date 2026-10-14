@@ -6,7 +6,7 @@ license = "GPL-3.0-only"
 language = "cyrius"
 # Tracks the ROOT pin (scripts/check/toolchain-pin-check.sh compares the strings): this binary
 # compiles the kernel's own codec source, so it must be built by the compiler the kernel is.
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 src = "zfscodec.cyr"
@@ -15,4 +15,10 @@ output = "build/zfscodec"
 # syscalls -> SYS_WRITE / SYS_EXIT, plus raw mmap (9) and mprotect (10) for the guard pages. Nothing
 # else: the codec under test may call only kernel/klib/kstring.cyr, which this program includes.
 [deps]
-stdlib = ["syscalls"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `syscalls` alone is NOT a closed set — it names `alloc` (since 6.6.6; CX-only under
+# `#ifdef CYRIUS_TARGET_CX` through 6.6.8, unconditional since 6.6.9), which names `atomic` + `fnptr` and, since
+# 6.6.18, `poison` (under `#ifdef CYRIUS_POISON`, never compiled here). `cyrius deps` walks includes textually, so
+# it resolved alloc/atomic/fnptr at the 6.6.6 pin too: this manifest was short BEFORE the move, which uncovered it.
+# `cyrius lib sync` copies only what is DECLARED, so the transitives are declared (the 1.57.2 tests/chan
+# precedent); `cyrius deps` vendoring 15 files where lib sync vendored 7 is how the 1.57.14 move measured it.
+stdlib = ["syscalls", "alloc", "atomic", "fnptr", "poison"]

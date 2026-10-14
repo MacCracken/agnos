@@ -21,8 +21,8 @@ set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-ARK_REPO="${ARK_REPO:-$ROOT/../ark}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+ARK_REPO="${ARK_REPO:-${SIBLINGS_ROOT:-$ROOT/..}/ark}"
 
 OVMF_CODE_CANDIDATES="
     /usr/share/edk2/x64/OVMF_CODE.4m.fd

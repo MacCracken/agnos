@@ -35,11 +35,13 @@
 import socket, struct, subprocess, sys, time, os, zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(ROOT, "scripts/harness"))   # 1.57.14: the harness helper (_qsock)
+from _qsock import qsock
 WORK = os.path.join(ROOT, "build/doom-smoke")
 IMG  = os.path.join(WORK, "agnos-doom.img")
 SER  = os.path.join(WORK, "serial-ingame.log")
 VARS = os.path.join(WORK, "vars-ingame.fd")
-MON  = "/tmp/agnos-doom-ingame.sock"
+MON  = qsock(os.path.join(WORK, "agnos-doom-ingame.sock"))  # 1.57.14: short + per-tree (_qsock.py) — a fixed /tmp name every tree shared
 PPM  = os.path.join(WORK, "doom-ingame.ppm")
 PPM_TITLE = os.path.join(WORK, "doom-title.ppm")
 PNG  = os.path.join(WORK, "doom-ingame.png")

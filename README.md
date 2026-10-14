@@ -270,7 +270,7 @@ agnos/
 ├── scripts/
 │   ├── build.sh             # Multi-arch wrapper around `cyrius build` (emits ELF64 multiboot2)
 │   ├── test.sh              # Build assertions (x86_64 / aarch64 / --all)
-│   ├── check.sh             # 11-point project validation
+│   ├── check.sh             # 40-gate project validation
 │   ├── bench.sh             # Bench harness
 │   └── version-bump.sh      # Versions all tracked files atomically (regenerates version.cyr)
 ├── docs/

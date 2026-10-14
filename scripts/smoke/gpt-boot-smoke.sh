@@ -18,8 +18,8 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-AGNOSHI="${AGNOSHI_ROOT:-$ROOT/../agnoshi}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+AGNOSHI="${AGNOSHI_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/agnoshi}"
 BLK_ROOT="$ROOT/tests/blk"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
@@ -44,10 +44,11 @@ P2_BLOCKS=$(( (P2_LAST - P2_FIRST + 1) * 512 / 4096 ))
 EXT2_FEATURES="^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg"
 
 echo "[1/6] Building gptwr (--agnos) + a PRODUCTION kernel + a GPT_WRITE_SELFTEST kernel..."
-( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build gptwr.cyr build/gptwr --agnos ) >/tmp/gptb-tool.log 2>&1 || { echo "  BUILD-FAIL (gptwr)"; tail -8 /tmp/gptb-tool.log; exit 1; }
-sh "$ROOT/scripts/build.sh" >/tmp/gptb-prod.log 2>&1 || { echo "  BUILD-FAIL (production kernel)"; tail -8 /tmp/gptb-prod.log; exit 1; }
+mkdir -p "$ROOT/build"   # 1.57.14: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build gptwr.cyr build/gptwr --agnos ) >"$ROOT/build/gptb-tool.log" 2>&1 || { echo "  BUILD-FAIL (gptwr)"; tail -8 "$ROOT/build/gptb-tool.log"; exit 1; }
+sh "$ROOT/scripts/build.sh" >"$ROOT/build/gptb-prod.log" 2>&1 || { echo "  BUILD-FAIL (production kernel)"; tail -8 "$ROOT/build/gptb-prod.log"; exit 1; }
 cp "$ROOT/build/agnos" "$ROOT/build/agnos-prod"
-env GPT_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/gptb-st.log 2>&1 || { echo "  BUILD-FAIL (selftest kernel)"; tail -8 /tmp/gptb-st.log; exit 1; }
+env GPT_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/gptb-st.log" 2>&1 || { echo "  BUILD-FAIL (selftest kernel)"; tail -8 "$ROOT/build/gptb-st.log"; exit 1; }
 GPTWR="$BLK_ROOT/build/gptwr"; AGNOS_ST="$ROOT/build/agnos"; AGNOS_PROD="$ROOT/build/agnos-prod"
 echo "  gptwr $(stat -c %s "$GPTWR") B  |  selftest-kernel $(stat -c %s "$AGNOS_ST") B  |  production-kernel $(stat -c %s "$AGNOS_PROD") B  |  agnsh $(stat -c %s "$AGNSH") B"
 

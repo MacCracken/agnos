@@ -762,6 +762,29 @@ fn kernel_resume() {
 # signal, then the publish (proc_death_finish). ⛔ REVIEW RULE: no function other than proc_death_release calls a
 # `*_release_pid` (test sources aside). The chain contains no wait (wq_arm / wq_sleep): it runs from the timer ISR on
 # a CPL3 frame (INV-L2), from a claimer's syscall, and from the dying process's own syscall / fault.
+# ⭐ 1.57.14 — A DEATH INSIDE A HANDLER OWES ITS REAPS. 1 for the TIMER TICK (VIA_TICK: the timer vector in service —
+# design k.132 (3), since 1.57.13) and, once the scheduler runs, for a RING-3 FAULT (VIA_FAULT: fault_kill_current,
+# from the #DE/#UD/#GP/#PF stub — IF=0 on the faulting process's own kernel stack, no vector in service). It keys the
+# REAPS only (proc_death_finish): such a death frees no fd table and no address space where it stands — its orphan reap
+# and its zombie children's reaps are OWED (proc_orphan_owed_run: the next syscall exit of any process or idle step of
+# any CPU, fs_lock by trylock). Until 1.57.14 a fault-killed parent or orphan freed them in the exception handler under
+# fs_lock, which a ZFS commit on another CPU holds for its whole length (k.126), and its CPU took no tick meanwhile.
+# ⛔ NOT the releases: proc_death_release keys its ZFS exit commit and its covered-console spill on VIA_TICK alone (the
+# timer vector in service, D-34) — a fault death commits its pending txg BEFORE its publish (durable at exit, ABI § 3.6
+# write#1, design D1) and spills the console it covered while the box still stands, exactly as exit#0 does in its
+# syscall: same context class (IF=0, its own stack, no vector in service, no lock held). The spill takes fs_lock around its
+# ext2 write only for a process that owned the scanout (klug.cyr, since the 1.57.14 merge — it took none before and could
+# race an ext2 op on another CPU), and the commit only for a process that holds a ZFS file fd (zfs_release_pid's look). Prior
+# art for the reaps: Linux never runs do_exit in a fault handler — a user fault posts the signal (force_sig_fault) and
+# the task exits from exit_to_user_mode_loop in process context, its mm and stack dropped by the next task its CPU runs
+# (finish_task_switch); FreeBSD's trap() posts it (trapsignal) and the thread exits from ast() / userret(). Before the
+# scheduler runs (the boot's exec_and_wait child, which kernel_resume returns from) no other context can hold fs_lock,
+# and the off-CPU fence an owed reap runs is opened by the scheduler's switch tail: such a fault reaps in place.
+fn proc_death_in_handler(via) {
+    if (via == VIA_TICK) { return 1; }
+    if (via == VIA_FAULT) { if (sched_active == 1) { return 1; } }
+    return 0;
+}
 fn proc_death_release(pid, code, sig, via) {
     if (pid < 0) { return 0; }
     if (pid >= proc_count) { return 0; }
@@ -773,6 +796,10 @@ fn proc_death_release(pid, code, sig, via) {
     chan_release_pid(pid);                        # 1.56.40 bite 4: #97 channel endpoints
     # 1.55.x: hand the scanout back to the console (a full-screen app that dies must not strand its last frame).
     # From the timer ISR (D-34) the hand-back runs at once but the disk spill + its kprint are deferred to the next B1.
+    # ⛔ VIA_TICK ONLY (1.57.14 review), not proc_death_in_handler: a ring-3 fault spills IN ITS HANDLER — the crash is
+    # the evidence the spill exists for (klug.cyr klug_spill_covered_console), and deferring it would only move the evidence
+    # to a later syscall exit the box may never make. Since 1.57.14 the spill holds fs_lock around its ext2 write, taken
+    # here as zfs_release_pid below takes it: a CPL3 fault holds no lock, the same context class as exit#0.
     if (via == VIA_TICK) { gpu_release_pid_isr(pid); } else { gpu_release_pid(pid); }
     tcp_release_pid(pid);                         # 1.57.7 S5: FIN/RST + release this incarnation's TCP conns, held slots included
     udp_release_pid(pid);                         # 1.57.7 S5: this incarnation's UDP listeners
@@ -782,7 +809,10 @@ fn proc_death_release(pid, code, sig, via) {
     proc_fgwait_set(pid, 0);                      # S3b: a dying waiter's own foreground cell
     lim_arm_clear(pid);                           # S8: the limits arm (the alloc reset covers a recycle too)
     # 1.57.12 B11 review: its pending ZFS txg COMMITTED before the publish — durable at exit, not at a reap a parent may
-    # never do (zfs_write.cyr zfs_release_pid). From the timer ISR (D-34) the commit is owed to the next B1, like the spill.
+    # never do (zfs_write.cyr zfs_release_pid). From the timer ISR (D-34) the commit is owed to the next B1, like the
+    # spill. ⛔ VIA_TICK ONLY (1.57.14 review): a ring-3 fault commits here, before its publish, as exit#0 does (ABI
+    # § 3.6 write#1: "exit#0, a fault or a kill: committed BEFORE the death is published"); zfs_release_pid takes
+    # fs_lock only for a process that holds a ZFS file fd, so a fault death with none never waits out a commit.
     if (via == VIA_TICK) { zfs_release_pid(pid, 1); } else { zfs_release_pid(pid, 0); }
     return 0;
 }
@@ -802,6 +832,7 @@ fn proc_death(pid, code, sig, via) {
 # then dead AND reaped in one proctab hold (proc_reap_orphan). Stopped children are continued (they would otherwise
 # have no live authority left that could — D-33) and every child's pending stop is dropped.
 fn proc_death_finish(pid, sig, via) {
+    var fz_ih = proc_death_in_handler(via);       # 1.57.14: the tick or a ring-3 fault — the reaps below are OWED
     var fz_pp = proc_get_ppid(pid);
     var fz_orphan = 0;
     var fz_kick = 0;
@@ -822,9 +853,10 @@ fn proc_death_finish(pid, sig, via) {
                 # under fs_lock, which another CPU may hold for a whole ZFS commit, and this CPU would spin on it IF=0 with
                 # the timer vector in service. In THIS hold it becomes DYING (4: not reusable, invisible to waitpid, a kill
                 # of it a no-op) and its reap is OWED, exactly as an orphan's (proc_orphan_owed): its parent is dying and
-                # nobody will read its status. Every other death path reaps it here, as before (D-31).
+                # nobody will read its status. ⭐ 1.57.14: from a ring-3 FAULT's handler too (proc_death_in_handler).
+                # Every other death path reaps it here, as before (D-31).
                 if (fz_s == 0) {
-                    if (via == VIA_TICK) { lc_st_set(fz_c, 4); fz_ow = fz_ow | (1 << fz_c); }
+                    if (fz_ih == 1) { lc_st_set(fz_c, 4); fz_ow = fz_ow | (1 << fz_c); }
                     else { fz_zm = fz_zm | (1 << fz_c); }
                 }
                 if (fz_s == 5) { lc_st_set(fz_c, 1); fz_kick = fz_kick | (1 << fz_c); }
@@ -841,10 +873,15 @@ fn proc_death_finish(pid, sig, via) {
                 atomic_or64(&proc_signals + fz_pp * 8, 1 << 17);          # SIGCHLD, only to a parent validated in THIS hold
             } else {
                 lc_st_set(pid, 4);                                        # DYING while it reaps itself
-                if (via == VIA_TICK) { fz_ow = fz_ow | (1 << pid); }      # 1.57.13: ... or while a process context reaps it
+                if (fz_ih == 1) { fz_ow = fz_ow | (1 << pid); }           # 1.57.13: ... or while a process context reaps it
             }
         }
         # Published under proctab_lock, the lock proc_orphan_owed_run claims the mask under: one claimer per bit.
+        # ⚠ A pid whose bit is set here may still be ON ITS CPU in sched_exit_tail — the fault-killed process itself
+        # (1.57.14), or a ZOMBIE child this hold just flipped 0 -> 4 that is still in its own exit tail (its exit#0 or
+        # fault published it, it has not left yet — since 1.57.13, under a tick parent too) — when another CPU claims the
+        # bit, detaches the slot's CR3 cell to 0x1000 and spins in the off-CPU fence: its leave (a CPL0 frame) must not
+        # be refused for that CR3 — sched_cpl0_switch_ok treats DYING-with-its-death-done as dead (1.57.14).
         if (fz_ow != 0) { atomic_or64(&proc_orphan_owed, fz_ow); }
         sched_spin_unlock();
         proctab_spin_unlock();
@@ -871,8 +908,9 @@ fn proc_death_finish(pid, sig, via) {
         wq_wake(WK_CHILD | fz_pp);                 # after state 0 (INV-FG-3); a spurious wake of a recycled slot is harmless
     } else {
         # 1.57.13 (k.132 (3)): a TICK death's orphan teardown is owed (set in the hold above) — the timer ISR takes no
-        # fs_lock, heap or pmm lock for it; proc_orphan_owed_run reaps it from the next syscall exit or idle step.
-        if (via != VIA_TICK) {
+        # fs_lock, heap or pmm lock for it; proc_orphan_owed_run reaps it from the next syscall exit or idle step. 1.57.14:
+        # a ring-3 FAULT's too — the exception handler takes none of them either (proc_death_in_handler).
+        if (fz_ih == 0) {
             proc_reap_orphan(pid);
             lifecycle_trace(LT_ORPHAN, pid, 0, 0);
         }
@@ -912,6 +950,8 @@ fn proc_reap_orphan_space(pid) {
     proctab_spin_unlock();
     return 0;
 }
+# ⭐ 1.57.14: the same drain serves a RING-3 FAULT's death (fault_kill_current, VIA_FAULT — proc_death_in_handler above):
+# its exception handler runs IF=0 on the dying process's own stack, and it owes the same reaps for the same reason.
 # ⭐ 1.57.13 (design k.132 (3)) — THE OWED ORPHAN REAP. A process killed at the TIMER TICK (proc_tick_lifecycle, INV-L2)
 # dies inside the ISR: IF=0, the timer vector in service until the EOI. Its own releases (proc_death_release) take only
 # short leaf locks there, but its orphan reap — and the reap of every zombie child it leaves — frees fd tables under
@@ -941,7 +981,7 @@ fn proc_reap_orphan_space(pid) {
 # another CPU's switch tail.
 # Claimed under fs_lock (won) + proctab_lock (IRQ-saved: the tick death's final hold takes it too). Returns the number
 # reaped. Lock order: fs < proctab (the claim), then fs alone for the fd tables, then proctab < heap < pmm per pid.
-var proc_orphan_owed = 0;    # (1 << pid) per tick death whose orphan / zombie reap is owed to a process context
+var proc_orphan_owed = 0;    # (1 << pid) per tick / fault death whose orphan / zombie reap is owed to a process context
 fn proc_orphan_owed_run() {
     if (proc_orphan_owed == 0) { return 0; }
     preempt_disable();                                # the claim and every reap: one non-preemptible stretch (above)
@@ -1160,7 +1200,14 @@ fn fault_kill_current(vector) {
     sys_exit_code = code;
     # ⭐ 1.57.7 (S7): THE ONE DEATH CHAIN — the releases (the scanout hand-back included: a full-screen app that faults
     # must not strand its last frame), the FP-owner clear, the zombie / orphan publish, SIGCHLD and the WK_CHILD wake.
+    # ⭐ 1.57.14: once the scheduler runs, this handler frees no fd table and no address space (proc_death_in_handler):
+    # an orphan's reap and its zombie children's reaps are OWED to the next syscall exit / idle step
+    # (proc_orphan_owed_run), exactly as for a tick death. Until then it freed them here under fs_lock at IF=0 and waited
+    # out any other CPU's ZFS commit (k.126). Its ZFS exit commit and covered-console spill still run HERE, before the
+    # publish, as exit#0's do (proc_death_release: VIA_TICK alone defers them). An orphan leaves through sched_exit_tail
+    # DYING (4) with its death done; kstack-smoke's `fault orphan` phase gates it.
     proc_death(pid, code, 0, VIA_FAULT);
+    kst_note_fault_death(pid);            # KSTACK_SELFTEST: the owed drain's CR3 detach, placed in its race window (no-op twin)
     # Foreground exec child → resume its exec_and_wait caller as a clean exit would.
     # kernel_resume restores boot CR3 + the saved continuation and NEVER returns.
     # ⭐ 1.57.7 (S3b-F4) — BOOT-ONLY: exec_and_wait runs only before `sched_active = 1` (it refuses after), so this
@@ -1908,9 +1955,11 @@ fn fd_kind_sys(fd) {
 # exists precisely because the rodata pointer is baked into the FUNCTION at compile time,
 # and its comment names the _AGNOS_VERSION gvar as the thing not to use. uname reached for
 # the gvar anyway. The accessor form below is that same pattern for the hostname.
-# ⚠ The gvar is kept ONLY as the seed value's home; nothing reads it. Anything that needs
-# the hostname from a syscall must call kernel_hostname_str().
-var kernel_hostname = "agnos";
+# Anything that needs the hostname from a syscall must call kernel_hostname_str().
+# ⛔ 1.57.14 — THE GVAR IS GONE. It was kept "only as the seed value's home" and nothing read it; cyrius 6.6.16+
+# names exactly this shape at every build (`in a kernel build the initializer of 'kernel_hostname' runs after the
+# top-level program`), and since 1.57.14 scripts/build.sh REFUSES an image whose compile prints that warning. The
+# accessor below is the hostname's one home.
 
 # Program-body-safe hostname accessor — the rodata pointer is baked in at compile time,
 # so this is valid from a ring-3 syscall regardless of gvar-init ordering. Mirrors

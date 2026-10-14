@@ -21,10 +21,12 @@
 import socket, subprocess, sys, time, os
 
 ROOT  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(ROOT, "scripts/harness"))   # 1.57.14: the harness helper (_qsock)
+from _qsock import qsock
 WORK  = os.path.join(ROOT, "build/ae-smoke")
 IMG   = os.path.join(WORK, "agnos-ae.img")
 SER   = os.path.join(WORK, "serial-input.log")
-MON   = "/tmp/agnos-ae-input.sock"
+MON   = qsock(os.path.join(WORK, "agnos-ae-input.sock"))  # 1.57.14: short + per-tree (_qsock.py) — a fixed /tmp name every tree shared
 PPM_A = os.path.join(WORK, "ae-input-a.ppm")  # two-window desktop
 PPM_B = os.path.join(WORK, "ae-input-b.ppm")  # after 'f4' (focused window closed)
 

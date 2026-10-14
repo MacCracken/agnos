@@ -13,7 +13,7 @@ language = "cyrius"
 # Raised 6.5.21 -> 6.5.27 -> 6.5.28 -> 6.5.36 with the root at 1.56.51. Since 1.56.49 this is a
 # GATE, not a convention: scripts/check/toolchain-pin-check.sh compares every manifest's pin
 # string against the root's and fails the build on any disagreement.
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 src = "gpufill.cyr"
@@ -25,4 +25,13 @@ output = "build/gpufill"
 # file-level `#ifdef CYRIUS_TARGET_AGNOS` gate, so an off-agnos build fails to COMPILE rather than emitting
 # Linux rmdir/creat. The result IS the exit code, read via the exec path's "run: exit N".
 [deps]
-stdlib = ["syscalls", "string", "args", "alloc", "atomic", "fnptr"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `alloc` names `poison` since 6.6.18 (under `#ifdef CYRIUS_POISON` — never compiled
+# here, but `cyrius deps` walks includes textually and vendors it) — declared because `cyrius lib sync` copies only
+# what is declared (the 1.57.2 tests/chan precedent).
+# ⚠ 1.57.14: 42 of the .cyr files here — the host oracles (bigate, cpuref, doomcol, edgeasm, …) and the
+# ring-3 gputri / gpudepth / gputex / gpuprof alike — `include "lib/io.cyr"` at SOURCE level, which no `[deps]`
+# walk sees. Until here io's closure was undeclared and never vendored; it resolved from the pinned toolchain's
+# lib only because no tests/gpu/lib/io.cyr existed, and a stale one left by an older vendoring would have shadowed
+# the pin. `io` and its closure (`result`, `fmt` -> `vec`) are declared: `cyrius lib sync` == `cyrius deps`,
+# 24/24 files `cmp`-equal to versions/6.6.20/lib.
+stdlib = ["syscalls", "string", "args", "alloc", "atomic", "fnptr", "poison", "io", "result", "fmt", "vec"]

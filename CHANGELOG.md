@@ -20,6 +20,403 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.14] — 2026-10-13 — repairs: cyrius 6.6.20, ring-3 fault deaths reap out of the handler, one sibling and socket rule for every smoke
+
+The repair minor's second cut (operator ruling 2026-09-21: 1.57.x = arising-issue repairs). Three tracks — the toolchain
+move (cyrius 6.6.6 → 6.6.20, kashi 1.1.1, rekha 1.0.0), the fault-path reap, smoke / harness hygiene — each implemented,
+adversarially reviewed and fixed on its own, then merged and read together (§ Changed / Fixed / Gates — the merge). No
+syscall number minted (the next free is **#112**); `check.sh` is **40 gates** (gate 40 new), its `syscall ABI` gate still
+red BY DESIGN until cyrius carries `#109`–`#111`. **Built, gated, NOT burned.**
+
+### Changed — the toolchain: cyrius 6.6.6 → 6.6.20, kashi 1.1.1, rekha 1.0.0 (operator ruling 2026-10-13; 6.7.x is LATER)
+
+- **All 25 manifests pin `cyrius = "6.6.20"`** (root + 24 `tests/*`; `toolchain-pin-check.sh`: `OK — 25 manifests,
+  all pin 6.6.20`). `build.sh`'s drift gate now refuses a 6.6.6 compile of this tree (`ERROR: toolchain drift —
+  cyrius.cyml pins 6.6.20 but the build would use 6.6.6`); `AGNOS_ALLOW_PIN_DRIFT=1` remains the deliberate override.
+  `roadmap.md`'s `Built with cyrius` trailer reads 6.6.20 (`version-bump.sh --regen`).
+- **Siblings, all three tagged on 6.6.20:** `KASHI_REF` 1.1.0 → **1.1.1** and `REKHA_REF` 0.9.0 → **1.0.0** in
+  `build.sh` / `test.sh` / `bench.sh`; klug **0.2.1** (state.md only — agnos does not build klug). rekha 1.0.0's
+  `fonts/face_data.cyr` is byte-identical to 0.9.0's, so it moves no kernel byte. kashi 1.1.1 resolves the issue agnos
+  filed at 1.57.12 (`kashi/docs/development/issues/2026-10-13-font-arrays-declared-u64-for-byte-tables.md`): the three
+  glyph tables are declared in u64 SLOTS (`[904]` / `[452]` / `[226]`, was the byte counts — 8× reserved), every glyph
+  byte, offset and accessor result unchanged. agnos reads them in two places, both inside the used spans:
+  `fb_console.cyr` reads exactly 16 rows of a `0x20..0x7F` cell through `kashi_glyph_ptr`, `gpu.cyr` goes through
+  `kashi_glyph_row`. `kernel-image-room.md`'s kashi row: 101,248 → 12,656 B.
+- **Vendored stdlib: the closure is declared.** `cyrius deps` walks includes TEXTUALLY (it does not evaluate
+  `#ifdef`), and `cyrius lib sync` copies only what `[deps].stdlib` declares, so every module the walk reaches has to be
+  declared. All 23 existing `tests/*` manifests fell short of it at 6.6.20 — 9 that declared only `syscalls` lacked
+  `alloc` / `atomic` / `fnptr` / `poison`, `tests/chan` lacked `vec` + `poison`, the rest `poison`:
+  - `syscalls` names `alloc` since 6.6.6 — CX-only (`#ifdef CYRIUS_TARGET_CX`) through 6.6.8, unconditional, so every
+    agnos program compiles it, since 6.6.9 — and `alloc` names `atomic` + `fnptr`. The textual walk resolved all three
+    at the 6.6.6 pin as well, so the 9 `syscalls`-only manifests were short BEFORE the move, which uncovered them.
+  - `fmt` → `vec` was already true at 6.6.6 (`lib/fmt.cyr:19`): `tests/chan`'s missing `vec` was likewise a
+    pre-existing under-declaration (the 1.57.5 transitives check missed it).
+  - `alloc` → `poison` is the move's own: since 6.6.18, under `#ifdef CYRIUS_POISON`, never compiled by these
+    programs, but vendored by the walk.
+  - `tests/gpu`'s 42 sources (its host oracles and ring-3 `gputri` / `gpudepth` / `gputex` / `gpuprof`) `include
+    "lib/io.cyr"` at SOURCE level, which no `[deps]` walk sees: io's closure (`io`, `result`, `fmt`, `vec`) was never
+    vendored and resolved from the pin's lib only because no stale `tests/gpu/lib/io.cyr` existed. Declared.
+
+  Proof per directory (24, `tests/sandhi` included), against the closure of the declared modules PLUS every
+  source-level `include "lib/…"`, `lib/` emptied before each command: a fresh `cyrius lib sync` vendors every file
+  `cyrius deps` resolves — equal sets, except that in `tests/sandhi` sync also copies `hashmap_fast.cyr` as a peer of
+  `hashmap` (67 vs 66) — and **472/472** vendored files `cmp`-equal `~/.cyrius/versions/6.6.20/lib/`. The 20 tests/gpu
+  host programs that build without check.sh's generated tables, rebuilt under the widened manifest: same size, same
+  output byte for byte, same exit code (their code moves, because the wrapper's stdlib injection now carries `io`).
+- **The 2×2 A/B** — {seed tree (1.57.13 + the version bump), moved tree} × {cycc 6.6.6, 6.6.20}, plus the sibling axis
+  under one compiler; `build/agnos` bytes, headroom under gate 34's `0x400000` in parentheses:
+
+  | build | seed · kashi 1.1.0 / rekha 0.9.0 · 6.6.6 | seed · 1.1.0 / 0.9.0 · 6.6.20 | seed · 1.1.1 / 1.0.0 · 6.6.20 | moved · 1.1.1 / 1.0.0 · 6.6.6 | **moved · 6.6.20 (shipped)** |
+  |---|---|---|---|---|---|
+  | plain | 2,773,064 (307,480) | 2,767,576 (312,968) | 2,679,048 (401,496) | 2,684,488 (396,056) | **2,679,000 (401,544)** |
+  | `ZFS_SELFTEST ZFS_WRITE_SELFTEST ZFS_WRITE_OPS` | 2,915,096 (165,448) | 2,908,872 (171,672) | 2,820,344 (260,200) | 2,826,536 (254,008) | **2,820,296 (260,248)** |
+  | `RING3_SELFTEST` | 2,854,904 (225,640) | 2,849,432 (231,112) | 2,760,904 (319,640) | 2,766,344 (314,200) | **2,760,856 (319,688)** |
+
+  Every byte attributed (plain; the flag builds move the same way):
+  - **compiler alone, −5,488 B, all `.text`** (seed, siblings held at 1.1.0 / 0.9.0; −6,232 binding, −5,480 RING3;
+    `.rodata` byte-identical, `.bss` the same size ±8 B of alignment). Cause: **cyrius 6.6.8's fix of the 1,024-entry enum-fold cap** —
+    enum constants declared past var index 1,024 were not folded, so through 6.6.7 every use loaded the constant from
+    memory. In the disassembly, 793 `movabs rcx, &E; mov rax, [rcx]` pairs (13 B) become `mov eax, imm32` (588 ×,
+    5 B), `movabs rax, imm64` (190 ×, 10 B) or `xor eax, eax` (12 ×, 2 B), and three `cqto; idiv` divisions and two
+    shifts by a now-constant enum fold away.
+  - **kashi 1.1.1 alone, −88,528 B** (under 6.6.20: `.bss` −88,584, `.text` +56 — kashi's new 3-member
+    `_KashiFontStore` enum is three more stores in the late init replay). rekha 1.0.0: 0 B.
+  - **the tree alone, −48 B** (`.text`; the two late-replay gvars below).
+  - **Total, 1.57.13 → 1.57.14 plain: −94,064 B — `0x3b4ee8` → `0x39df78`, headroom 307,480 → 401,544 B; the
+    binding build 165,448 → 260,248 B.**
+- **Every x86 flag build re-measured on the moved tree under 6.6.20**: all 156 `build.sh` flags one at a time (the
+  two that need `HDMI_ATOM=1` with it) plus the combined builds, 164 builds — every one compiles, 0 placeholders,
+  0 late-initializer warnings, 0 refusals. Headroom: plain 401,544 · **binding `ZFS_SELFTEST ZFS_WRITE_SELFTEST
+  ZFS_WRITE_OPS` 260,248 (tightest)** · `ZFS_WRITE_OPS` 318,648 · `RING3_SELFTEST` 319,688 · `KTEST THREAD_SELFTEST
+  KSTACK_SELFTEST KSTACK_HW` 332,600 · `EDGE_ABI_SELFTEST` 337,600 · `TEST KTEST` 339,928 · `ZFS_SELFTEST
+  ZFS_WRITE_SELFTEST` 343,080 · `TCP_SELFTEST` 354,608 · `VTD_SELFTEST` 391,144 · `TTY_SELFTEST` 401,048.
+- **`CYRIUS_DCE` is not a size lever on any pin** (`test.sh`, `kernel-image-room.md`): 6.6.20's REVBE-01 declines
+  compaction on a `kernel;` image — the fix for the corruption agnos filed at 1.57.12 (cyrius
+  `issues/2026-10-10-agnos-kernel-dce-compaction-moves-data.md`, OPEN there for the missing shrink) — so `CYRIUS_DCE=1`
+  only NOP-fills; the compile's note now says so.
+- **Unchanged by the move:** the `syscall ABI` gate still reads `kernel 111 · abi-doc 111 · cyrius 108` (the cyrius repo
+  HEAD it reads first and 6.6.20's own peer both carry 108) — red BY DESIGN until cyrius carries #109–#111. The
+  placeholder gate stays as the belt: cyrius 6.6.9+ refuses a reachable undefined call even when a dead fn referenced
+  it first (measured: 6.6.6 built that probe rc 0, x86 with a warning, aarch64 silently; 6.6.20 refuses both).
+- Docs: state.md § Cyrius pin; roadmap § "Recorded by cyrius 6.6.16 / 6.6.17" DONE, § 6.6.19 carried (the readiness
+  probe, a feature, unslotted), § 6.7.6 left for the 6.7.x move; ABI §O5 (the BSD socket names are safe on agnos since
+  6.6.17; the agnos CLI answers version/help only); build.md; CLAUDE.md (the compiler-OK rule).
+
+### Added — with the 6.6.20 move
+
+- **`build.sh` refuses a late-replayed global initializer.** cyrius 6.6.16+ warns once per declaration-zone global
+  whose initializer an x86 `kernel;` build runs AFTER the top-level program; this kernel's program never returns, so
+  such a global reads 0 forever. The compile's captured stderr is grepped for `in a kernel build the initializer of`
+  and the image is moved to `build/agnos.lateinit-refused` (exit 1). Mutation-proven: `var _AGNOS_VERSION =
+  "1.57.14";` put back into `version.cyr` → the warning, `ERROR: the compile named a global whose initializer an x86
+  kernel build never runs`, `agnos.lateinit-refused`; restored (sha256 OK) → builds.
+- **NEW `scripts/smoke/sandhi-async-smoke.sh` + `tests/sandhi` (`sandhix`) — sandhi's cooperative server booted on
+  agnos** (roadmap § "Recorded by cyrius 6.6.19": cyrius asked for it once agnos pinned ≥ 6.6.19). `sandhix` (2,201,472 B,
+  `--agnos`, the whole folded `lib/sandhi.cyr`) is seeded as `/bin/agnsh` on a PLAIN kernel and serves HTTP on guest 8090
+  through `sandhi_server_run_async` with NO stop flag, so its idle path is `async_await_readable` — the 6.6.19 readiness
+  STASH (`_agnos_fd_ready` pre-accepts the pending conn, `sleep_ms` 1 → 32 ms backoff), verified until now only under
+  cyrius's PTRACE_SYSEMU fake kernel. Host phases: R `GET /ready` 2 s after `SANDHIX-LISTENING`, re-sent until
+  answered (`R ok=1`; answered, never counted — the marker precedes `bind`/`listen`, and agnos drops a SYN to a port
+  with no listener, so a request sent AT ONCE was measured answered only at 6.07 / 6.32 s, by SLIRP's re-sent SYN);
+  2 s later P1 one GET (`ok=1`, < 2 s); P2 six concurrent GETs over `max_conns` 4 (`ok=6`; slowest 0.65–6.17 s on TCG
+  `-smp 1` — the `TCP_SYNRCVD_MAX` 4 cap plus SLIRP's SYN re-send — and 1.14–1.18 s on KVM `-smp 4`, printed as an
+  INFO line, against a 60 s client timeout, tcp-inbound-smoke's); P3 three GETs after a 3 s re-park (`ok=3`); then
+  `GET /quit` → `SANDHIX-DONE served=10` and exit 0. **24/24 at `-smp 1` and `-smp 4`** (63 s through
+  `SWEEP_ONLY`). New sweep row (group `hostport` — it picks its host port by bind(0), as tcp-inbound does); 74 rows.
+  Its manifest declares sandhi's whole stdlib closure (37 modules; `lib sync` vendors all 66 files `deps` resolves,
+  plus `hashmap_fast.cyr` as a peer of `hashmap` — 67/67 equal to 6.6.20).
+
+### Fixed — with the 6.6.20 move
+
+- **Two string gvars that read 0 in this kernel are gone:** `_AGNOS_VERSION` (`version.cyr`) and `kernel_hostname`
+  (`core/syscall.cyr`) — declaration-zone initializers an x86 kernel build runs after its never-returning program, the
+  two cyrius 6.6.16 named at every build. Nothing read either (uname#34 has used `agnos_version_str()` /
+  `kernel_hostname_str()` since 2026-08-11). `version-bump.sh` no longer generates `_AGNOS_VERSION`, and check.sh's
+  `version in kernel` row for it went with it (its comment had it "feeding uname#34").
+- **`syscall-abi-check.sh`'s fallback read the NEWEST installed cyrius, not the pin.** With no `../cyrius` sibling it
+  took `sort -V -r | head` of `~/.cyrius/versions/` (6.7.10 at the move) while its comment called that "what this
+  kernel is actually built against". It now tries `${CYRIUS_HOME:-~/.cyrius}/versions/<root pin>/lib` first.
+- **The undeclared transitive stdlib modules in 23 `tests/*` manifests, and `tests/gpu`'s source-level `lib/io.cyr`**
+  (§ Changed) — `cyrius lib sync` left them unvendored, so a `tests/*/lib` snapshot could only be completed by whichever
+  build or toolchain resolved it.
+- `build.sh`'s drift message said "all 9 manifests move together" (25); `test.sh`'s size note offered
+  `CYRIUS_DCE=1` as a squeeze (§ Changed).
+- **`test.sh`'s `x86 kernel_hello builds` row compiled from the CALLER's cwd** — the repo root, whose `cyrius.cyml`
+  declares `[deps.kashi] path = "../kashi"` / `[deps.rekha] path = "../rekha"`; the wrapper validates those modules even
+  under `--no-deps` (6.6.6 and 6.6.20 alike), so in a checkout with no `../kashi` (KASHI_DIR pointed elsewhere, as
+  worktree builds do) the row FAILED for a freestanding file that names neither sibling (measured: `test.sh --all` 7/8 in
+  such a copy). It compiles from `kernel/` now, like every other kernel compile there (8/8 in the same copy).
+
+### Gates — the 6.6.20 move (on the final moved tree, cyrius 6.6.20, kashi 1.1.1 / rekha 1.0.0)
+
+- `build/agnos` **2,679,000 B**, sha256 `f362d0b3…` (byte-identical to the A/B's moved × 6.6.20 build); LOAD end
+  **`0x39df78`**, **401,544 B** under gate 34's `0x400000`. aarch64 641,960 B (642,000 on 6.6.6), 0 placeholders.
+- `check.sh` **38/39** — the one red is the `syscall ABI` gate, red BY DESIGN (`kernel 111 · abi-doc 111 · cyrius 108`,
+  unchanged by the move) · `test.sh --all` **8/8** · `toolchain-pin-check` 25 manifests · the stdlib closure 472/472 ·
+  164 flag builds through the placeholder, late-initializer and image-layout gates (all PASS).
+- Boots: `agnsh-smoke` PASS (the BSP boot stack, region 7, the ROOM carve-out, the 0xE0/0xE1 gates, no latched
+  invariant) · `sandhi-async-smoke` **24/24** (the reworked R / P1 / P2 phases) · `SWEEP_JOBS=1 SWEEP_ONLY=…` **17/17 rows** (1,647 s; NOT a sweep verdict,
+  the full sweep is the closeout): ktest (-smp 1 + 4: 380 checks, 13/13 KTEST boot self-tests, each) · ZFS read + write
+  gate (8/8 lanes; the OpenZFS fixture rebuilt cold once, ~6 min, because the `zfsx` payload is a 6.6.20 build now) ·
+  ZFS ring 3 · kfont · AP stacks · TSC (75/0) · doom · ring3 (20/0) · kstack (64/0) · tty (108/0) · the five FP rows ·
+  naad-ring3 · console live line.
+- **The console renders the same glyphs:** `console-line-smoke` on the seed tree (cyrius 6.6.6, kashi 1.1.0) and on the
+  moved tree (6.6.20, kashi 1.1.1), screendumps of the virgin `[ASSIST] >` prompt compared: the prompt row is
+  pixel-identical, and all 75 distinct inked glyph cells on the moved screen (2048×2048, scale 2) occur pixel-for-pixel
+  on the seed screen (0 moved-only; 63 text rows each).
+- Negatives, each restored byte-identical (sha256): `tests/zfs/cyrius.cyml` left at `6.6.6` → `toolchain-pin-check`
+  FAILED (`pins 6.6.6 (root pins 6.6.20)`); the dropped `_AGNOS_VERSION` gvar put back → `build/agnos.lateinit-refused`;
+  the moved tree built with the 6.6.6 compiler and no override → `ERROR: toolchain drift`; the old `kernel_hello` row in
+  a copy with no `../kashi` → `test.sh --all` 7/8.
+
+### Added — the fault-path reap (out of the exception handler)
+
+- **`kstack-smoke`: `kstack: fault orphan OK`** (`KSTACK_SELFTEST`, -smp 4; `n/a (1 cpu)` at -smp 1, `n/a (2 cpus)` at
+  -smp 2). kmain holds `fs_lock` throughout. An ORPHAN O spins in ring 3 on an AP; its child Z runs into `ud2` (#UD,
+  exit 134) on another AP and is HELD at the top of `sched_exit_tail` as a zombie (state 0, death done; `sched.cyr`
+  `kst_note_exit_tail`, a no-op twin outside the flag). With `zfs_active` planted 1 (a pool reading as imported; O's
+  table holds no ZFS file fd) O is released into `ud2`; between its death's publish and its leave its CR3 cell is
+  detached to `0x1000` (`kst_note_fault_death`, called by `fault_kill_current`). After 300 ms Z's cell is detached
+  while Z is still held, and Z is let go. Requires ≥ 10 ticks on O's CPU during the hold, the detach run and O off its
+  CPU (`on_cpu` -1), Z held through O's death and off its CPU within 200 ms of its release, O's death done with exit
+  134, both slots DYING (4) and both reaps owed, then both reaped within 2 s of the release (state 0, ppid 0, no fd
+  table, CR3 `0x1000`, nothing owed, ≤ 16 pages of the free pool not back). Measured: 30 ticks,
+  `detached=1 left=1 zheld=1 zleft=1`, both reaped, 0 pages lost. Negatives: N-FAULT (the deferral removed) and
+  N-FREAP (the reaps only) — `ticks_in_hold=0 … done=0`, FAIL (measured on the phase before Z was held); N-ZLOOK
+  (`zfs_release_pid`'s lock-free look removed: `fs_lock` first) — `ticks_in_hold=0 done=0`, FAIL; N-FLEAVE (the
+  DYING-done switch test removed) — `left=0 zleft=0`, FAIL, and the owed drain then wedged in its fence against O's
+  refused leave (`reaped=0 free_lost=3078`).
+
+### Fixed — the fault-path reap
+
+- **A process killed by a ring-3 fault no longer reaps inside the exception handler** (the 1.57.13 carry; `syscall.cyr`
+  `proc_death_in_handler`). `fault_kill_current` (#DE / #UD / #GP / #PF from CPL3; IF=0 on the faulting process's own
+  kernel stack) freed its zombie children's and its own orphan fd tables there under `fs_lock`; a ZFS commit on another
+  CPU held that CPU at IF=0, with no tick, until the commit ended. Once the scheduler runs, a fault death's orphan reap
+  and its zombie children's reaps are owed to `proc_orphan_owed_run` (the next syscall exit of any process or idle step
+  of any CPU, `fs_lock` by trylock), as a tick death's are. Before the scheduler runs (the boot's `exec_and_wait` child)
+  a fault reaps in place. Its ZFS exit commit and covered-console spill stay in the handler, before the publish, as
+  exit#0's do (keyed on `VIA_TICK` alone): a fault death is durable at exit (ABI § 3.6 `write`#1, design D1) and the
+  crash's console spill reaches `/klug.txt` while the box stands. Every other death path runs in process context and
+  reaps in place: exit#0, a kill at B1 (a wait's abort included), a claim (kill#16, execwait#37); the tick death has
+  been owed since 1.57.13.
+- **`zfs_release_pid` took `fs_lock` for every dying process while a pool was imported, ZFS fds or not**
+  (`zfs_write.cyr`). Every death — exit#0, a fault, a kill at B1, a claim — waited out any other CPU's commit at IF=0
+  before its publish. It now looks lock-free for a ZFS file fd in the dying table first, on every path, and takes the
+  lock only when one exists. The look is on the fd's type, not on `zfs_wp_ref`: `zfs_commit` clears `zfs_wp_ref` before
+  it commits under the lock, so a commit in flight must still be waited out for a table that holds a ZFS file.
+- **A dying process whose reap is owed could not leave its CPU once the owed drain had detached its CR3** (found with
+  the above). `sched_cpl0_switch_ok` refused a CPL0 switch (the voluntary leave `sched_exit_tail` raises, and each
+  tick in its `sti; hlt` fallback) whose current process's CR3 cell no longer matched the live CR3 unless that process
+  was dead (state 0); `proc_reap_orphan_space` rewrites the cell to `0x1000` and then waits in the off-CPU fence for the
+  dying CPU to leave, so the two CPUs waited on each other forever. It now switches ANY DYING (4) current whose death is
+  done (`lc_dying_done`): a fault-killed orphan in its exit tail, and a zombie still in its exit tail that its parent's
+  tick or fault death flipped from 0 to 4.
+- **The same hang shipped in 1.57.13 for a tick death's zombie children**: a child that had published its exit#0 or
+  fault (state 0) and not yet left its CPU, flipped to DYING by its parent's death at the tick on another CPU, was
+  refused its leave forever once a third CPU's owed drain claimed it. Fixed by the exemption above; gated by the
+  `fault orphan` phase's Z (a fault parent; the flip and the leave are the same code for a tick parent).
+- **Image**: plain 2,773,512 B, LOAD end `0x3b50a8`, **307,032 B** under gate 34's `0x400000` (−448 B);
+  `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 ZFS_WRITE_OPS=1` 2,915,544 B, `0x3d7b78`, **165,000 B** (binding, −448 B);
+  `KSTACK_SELFTEST=1` (+ `KSTACK_HW`) 2,836,640 B, 243,904 B. 0 placeholders in each; aarch64 642,000 B, 0 placeholders.
+
+### Added — smoke / harness hygiene
+
+- **`check.sh` gate 40 — smoke / harness hygiene** (`scripts/check/smoke-hygiene-check.sh`; the 1.57.13 carried
+  repair). A text + Python-`ast` walk (~1.5 s, never builds) over every `*.sh` / `*.py` under `scripts/smoke/`,
+  `scripts/harness/`, `scripts/tool/` and `scripts/probe/` (`os.walk`, so an un-added script is covered) that refuses,
+  at the line, with the fix: **S1** a sibling default other than `${<NAME>_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/<repo>}` —
+  `$ROOT/..`, `dirname "$ROOT"`, `../../..`, a bare `$SIBLINGS_ROOT`; Python `os.path.join(ROOT, "..…")`, `f"{ROOT}/.."`,
+  `os.pardir`, a pathlib parent, and `os.environ.get("X_ROOT|X_BIN|X_DIR", default)` (an exported-empty X is `""`);
+  **S2** a literal `/tmp/…sock` or `unix:…`, every `unix:` / socket-chardev `path=` whose value is not a variable bound
+  ONLY through a **tree-rooted** `smoke_qsock` / `qsock` (Python through the `ast`: `%`, `+`, `.format`, f-strings,
+  tuple unpacking, a parameter traced to its call sites), and every `smoke_qsock` / `qsock` call whose argument does not
+  name the tree (`qsock("x.sock")` hashes to the same path in every tree); **S3** any other fixed `/tmp/<name>`,
+  `${TMPDIR:-/tmp}/<name>`, `gettempdir()` (mktemp / mkdtemp allowed); **S4** any build command in the scope of
+  `cd "$<sibling>"` (`&&`, `;` or the next line), a `cyrius build` output under a sibling, a sibling's `build.sh` run by
+  path, `make -C`, Python `cwd=` / `os.chdir` into a sibling. Two per-line markers, each honoured only where it can be
+  checked: `# guest path` (S3: a path inside the VM) and `# socket path from scripts/<caller>` (S2: a driver handed its
+  socket by a caller that binds it through qsock — `lockup-driver.py`). The header lists the forms it does NOT follow.
+  The two helpers that define the rules are exempt and must exist; floors make a vacuous walk FAIL (measured: 196 files,
+  199 SIBLINGS-rule sites, 70 tree-rooted qsock sockets). Mutation record in the header: the pre-conversion `scripts/`
+  scores 327 sites (187 S1, 107 S2, 30 S3, 3 S4); 67 planted files each scored alone — 47 red on the planted line, 20
+  legitimate forms green; planted in the tree (a relative `qsock` in `redirect-smoke.py`) the gate is red on both lines
+  and the file was restored byte-identical. Prior art: Linux `checkpatch.pl` / `documentation-file-ref-check`,
+  shellcheck. `CLAUDE.md` (40-gate, closeout step 1), `README.md`, `build.md` updated.
+- **`scripts/harness/_siblings.py`** — `sibling("<repo>", "<NAME>_ROOT")`: `$<NAME>_ROOT` if set and non-empty, else
+  `${SIBLINGS_ROOT:-<tree>/..}/<repo>`, the Python twin of the shell rule (empty counts as unset, as `${X:-…}` does).
+  Documented in `scripts/harness/README.md` with `_qsock.py`, which the README had never listed.
+
+### Changed — smoke / harness hygiene
+
+- **Every smoke and harness finds its siblings by the one rule** (1.57.13 fixed doom, doom-audio, naad-ring3 and the smokes it touched):
+  103 `$ROOT/../<repo>` defaults in 88 smokes → `${SIBLINGS_ROOT:-$ROOT/..}/<repo>` (gnoboot 88, agnoshi 5, agnova 2,
+  vani, mishran, bote, ark ×2, hoosh ×2, takumi); 75 lines in 40 harnesses → `sibling(…)` (gnoboot, agnoshi, crab,
+  aethersafha, puka). Inert under `sweep.sh`, which exports every root absolutely; standalone from a worktree they now
+  resolve through `SIBLINGS_ROOT` alone.
+- **Every harness and QEMU driver binds its QEMU sockets through `qsock` / `smoke_qsock`** — 47 fixed
+  `/tmp/agnos-*.sock` monitor / QMP names in 39 harnesses, plus the six drivers under `scripts/tool/` and
+  `scripts/probe/` (`pipe-smoke`, `redirect-smoke`, `iam-agnos-verify`, `doom-ingame-smoke`, `aethersafha-input-smoke`,
+  `kriya-crash-probe`) → `qsock(os.path.join(WORK, "<the old name>"))` (short and per-tree; `hid-halt-oracle`, which has
+  no WORK, keys on `build/hid-halt-oracle/`); `lockup-repro.sh`'s QMP socket → `smoke_qsock "$WORK/qmp.sock"` (it was
+  under `$WORK`, over `sun_path` from a deep worktree). The imports moved above the first use (`sys.path.insert` right
+  after `ROOT`; the tool / probe drivers import from `scripts/harness/`). `pipe-smoke`, `redirect-smoke` and
+  `iam-agnos-verify` also took gnoboot / agnoshi / anuenue through `os.path.join(ROOT, "../…")`, ignoring
+  `SIBLINGS_ROOT` (and `GNOBOOT_ROOT` for the binaries): `sibling(…)` now.
+- **Build logs are the tree's**: the 29 fixed `/tmp/*.log` references in `kfont`, `gpt-boot`, `gpt-write`, `blk-ring3`,
+  `tonegen` and `ap-stack` → `$ROOT/build/` (fp-ring3's 1.57.13 form); `agnova-install` → `build/agnova-install-logs/`,
+  `mishran-audio` / `vani-tone` → their `$WORK` (20 more); `burn-prep.sh`'s `/tmp/burn-prep-build.log` →
+  `build/burn-prep-build.log`.
+
+### Fixed — smoke / harness hygiene
+
+- **Three smokes wrote into sibling repos** (naad-ring3's 1.57.13 defect, not swept beyond it): `agnova-install-smoke`
+  built `build/agnova-agnos` inside `$AGNOVA_ROOT`, `mishran-audio-smoke` built `build/mishtone-agnos` inside
+  `$MISHRAN_ROOT`, and `vani-tone-smoke` ran `cyrius distlib core` inside `$VANI_ROOT` — rewriting vani's TRACKED
+  `dist/vani-core.cyr` under agnos's toolchain on every run. Each now copies the sources it reads (manifest, VERSION,
+  lock, `src/`, `lib/`, `dist/`, plus `programs/` / `vendor/` where used — never `.git`) under this tree's `build/`
+  and builds there; the sibling is only read.
+- **23 harnesses ignored `GNOBOOT_ROOT` and `SIBLINGS_ROOT` outright** (`GNOBOOT = os.path.join(ROOT,
+  "../gnoboot/…")`, and every `CRAB_BIN` / `AE_BIN` / `PUKA_BIN` fallback), so from a worktree they failed `missing …`
+  whatever the operator exported. `tty-test.py`'s 1.57.13 inline form read an exported-but-empty `SIBLINGS_ROOT` as a
+  cwd-relative path; it uses `_siblings.py` now. The 33 `CRAB_BIN` / `AE_BIN` / `PUKA_BIN` / `AGNSH_BIN` fallbacks this
+  cut rewrote still read an exported-but-EMPTY variable as the path `""` (`os.environ.get("X_BIN", default)`); they —
+  and `vtd-iommu-test.py`'s `VTD_KERNEL` — are `os.environ.get("X") or default` now, and gate 40 refuses the old form.
+- **`burn-prep.sh` compared the staged tools against `../<repo>/build/…`** (kriya, iam, aethersafha, setu / puka,
+  crab, agnoshi), relative to the tree: from a worktree every one named `.claude/worktrees/<repo>` and fell to "no
+  source to compare". Through `${SIBLINGS_ROOT:-..}` now (stage-tools.sh's rule); the unreachable `../agnos/tests/…`
+  rows read `tests/…`.
+- **`ae-theme-repaint-test.py` bound `ae-resize-fault`'s monitor socket name** (a copy-paste: both
+  `/tmp/agnos-aefault.sock`), so the two harnesses could drive each other's QEMU; keyed on each one's own WORK now.
+- **`smoke_stage_rootfs` could not stage from a worktree with only `SIBLINGS_ROOT` set** — found running this cut's
+  samples: `scripts/burn/stage-agnsh.sh` defaulted agnoshi through `$ROOT/..` alone ("agnoshi repo not found at
+  …/r14-hyg/../agnoshi"), so the staging every rootfs-seeding smoke and harness relies on left `build/rootfs/bin/agnsh`
+  absent. Fixed with the one rule, as are `stage-tools.sh`'s wallpaper directory (its 34 tool rows already used
+  `$SIBLINGS`), `scripts/ktest.sh`'s gnoboot default and the two `scripts/probe/` repro scripts'.
+- **Seven harnesses scored a live shell as dead: their `version` oracle named agnoshi's MAJOR** (`"agnoshi 1."`) —
+  `sweep-test`, `hid-cc-inject`, `hid-mouse-deferred`, `agnsh-bg`, `agnsh-bg-smp4`, `agnsh-multijob`, `agnsh-kvm`;
+  agnsh answers `agnoshi 2.0.3` (1.57.13 fixed `agnsh-type-test` alone). Found running `sweep-test.py` from this tree:
+  "shell survives a faulted & job" FAILED with `agnoshi 2.0.3` printed right after the job's `[1] Done`. Each matches
+  `agnoshi [0-9]+\.[0-9]+` now (`AGNSH_VER`; `run_wait` / `waitfor` take a pattern or a string).
+- `README.md` called `check.sh` an "11-point" validation (40 gates).
+- **`agnsh-verb-test.py` RETIRED — it could only fail.** It drove agnoshi 1.4.2's in-process `echo` / `ls` / `cat`
+  verbs, which agnoshi 1.5.0 removed (agnsh delegates file verbs to `/bin/kriya`; `cat` nudges to `owl`). Run from this
+  tree as one of the converted samples, its monitor socket worked (every key arrived) and agnsh answered `ls /` with
+  "not a known command here" and `cat` with the owl hint — a harness asserting removed behaviour, green last at 1.4.2's
+  era. `agnsh-delegation-test.py` (1.44.x) is the live test of the delegated verbs, and since 1.57.14 it also carries
+  the retired test's distinctive half — `echo VERBPROOF > /vtest` (agnsh output redirection of kriya `echo`) read back
+  with `owl -p /vtest` — so one harness covers both; `scripts/tool/redirect-smoke.py` drives the same redirect with
+  `owl` as the writer. Its header listed a `touch /tfile` step the sequence never ran; it lists the real one now.
+
+### Changed — the merge
+
+- **Operator ruling 2026-10-13: a failed aarch64 compile does NOT block a release.** `release.yml` keeps its soft arm —
+  `aarch64=absent`, the x86_64 release continues, the log calls it a regression of a green compile — "until aarch64 is
+  ready and proven, then we gate ci" (the 1.6x port). 1.57.13 left this open; it is recorded in roadmap's aarch64 row,
+  state.md's aarch64 bullet, CLAUDE.md ("Compiles is not boots") and a comment on `release.yml`'s compile step (no
+  behaviour change).
+- **`check.sh` is 40 gates** (the pin track left 39; hyg's `smoke/harness hygiene` is gate 40) and **`sweep.sh` 74 rows**
+  (`sandhi-async-smoke` new, group `hostport` — tcp-listen, tcp-inbound and sandhi-async run in order on one worker, as
+  build.md § parallel sweep now says). Gate 40 walks the pin track's new `sandhi-async-smoke.sh` (197 files, 199
+  SIBLINGS-rule sites, 70 tree-rooted qsock sockets).
+
+### Fixed — the merge (found along the way)
+
+- **`klug_spill` wrote ext2 with no lock on every path**, so a spill could interleave with an ext2 operation on another
+  CPU (`ext2_write_at` through ext2's one shared bounce block; every other ext2 writer holds `fs_lock` across exactly such
+  calls). `klug.cyr`: `klug_spill()` and `klug_spill_covered_console()` take `fs_lock` around the write (`fs_spin_lock`,
+  as the syscall ext2 arms and `power_flush` do); every caller is a syscall (modeset transmit, the GPU audits and forensic
+  dump), exit#0 or a ring-3 fault's death (`gpu_release_pid`, where `zfs_release_pid` already takes the same lock), or the
+  boot, and none holds `fs_lock` there. The owed spill (`klug_spill_owed_run`, at B1 after a tick death of a scanout owner)
+  takes it by `fs_spin_trylock`, as `proc_orphan_owed_run` / `zfs_wp_owed_run` do at the same point — B1 holds no lock
+  (every dispatch arm closes its pair before `syscall_hw.cyr`'s one exit): a busy lock leaves the debt set for the next
+  B1, never waiting a ZFS commit out at IF=0. `klug_spill_held()` / `klug_spill_cc_held()` are the bodies for a holder;
+  aarch64 gains the `fs_spin_trylock` stub (always won, one core). Gated in `klug-spill-smoke` (both rows): under
+  `KLUG_SPILL_SELFTEST` kmain holds `fs_lock`, sets the debt and runs the owed spill — the debt must stay — then releases
+  and runs it again — the debt must be paid: `klug: spill lock OK`. Negative N-KTRY (the trylock removed, the 1.57.13
+  runner): `klug: spill lock FAILED -- debt under a held fs_lock=0 after release=0`, 8/1, FAIL. The blocking paths' lock
+  is proven by construction only: their callers are iron-only (the scanout, modeset, the GPU) or the boot, so no QEMU
+  smoke drives a spill against a concurrent ext2 write on another CPU.
+- **`burn-prep.sh`'s staleness loop repeated case labels, so klug was never compared.** The 2026-08-30 fix added a
+  second row for klug, kriya, iam, the ten gpu tools and faulter BELOW their first rows; a `case` takes its first match,
+  so the second rows never ran — harmless where both named the same file, but klug's first row was `klug) _src="" ;;`,
+  so `/bin/klug`'s staleness was never compared (the exact silent skip the 2026-08-30 fix was written to end). One row
+  per tool now; klug compares against `$SIBLINGS/klug/build/klug_agnos`, the file `stage-tools.sh` stages it from.
+  burn-prep targets iron, so the loop was proven by a dry run (the loop and its vacuity floor extracted verbatim, run
+  over a fake tree of 18 staged tools and their sources): before — duplicate labels `faulter gpu* iam klug kriya modeset`,
+  `compared 17 of 18 … NOT compared: klug`, and a STALE `/bin/klug` passed (rc 0); after — no duplicate label,
+  `compared 18 of 18`, and the stale `/bin/klug` is refused (`STALE STAGED TOOL -- build/rootfs/bin/klug`, rc 1).
+- Docs that said the covered-console spill takes no `fs_lock` (`syscall.cyr` `proc_death_in_handler` /
+  `proc_death_release`, `process-lifecycle.md`, k.136) say it holds it.
+
+### Gates — the merge (merged source, cyrius 6.6.20, kashi 1.1.1 / rekha 1.0.0; each once)
+
+- **Image** (plain, the merged tree): `build/agnos` **2,679,672 B**, LOAD end **`0x39e218`**, **400,872 B** under gate 34's
+  `0x400000` — 1.57.13 → 1.57.14 **−93,392 B**: the compiler −5,488, kashi 1.1.1 −88,528, the two dead gvars −48, the
+  fault-path reap +448, `klug_spill`'s lock +224. aarch64 **642,216 B**, 0 placeholders.
+- **All 160 `build.sh` flag builds** (every flag alone, the two `ATOM_*` ones with `HDMI_ATOM`, and the combined builds)
+  rebuilt on the merged source under 6.6.20: every one compiles, **0 placeholders, 0 late-initializer warnings, 0
+  refusals**. Headroom: plain 400,872 · **binding `ZFS_SELFTEST ZFS_WRITE_SELFTEST ZFS_WRITE_OPS` 259,560 (tightest)** ·
+  `ZFS_WRITE_OPS` 317,976 · `RING3_SELFTEST` 319,016 · `KTEST THREAD_SELFTEST KSTACK_SELFTEST KSTACK_HW` 324,512 ·
+  `EDGE_ABI_SELFTEST` 336,928 · `KSTACK_SELFTEST` 337,760 · `TEST KTEST` 339,256 · `ZFS_SELFTEST ZFS_WRITE_SELFTEST`
+  342,408 · `TCP_SELFTEST` 353,936 · `VTD_SELFTEST` 390,456 · `KLUG_SPILL_SELFTEST` 400,136 · `TTY_SELFTEST` 400,360.
+- `check.sh` **39/40** — the one red is the `syscall ABI` gate, red BY DESIGN (`kernel 111 · abi-doc 111 · cyrius 108`;
+  `#109`–`#111` absent from cyrius); gate 40 PASS over the merged scripts, the aarch64 row PASS · `test.sh --all`
+  **8/8** · fmt, kprint-len (5,866 literals), pp-balance, brace-balance, issue-pointer clean.
+- Boots: `agnsh-smoke` **PASS** (both layout lines, the room carve-out, the 0xE0 / 0xE1 gates, no latched invariant) ·
+  `KTEST=1 ktest.sh` **380/380 at `-smp 1` and at `-smp 4`**, 13/13 KTEST boot self-tests each ·
+  `scripts/harness/sweep-test.py` **PASS 4/4** (`Kernel: AGNOS 1.57.14` through `agnos_version_str()`, kriya `ln -s` /
+  `readlink`, the shell survives a faulted `&` job and answers `agnoshi 2.0.3`).
+- `SWEEP_JOBS=4 SWEEP_ONLY=…` **14/14 rows PASS** (416 s; 0 serial retries; five firmware VOIDs — `gnoboot: fail @ EBS` —
+  relaunched inside their rows; NOT a sweep verdict, the full sweep is the closeout's): kstack **66/0** (`fault orphan`
+  at `-smp 4`: 30 ticks in the hold, `detached=1 left=1 zheld=1 zleft=1`, both reaped, 0 pages lost; `n/a (1 cpu)` at
+  `-smp 1`) · fault-kill · lifecycle **181/0** · spawn **133/0** · sandhi-async **24/24** (P2 slowest 6.10 s TCG / 1.22 s
+  KVM against the 60 s client timeout) · klug-spill **9/0** and wrapped **8/0** (both with `klug: spill lock OK`) · ZFS ring
+  3 · tcp-listen **4/0** + tcp-inbound **60/0** + sandhi-async on one `hostport` worker · doom · naad-ring3 ·
+  hid-mouse-deferred · pipeline **12/0**.
+- The two fixes' own evidence is in § Fixed — the merge (N-KTRY, the burn-prep dry run).
+
+### Closeout
+
+- **The release phase (2026-10-13), the full sweep once — the first on cyrius 6.6.20:** `sweep.sh` **73/74**
+  (`SWEEP_JOBS=4`, wall **5,453 s**: the parallel phase 5,329 s, then the exclusive `tsc` 84 s and `kvm-net-boot` 38 s).
+  The one red is row 1 `baseline check.sh`, **KNOWN RED by design**: inside it `check.sh` read 39/40, and its only FAIL
+  lines are the `syscall ABI` gate's ("kernel 111 · abi-doc 111 · cyrius 108", `#109`–`#111` absent from cyrius), so
+  it got one attempt and no retry. Every other row passed on its first attempt: **0 serial retries, no row re-run**.
+  **19 firmware VOIDs inside 12 rows**, every one `gnoboot: fail @ EBS` (the kernel never ran), each relaunched inside
+  its row, which then passed: `tsc` 4 (its `pc -smp 1` arm booted on the 5th of 6 tries), exFAT read 2, ZFS read 2
+  (mirror-a, raidz-0), ZFS write 2 (`wr@u0`), exec-redirect 2 (inside the agnsh-smoke it runs with its output
+  discarded, so the row printed no VOID line; found in the worker's `agnsh-smoke-logs/agnsh.log.attempt1-2`), and one
+  each in net-csum, doom, exFAT write, ext2 write, klug-spill wrapped, fssys and FP/SSE. The ZFS write row took
+  **5,324 s** (21/21 lanes, 12 rw pools committed and accepted by OpenZFS). The new `sandhi-async` row **24/0** (63 s).
+- **Against 1.57.13's closeout sweep, row by row:** 69 of the 73 rows both sweeps share ran in the same time or
+  faster, most by 2–35 %. The four that were 72–86 % faster (ring3, FP-area, chan-ring3, nbread) had firmware VOIDs at
+  1.57.13. The timing-sensitive rows held: `tsc` **75/0** in 84 s (86 s at 1.57.13, despite its four
+  VOIDs), calibration 3,193 cycles/µs and the tick period 9,999–10,000 µs as at 1.57.13, every ratio predicate green ·
+  `kvm-net-boot` **12/0** in 38 s (51 s), the pre-console window 3 ms at `-smp 1` and `-smp 4`, as before · `kstack`
+  **66/0** in 73 s (83 s) · `tcp` **66/0** in 47 s (51 s) · `tcp-inbound` **60/0** in 111 s (132 s) · the FP rows
+  14–103 s (18–107 s), except FP/SSE. Four rows were slower: three by one or two firmware VOIDs each (exFAT read 78 s
+  vs 20 s, exec-redirect 131 s vs 62 s, FP/SSE 55 s vs 18 s), and the **ZFS write row by +367 s (+7.4 %: 5,324 s vs
+  4,957 s), with two VOIDs in each sweep**. That last difference is NOT attributed. 1.57.13's lane logs were not kept,
+  so no per-lane comparison exists. The row ran alone for its last ~50 min in both sweeps. In this one, `check.sh`,
+  `test.sh --all` and the two re-measure builds below ran in the main tree (which no row used at that point) for about
+  3 minutes while the row was in its `fz` lane.
+- After the parallel rows (in the main tree, as above): `check.sh` **39/40** (the same one red: the `syscall ABI` gate,
+  by design) · `test.sh --all` **8/8** · plain and the binding flag build re-measured, the merge's numbers unchanged:
+  plain 2,679,672 B, LOAD end `0x39e218`, **400,872 B**; `ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 ZFS_WRITE_OPS=1`
+  2,820,984 B, `0x3c0a18`, **259,560 B**; 0 placeholders in each. Boot checkpoints from the sweep's logs: `ktest-smoke`
+  at `-smp 1` and `-smp 4` printed `AGNOS kernel v1.57.14`, both `boot: … OK` layout lines, `Userland exec complete`
+  and `TOTAL: 380 passed, 0 failed`, with 13/13 KTEST boot self-tests. `agnsh-smoke` **PASS** on the plain production
+  kernel (row 73's image build: both layout lines, the room carve-out (11 arrays, 300,064 B), the 0xE0 / 0xE1 gates,
+  agnoshi 2.0.3 in ring 3, no latched invariant). Version verify: `VERSION` 1.57.14 matches this header,
+  `kernel/version.cyr`'s three banners (21 / 31 / 34 B) and `kernel/agnos.cyr`'s header. The tag is the operator's.
+- The run's leftovers were removed: `tests/{chan,gpu,zfscodec}/cyrius.lock`, `tests/{gpu,zfscodec}/gen/` and
+  `scripts/{check,smoke/lib}/__pycache__/`, all written by `check.sh`. No root `lib/` or `cyrius.lock` was present. No
+  kernel, script or test changed at the closeout.
+- **CLAUDE.md closeout step 3 (dead-code audit) stays WAIVED** by the operator's standing rule *grow before refactor*.
+- **Open**: the cyrius peers for `#109`–`#111` (filed there; the ABI gate's by-design red). The closeout added
+  nothing.
+
 ## [1.57.13] — 2026-10-13 — repairs: VT-d queued invalidation, a ceiling on `sock_send`, the console from ring 3, tick deaths reaped in process context, aarch64 compiles
 
 The repair minor (operator ruling 2026-09-21: 1.57.x = arising-issue repairs; the aarch64 compile debt later in the

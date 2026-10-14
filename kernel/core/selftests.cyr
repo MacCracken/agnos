@@ -1773,7 +1773,7 @@ ext2_jbd2_crash_selftest();
 # Now: a long-lived HTTP/1.0 server. Serves for as long as the box is up (the
 # qemu timeout or a power-cycle ends it), net_poll()-ing every spin so ARP
 # replies + ICMP echo stay answered too — the box is pingable AND curl-able the
-# whole time. Banner is version-derived (_AGNOS_VERSION); every length is
+# whole time. Banner is version-derived (agnos_version_str()); every length is
 # strlen-computed, never a literal. Build-flag-gated, so production is untouched.
 {
     var m_start = "tcp_listen smoke: start";

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos audio-path test — clean generated waveforms (sine/square/saw/triangle/sweep) streamed through the snd_* band with BLOCKING writes."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 src = "tonegen.cyr"
@@ -13,4 +13,6 @@ output = "build/tonegen"
 # syscalls -> sys_snd_* + SYS_EXIT ; alloc -> the chunk buffer ; sakshi -> console
 # progress lines (visible on the iron FB as each tone plays) ; string -> sakshi dep.
 [deps]
-stdlib = ["string", "alloc", "syscalls", "sakshi", "atomic", "fnptr"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `alloc` includes `poison` since 6.6.18 — declared because `cyrius lib sync` copies only
+# what is declared (the 1.57.2 tests/chan precedent; `cyrius deps` vendored it where lib sync did not).
+stdlib = ["string", "alloc", "syscalls", "sakshi", "atomic", "fnptr", "poison"]

@@ -132,7 +132,7 @@ def main():
         "-device", "qemu-xhci,id=xhci",
         "-device", "usb-kbd,bus=xhci.0",
         "-serial", f"file:{args.serial}",
-        "-qmp", f"unix:{args.qmp},server,nowait",
+        "-qmp", f"unix:{args.qmp},server,nowait",   # socket path from scripts/probe/lockup-repro.sh (smoke_qsock)
         "-display", "none", "-no-reboot",
     ]
     print("QEMU:", " ".join(qemu), flush=True)

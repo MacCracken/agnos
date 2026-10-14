@@ -27,6 +27,7 @@ IMG  = os.path.join(WORK, "agnos-doom.img")
 # ⚠ REFUSES, does not rebuild: the image is produced by another smoke, so the honest action is
 # to name the command rather than silently regenerate someone else's artifact.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
 from _freshness import refuse_stale, kernel_sources
 # ⛔ 1.57.7 (HAR) — COMPARE AGAINST THE KERNEL BAKED INTO THE IMAGE, NOT build/agnos. doom-smoke.sh restores a PLAIN
 # build/agnos on exit (IMG-fix), so build/agnos is ALWAYS newer than the image it just baked and the old
@@ -57,7 +58,7 @@ refuse_stale(REC, kernel_sources(ROOT) + [os.path.join(ROOT, 'cyrius.cyml')],
              'kernel (a kernel source is newer than the kernel baked into this image)',
              REBAKE)
 SER  = os.path.join(WORK, "serial-input.log")
-MON  = "/tmp/agnos-doom-input.sock"
+MON  = qsock(os.path.join(WORK, "agnos-doom-input.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 PPM_A = os.path.join(WORK, "doom-input-a.ppm")  # title
 PPM_B = os.path.join(WORK, "doom-input-b.ppm")  # after 'w'
 

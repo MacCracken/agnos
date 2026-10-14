@@ -8,7 +8,7 @@ language = "cyrius"
 # it must equal the ROOT manifest's pin, because CI installs only that one version and
 # the wrapper resolves the manifest at the compile cwd. scripts/check/toolchain-pin-check.sh
 # enforces it; this comment used to read "pin the current 6.3.9" while the line said 6.5.27.
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 entry = "symtest.cyr"
@@ -17,4 +17,10 @@ output = "build/symtest"
 [deps]
 # Syscall ABI only — under `--agnos` this resolves to lib/syscalls_x86_64_agnos.cyr
 # (SYS_SYMLINK=63 / sys_open#7 / sys_read#5 / sys_write#1 / sys_close#6 / SYS_EXIT=0).
-stdlib = ["syscalls"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `syscalls` alone is NOT a closed set — it names `alloc` (since 6.6.6; CX-only under
+# `#ifdef CYRIUS_TARGET_CX` through 6.6.8, unconditional since 6.6.9), which names `atomic` + `fnptr` and, since
+# 6.6.18, `poison` (under `#ifdef CYRIUS_POISON`, never compiled here). `cyrius deps` walks includes textually, so
+# it resolved alloc/atomic/fnptr at the 6.6.6 pin too: this manifest was short BEFORE the move, which uncovered it.
+# `cyrius lib sync` copies only what is DECLARED, so the transitives are declared (the 1.57.2 tests/chan
+# precedent); `cyrius deps` vendoring 15 files where lib sync vendored 7 is how the 1.57.14 move measured it.
+stdlib = ["syscalls", "alloc", "atomic", "fnptr", "poison"]

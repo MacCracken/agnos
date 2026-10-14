@@ -14,7 +14,8 @@ RIPs; CLAUDE.md, `scripts/check/image-layout-check.sh`). The LOAD image's `memsz
 flag build (`ZFS_SELFTEST ZFS_WRITE_SELFTEST ZFS_WRITE_OPS`) had **60,216 B** left and `RING3_SELFTEST` 63,664 B, while
 B8–B11 were estimated at ≈ 44 KB (up to 2× at the bites' measured overrun) with zstd to follow — and ~300 KB of `.bss`
 was arrays nothing touches until long after the physical allocator is up. `CYRIUS_DCE` is not available (cycc bug,
-filed). Operator standing rule (2026-10-11), **grow before refactor**: never trim, `#ifdef`-out or dead-code-audit code
+filed: cyrius `issues/2026-10-10-agnos-kernel-dce-compaction-moves-data.md`, OPEN; from cyrius 6.6.20 — agnos's pin since
+1.57.14 — REVBE-01 declines compaction on a `kernel;` image, so `CYRIUS_DCE=1` NOP-fills and shrinks nothing). Operator standing rule (2026-10-11), **grow before refactor**: never trim, `#ifdef`-out or dead-code-audit code
 to make room; MOVE things.
 
 ## Prior art
@@ -191,7 +192,7 @@ Stayed, with the reason:
 | array | bytes | why it stays in the image |
 |---|---|---|
 | `bsp_boot_stack` | 65,536 | the shim's first instruction; a stack (red zone, the CR3 rule — kernel-stacks-and-preemption.md) |
-| kashi `kashi_font9_16` / `kashi_font16` / `kashi_font8` | 101,248 | the console draws from line 1; declared in the sibling kashi repo (u64 slots holding bytes — 7/8 unused; a kashi-side fix) |
+| kashi `kashi_font9_16` / `kashi_font16` / `kashi_font8` | 12,656 | the console draws from line 1; declared in the sibling kashi repo. 101,248 B through kashi 1.1.0 (u64 slots holding bytes — 7/8 unused); kashi 1.1.1 declares them in slots (`[904]`/`[452]`/`[226]`, the issue agnos filed), taken at agnos 1.57.14: −88,584 B of image (cyrius 6.6.20) |
 | `gpu_psp_ring` | 36,864 | DMA (the AMD PSP ring). The room is CPU-only; moving it means the driver's own pmm pages, `dma_kva` and an IOMMU grant (dma-cpu-pointers.md) on an iron-only path no QEMU smoke reaches |
 | `idt` | 32,768 | `idt_init` runs long before the pmm |
 | `vnet_rx_buf`, `vblk_dma_buf` | 24,576 + 4,096 | DMA, inside the default VT-d grant of the first 16 MB; the same driver conversion, later |

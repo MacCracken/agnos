@@ -2,7 +2,7 @@
 # Drive agnsh in QEMU through a USB-xHCI keyboard: wait for the banner, then
 # inject keystrokes via the HMP `sendkey` monitor command and watch the serial
 # log for the command's output. Proves end-to-end ring-3 typing.
-import socket, subprocess, sys, time, os
+import socket, subprocess, sys, time, os, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORK = os.path.join(ROOT, "build/agnsh-smoke")
@@ -16,12 +16,17 @@ IMG  = os.path.join(WORK, "agnos-agnsh.img")
 # ⚠ REFUSES, does not rebuild: the image is produced by another smoke, so the honest action is
 # to name the command rather than silently regenerate someone else's artifact.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
 from _freshness import refuse_stale
+# 1.57.14: the shell's `version` answer is ANY agnoshi major.minor. The literal "agnoshi 1." went stale at agnoshi 2.0
+# (it answers `agnoshi 2.0.3`) and scored a live shell as dead; agnsh-type-test.py made the same move at 1.57.13.
+AGNSH_VER = re.compile(r"agnoshi [0-9]+\.[0-9]+")
+def _hit(m, seg): return (m.search(seg) is not None) if hasattr(m, "search") else (m in seg)
 refuse_stale(IMG, [os.path.join(ROOT, 'build', 'agnos')],
              'kernel (build/agnos is newer than this baked image)',
              'rm -rf ' + WORK + '   # then re-run the smoke that builds this image')
 SER  = os.path.join(WORK, "serial-kvm.log")
-MON  = "/tmp/agnos-kvm.sock"
+MON  = qsock(os.path.join(WORK, "agnos-kvm.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 for c in ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/OVMF/OVMF_CODE.fd"):
     if os.path.exists(c): OVMF = c; break
 subprocess.run(["cp", os.path.join(WORK, "vars.fd"), os.path.join(WORK, "vars-kvm.fd")])
@@ -66,7 +71,7 @@ def p(*a): print(*a, flush=True)
 # "2/3 answered", never a silent pass.
 # ⛔ NOT the ECHOED word, for the reason the sibling gives at :56-57: agnsh's own `help` output lists
 # "version" and "mode" (:382-383), so counting echoes would let ONE surviving keystroke score 3/3.
-ANSWERS = (("help", "show this help"), ("version", "agnoshi 1."), ("mode", "Current mode:"))
+ANSWERS = (("help", "show this help"), ("version", AGNSH_VER), ("mode", "Current mode:"))
 
 rc = 1
 
@@ -161,7 +166,7 @@ try:
     # demand the typed TEXT back, not a reason to accept any bytes at all. The oracle is the third
     # option neither considered: the shell's ANSWERS, counted and printed, ported from the sibling
     # agnsh-type-test.py:148-158. A run that reports 1/3 is telling you its own input path broke.
-    answered = [cmd for cmd, marker in ANSWERS if marker in new]
+    answered = [cmd for cmd, marker in ANSWERS if _hit(marker, new)]
     p(f"typed 3 commands | serial grew {len(new)} bytes")
     p(f"typed lines the shell answered: {len(answered)}/{len(ANSWERS)}  {answered}")
     if len(answered) == len(ANSWERS):

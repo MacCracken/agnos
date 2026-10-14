@@ -30,7 +30,7 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-AGNOSHI="${AGNOSHI_ROOT:-$ROOT/../agnoshi}"
+AGNOSHI="${AGNOSHI_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/agnoshi}"
 SRC="$AGNOSHI/build/agnsh_agnos"     # CYRIUS_TARGET_AGNOS build — NOT build/agnsh (host/Linux ABI)
 DEST_DIR="$ROOT/build/rootfs/bin"
 DEST="$DEST_DIR/agnsh"

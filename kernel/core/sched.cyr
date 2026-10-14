@@ -451,12 +451,25 @@ fn sched_live_cr3_ok(pid) {
 # the slot's CR3 to 0x1000 (proc_reap / proc_reap_child) and be spinning in the fence for this CPU to leave
 # — refusing here on "live != slot" would deadlock the two. It has no continuation to preserve; the dead-old
 # path in do_context_switch hands this CPU back to 0x1000 before it goes.
+# ⛔ 1.57.14 — AND SO IS A DYING (4) ONE WHOSE DEATH IS DONE (proc.cyr lc_dying_done): ANY such current, whoever made
+# it 4. Two ways in, both with the slot's reap OWED (syscall.cyr proc_orphan_owed) while its CPU, still on the slot's
+# stack and CR3, is in sched_exit_tail about to raise its CPL0 switch: (1) a ring-3 FAULT's own death (an orphan, since
+# 1.57.14: proc_death_in_handler); (2) a ZOMBIE still in its exit tail — its exit#0 or fault published it (state 0,
+# done) and it has not left yet — that its parent's HANDLER death flips 0 -> 4 in the parent's final hold (a tick parent
+# since 1.57.13, a fault parent since 1.57.14). Another CPU's B1 / idle step may claim the owed bit first and run
+# proc_reap_orphan_space: it rewrites the slot's CR3 cell to 0x1000 and spins in the off-CPU fence for this CPU to
+# leave. "live != slot" would then refuse every switch — the voluntary one and each tick's in the `sti; hlt` fallback —
+# and the two CPUs would wait on each other forever (the drain preempt-held, this CPU parked on a dead stack). Way (2)
+# SHIPPED in 1.57.13 for a tick parent (state 0 was the only exemption: the flip to 4 removed it) — fixed here too. The
+# tick-killed process itself never meets it (its frame is CPL3). kstack-smoke `fault orphan` gates both ways: O's cell
+# is detached between its publish and its leave (`left=`), and Z's while Z waits in its exit tail (`zleft=`).
 fn sched_cpl0_switch_ok(isr_rsp) {
     if ((load64(isr_rsp + 128) & 3) != 0) { return 1; }
     var cs_cur = proc_current_get();
     if (cs_cur < 0) { return 1; }
     if (cs_cur >= proc_count) { return 1; }
     if (load64(&proc_table + cs_cur * 176 + 8) == 0) { return 1; }
+    if (lc_dying_done(cs_cur) == 1) { return 1; }               # 1.57.14: a fault death, its reap owed (above)
     if (sched_live_cr3_ok(cs_cur) == 0) { return 0; }
     return 1;
 }
@@ -1779,7 +1792,8 @@ fn lifecycle_after_unlock(lm) {
 # proc_orphan_owed_run, because fs_lock is held for whole ZFS commits and this ISR spun on it with the vector in
 # service — design k.132 (3); no fs_lock and no heap lock since): a CPU interrupted in ring 3 holds no kernel lock, so no
 # same-CPU holder can exist; other-CPU holders are ordinary contention (fault_kill_current runs the same chain from a
-# CPL3 exception on the same argument). do_context_switch's early-out guards are replicated: if it would not switch, a
+# CPL3 exception on the same argument, and since 1.57.14 owes the same reaps — syscall.cyr proc_death_in_handler).
+# do_context_switch's early-out guards are replicated: if it would not switch, a
 # death here would iretq a dead process. Returns the action (0 none · 1 died · 2 stopped · 3 dropped a stop).
 # ⭐ 1.57.7 (S8) — THE CPU CAP (spawn_limits#107 a2, or inherited). timer_handler has already charged proc_ticks[p] on
 # this tick (halted ticks are not charged). At the cap a SIGXCPU kill is MARKED on the current proc; the lifecycle body
@@ -1982,11 +1996,14 @@ fn lifecycle_trace(kind, pid, sig, via) {
     return 0;
 }
 
-# A process that has ended (state 0 already published — exit#0, fault_kill_current) leaves its CPU AT ONCE: a
+# A process that has ended (state 0 already published — exit#0, fault_kill_current; or DYING (4) with its death done
+# and its reap owed — a ring-3 fault's orphan death, or a zombie its parent's tick / fault death flipped to 4 while it
+# was still here: sched_cpl0_switch_ok) leaves its CPU AT ONCE: a
 # BLOCK-shaped voluntary switch (the BLOCK guard proceeds on state 0, do_context_switch never revives 0 and hands a
 # dead old back to the boot CR3), so its reaper's on_cpu fence spins for a few instructions instead of up to a
 # tick. The `sti; hlt` is the pre-scheduler and refused-switch fallback (the next tick switches away).
 fn sched_exit_tail() {
+    kst_note_exit_tail();                              # KSTACK_SELFTEST: holds an armed zombie here (no-op twin)
     while (1) {
         if (sched_active == 1) { sched_switch_vol(2); }
         # REGISTER CONTRACT (sti; hlt): no inputs, no outputs, no GPR touched. Sets RFLAGS.IF and halts until
@@ -3135,8 +3152,45 @@ fn kst_note_leave(old) {
     if (proc_epoch_get(old) != load64(&kst_leave_ep + knl_c * 8)) { kst_underfoot = kst_underfoot + 1; }
     return 0;
 }
+# 1.57.14 (main.cyr kst_phase_faultorphan) — a ring-3 fault's death is published (fault_kill_current, right after
+# proc_death, before its leave). For the ONE pid the phase armed, DETACH its CR3 cell to 0x1000 here: exactly what an
+# owed drain that claimed the pid first does (syscall.cyr proc_reap_orphan_space), placed deterministically in the
+# window that race needs — so the leave that follows meets "live != slot" every time, not by luck.
+var kst_fo_arm = 0 - 1;
+var kst_fo_detached = 0;
+fn kst_note_fault_death(pid) {
+    if (pid != kst_fo_arm) { return 0; }
+    kst_fo_arm = 0 - 1;
+    proc_set_cr3(pid, 0x1000);
+    kst_fo_detached = 1;
+    return 0;
+}
+# 1.57.14 review (main.cyr kst_phase_faultorphan, Z) — HOLD the ONE armed pid at the top of sched_exit_tail: its death is
+# published (a zombie: state 0, done) and it has not left its CPU — the window in which its parent's handler death flips
+# it 0 -> 4 and an owed drain may detach its CR3 cell. Held IF=0 (the exit tail's own state, so no tick moves it), with
+# tlb_service_self answering any shootdown meanwhile (kst_note_leave's hold), until kmain clears kst_fz_hold or 2 s pass
+# (kst_fz_timeout = 1: kmain's verdict then FAILs).
+var kst_fz_arm = 0 - 1;
+var kst_fz_hold = 0;
+var kst_fz_parked = 0;
+var kst_fz_timeout = 0;
+fn kst_note_exit_tail() {
+    if (proc_current_get() != kst_fz_arm) { return 0; }
+    kst_fz_arm = 0 - 1;
+    kst_fz_parked = 1;
+    var kfz_t = kst_now_us();
+    while (kst_fz_hold == 1) {
+        if (kst_now_us() - kfz_t > 2000000) { kst_fz_timeout = 1; kst_fz_hold = 0; }
+        tlb_service_self();                            # IF=0: answer a shootdown another CPU may be waiting on
+        asm { 0xF3; 0x90; }                            # pause (no GPR touched)
+    }
+    kst_fz_parked = 2;                                 # released: the exit tail's switch follows
+    return 0;
+}
 #endif
 #ifndef KSTACK_SELFTEST
+fn kst_note_fault_death(pid) { return 0; }
+fn kst_note_exit_tail() { return 0; }
 fn kst_probe_hook(a1, a2, a3) { return 0 - 1; }
 fn kst_tail_hook() { return 0; }
 fn kst_note_switch_out(old) { return 0; }

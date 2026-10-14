@@ -1068,12 +1068,14 @@ esac
 # leak — and two of them are not cosmetic: an exported ATOM_TX_CYCLE would add a LIVE #76 PHY edge to an arm
 # whose tag promises none, and an exported GPU_AUDIO_PROBE would silently supply the very flag the
 # required-flag gate above exists to make explicit, so a build could pass the gate for the wrong reason.
+# 1.57.14: the build log is the TREE's (build/), never a fixed /tmp name every tree shares (check.sh gate 40, S3).
+mkdir -p build
 if ! env -u HDA_HDMI -u HDA_TONE -u HDMI_DCCG -u HDMI_ATOM -u HDMI_AUDIO_DUMP -u HDMI_AUDIO_SWEEP \
         -u HDMI_ACR_CTS -u HDMI_SYMCLK_AB -u GPU_AUDIO_PROBE -u MODESET_AUDIO -u ATOM_TX_CYCLE \
         -u ATOM_DRY -u ATOM_TRACE -u ATOM_HALT -u ATOM_RUN_TRANSMITTER \
         -u EXT2_WRITE_SELFTEST -u EXEC_SELFTEST -u THREAD_SELFTEST \
-        $BUILD_ENV sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
-    echo "burn-prep: BUILD-FAIL (see /tmp/burn-prep-build.log)"
+        $BUILD_ENV sh scripts/build.sh >build/burn-prep-build.log 2>&1; then
+    echo "burn-prep: BUILD-FAIL (see build/burn-prep-build.log)"
     exit 1
 fi
 
@@ -1092,7 +1094,7 @@ _ART_SZ=0
 if [ "$_ART_SZ" -lt 50000 ]; then
     echo "burn-prep: NO ARTIFACT TO VERIFY -- build/agnos is $_ART_SZ bytes (need >= 50000)."
     echo "  build.sh exited 0 but left no usable kernel. Every verify_absent below would 'pass' by"
-    echo "  grepping an empty file, including the ATOM #76 safety proofs. See /tmp/burn-prep-build.log."
+    echo "  grepping an empty file, including the ATOM #76 safety proofs. See build/burn-prep-build.log."
     exit 1
 fi
 
@@ -1250,6 +1252,9 @@ esac
 _cmp_n=0
 _cmp_skipped=""
 _cmp_tools=18   # the length of the list on the next line — the denominator the count is read against
+# 1.57.14: siblings by the one rule (stage-tools.sh: ${SIBLINGS_ROOT:-<tree>/..}) — a bare ../<repo> named
+# .claude/worktrees/<repo> from a worktree, so every sibling row below fell to "no source to compare" there.
+_SIBS="${SIBLINGS_ROOT:-..}"
 for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug aethersafha puka crab agnsh kriya iam faulter; do
     _src=""
     _puka_alt=""
@@ -1264,10 +1269,7 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         gpublit)  _src="tests/gpu/build/gpublit_agnos" ;;
         gpufill)  _src="tests/gpu/build/gpufill_agnos" ;;
         gpucopy)  _src="tests/gpu/build/gpucopy_agnos" ;;
-        klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
-        kriya)   _src="../kriya/build/kriya_agnos" ;;
-        iam)     _src="../iam/build/iam_agnos" ;;
-        faulter) _src="tests/fault/build/faulter_agnos" ;;
+        faulter)  _src="tests/fault/build/faulter_agnos" ;;
         # ⛔ ADDED 2026-08-02 AFTER THIS GATE MISSED IT. The desktop burn staged an aethersafha
         # NINE HOURS OLD -- no geometry fix, none of the new diagnostics -- and every check passed,
         # because the only aethersafha check was a grep for "--selftest" and the OLD binary had that
@@ -1275,7 +1277,7 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         # tools it knew about, and did not know about the one the burn was for.
         # ⚠ Unlike klug, this one CAN be compared: aethersafha builds a real --agnos artifact at a
         # known path, so compare bytes rather than settling for size-only.
-        aethersafha) _src="../aethersafha/build/aethersafha_agnos" ;;
+        aethersafha) _src="$_SIBS/aethersafha/build/aethersafha_agnos" ;;
         # ⛔ RETIRED TRANSPORT — STAGED, NOT A BURN OBJECTIVE. These two are aethersafha's setu
         # clients, which connect back over loopback:7700. Operator ruling 2026-08-03: TCP-on-
         # loopback is the WRONG PRIMITIVE for local display IPC and is being removed in favour of
@@ -1289,9 +1291,9 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         # rather than here — see the `_puka_alt` block. Default is setu's slim present_probe (the
         # compositor's first-resident slot); `PUKA_TERMINAL=1 sh scripts/burn/stage-tools.sh` puts the
         # real terminal there, which is what an iron burn of `AE-T2` requires.
-        puka)        _src="../setu/build/puka_agnos" ; _puka_alt="../puka/build/puka_agnos" ;;
-        crab)        _src="../crab/build/crab_agnos" ;;
-        agnsh)       _src="../agnoshi/build/agnsh_agnos" ;;
+        puka)        _src="$_SIBS/setu/build/puka_agnos" ; _puka_alt="$_SIBS/puka/build/puka_agnos" ;;
+        crab)        _src="$_SIBS/crab/build/crab_agnos" ;;
+        agnsh)       _src="$_SIBS/agnoshi/build/agnsh_agnos" ;;
         # ⛔⛔ 2026-08-30 — THE OTHER TWELVE HAD NO `_src` AT ALL, SO THE LOOP CHECKED THEM FOR
         # PRESENCE AND NEVER FOR STALENESS. Eighteen tools iterate here and only four could be
         # compared; the rest fell through this case with `_src` empty and skipped the `cmp` entirely.
@@ -1303,20 +1305,16 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         # — written about gputex, while twelve rows including gputex`s siblings sat uncovered below it.
         # Every one of them has a resolvable `<repo>/build/<name>_agnos`; there was no reason for the
         # list to be short beyond nobody extending it.
-        klug)        _src="../klug/build/klug_agnos" ;;
-        kriya)       _src="../kriya/build/kriya_agnos" ;;
-        iam)         _src="../iam/build/iam_agnos" ;;
-        modeset)     _src="../agnos/tests/gpu/build/modeset_agnos" ;;
-        gpuwedge)    _src="../agnos/tests/gpu/build/gpuwedge_agnos" ;;
-        gputri)      _src="../agnos/tests/gpu/build/gputri_agnos" ;;
-        gputex)      _src="../agnos/tests/gpu/build/gputex_agnos" ;;
-        gpucov)      _src="../agnos/tests/gpu/build/gpucov_agnos" ;;
-        gpublend)    _src="../agnos/tests/gpu/build/gpublend_agnos" ;;
-        gpublit)     _src="../agnos/tests/gpu/build/gpublit_agnos" ;;
-        gpufill)     _src="../agnos/tests/gpu/build/gpufill_agnos" ;;
-        gpucopy)     _src="../agnos/tests/gpu/build/gpucopy_agnos" ;;
-        gpudepth)    _src="../agnos/tests/gpu/build/gpudepth_agnos" ;;
-        faulter)     _src="../agnos/tests/fault/build/faulter_agnos" ;;
+        # ⛔ 1.57.14: ONE ROW PER TOOL. Until 1.57.14 the 2026-08-30 fix above was added as a SECOND row for
+        # klug / kriya / iam / the ten gpu tools / faulter BELOW their first rows, and a `case` takes its
+        # first match: the second rows never ran. For the gpu tools, kriya, iam and faulter both rows named
+        # the same file, so nothing changed; for klug the first row was `klug) _src="" ;;` ("staged from its
+        # own repo; size-compare only" — no size compare existed), so klug was NEVER compared, the exact
+        # silent skip that fix was written to end. The duplicates are gone and klug compares against the
+        # file stage-tools.sh stages it from (`stage_one klug` → `$SIBLINGS/klug/build/klug_agnos`).
+        klug)        _src="$_SIBS/klug/build/klug_agnos" ;;
+        kriya)       _src="$_SIBS/kriya/build/kriya_agnos" ;;
+        iam)         _src="$_SIBS/iam/build/iam_agnos" ;;
     esac
     _src0="$_src"   # pre-match copy — the accounting at the bottom of this loop body explains why
     _staged="build/rootfs/bin/$_t"
@@ -1347,13 +1345,11 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
     # scoring the same green as a real comparison: `_src` left empty by the case above, or `_src` set
     # to a path that does not exist. The 2026-08-30 note twelve lines up records the first way costing
     # a burn's worth of trust (kriya stale by 27,688 bytes, prep said nothing) and adds twelve rows to
-    # close it — but the FIX IS STILL PARTLY INERT AND NOTHING SAYS SO:
-    #   · `klug) _src="" ;;` at :1243 matches FIRST, so the `klug) _src="../klug/build/klug_agnos"`
-    #     row added at :1282 by that very fix is unreachable and klug is compared against nothing;
-    #   · `modeset/gpuwedge/gputri/...` are likewise resolved by the earlier `tests/gpu/build/*` arms,
-    #     so the later `../agnos/tests/gpu/build/*` duplicates are dead too (harmless here, since the
-    #     earlier paths are the correct ones — but they mean the row count reads higher than the
-    #     coverage, which is how the first gap hid).
+    # close it — but that fix was PARTLY INERT until 1.57.14 and nothing said so: a `klug) _src="" ;;`
+    # row matched FIRST, so the klug row the fix added was unreachable and klug was compared against
+    # nothing, and the gpu / kriya / iam / faulter rows it added were dead duplicates of earlier arms (the
+    # row count read higher than the coverage, which is how the first gap hid). 1.57.14 left one row per
+    # tool (the case above); `_cmp_tools` is the number of tools, not of rows.
     # The loop verdict below says "staged tools match their builds". Over an all-skipped run that is a
     # sentence about nothing. So: count the real comparisons, NAME the tools that were skipped, and
     # floor the count — a run that compared nothing must not print that line.

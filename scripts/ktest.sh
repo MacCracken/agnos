@@ -174,7 +174,7 @@ echo "Booting test kernel via gnoboot + OVMF (-smp $KTEST_SMP, ${QEMU_TIMEOUT:-9
 # gnoboot + /boot/agnos; the kernel reaches core/boot_finish.cyr, runs
 # sh_cmd_test() in place of kybernet(), then arch_halt()s. Mirrors bench.sh's
 # OVMF plumbing, minus the ext2 data partition (no rootfs needed).
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 OVMF_CODE_CANDIDATES="/usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd"
 OVMF_VARS_CANDIDATES="/usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd"

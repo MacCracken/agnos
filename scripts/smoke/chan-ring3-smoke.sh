@@ -26,7 +26,7 @@ CHANX_DIR="$ROOT/tests/chan"
 WORK="$ROOT/build/chan-ring3"; LOGS="$ROOT/build/chan-ring3-logs"
 rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
 
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS_SRC="${OVMF_VARS:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"

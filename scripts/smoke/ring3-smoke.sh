@@ -22,7 +22,7 @@ set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
+GNOBOOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 
 for tool in qemu-system-x86_64 mformat mmd mcopy parted; do

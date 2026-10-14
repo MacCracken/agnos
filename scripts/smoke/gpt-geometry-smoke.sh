@@ -56,7 +56,7 @@
 # Exit: 0 PASS · 1 FAIL · 2 VOID (the firmware never handed off). Leaves a PLAIN build in build/agnos.
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
+GNOBOOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 GPTI="$ROOT/scripts/smoke/lib/gpt-image.py"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"

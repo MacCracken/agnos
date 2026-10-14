@@ -2,7 +2,7 @@
 
 > **TL;DR**: `./scripts/build.sh` produces `build/agnos` (x86_64 ELF64 multiboot2 kernel for the gnoboot Path-C handoff). Optional gates `KTEST=1` and `XHCI_VERBOSE=1` opt into developmental output that's off by default in production.
 >
-> Toolchain pin: see `cyrius.cyml` (`cyrius = "..."`) for the current version. The build script invokes `~/.cyrius/bin/cyrius` (the wrapper, not `cycc` directly). Wrapper auto-resolves the pin.
+> Toolchain pin: see `cyrius.cyml` (`cyrius = "..."`) for the current version. The build script invokes `~/.cyrius/bin/cyrius` (the wrapper, not `cycc` directly). Wrapper auto-resolves the pin. The kernel compiles from `kernel/`, which has no manifest, so the pin is enforced by `build.sh`'s drift gate, not by the wrapper (state.md § Cyrius pin — 6.6.20 since 1.57.14; `AGNOS_ALLOW_PIN_DRIFT=1` for a deliberate off-pin A/B). Sibling font data is folded in from `KASHI_DIR` / `REKHA_DIR`, falling back to clones of `KASHI_REF` / `REKHA_REF` (kashi 1.1.1, rekha 1.0.0 since 1.57.14).
 
 ---
 
@@ -156,6 +156,7 @@ build/agnos.compile-stderr.log    # the x86_64 compile's stderr, captured for th
 build/placeholder-x86.log         # the placeholder gate's output for the last x86_64 build (1.57.13)
 build/placeholder-aarch64.log     # … for the last aarch64 build (1.57.13)
 build/agnos.placeholder-refused   # an x86_64 image carrying unresolved-call placeholders (1.57.13) — never boot it
+build/agnos.lateinit-refused      # an x86_64 image whose compile named a late-replayed global initializer (1.57.14) — never boot it
 build/agnos-aarch64.placeholder-refused   # the same, aarch64 (1.57.13)
 build/agnos_ktest        # produced by scripts/ktest.sh (separate flow — see below)
 ```
@@ -178,6 +179,18 @@ moved to `build/agnos.placeholder-refused` / `build/agnos-aarch64.placeholder-re
 FAIL-CLOSED: an image it cannot scan (no section table, no executable section, no python3) is refused too (on x86_64
 without python3 the layout guard's own rules below apply). On a PASS it prints one `placeholders (<flags | plain>):
 PASS: …` line (aarch64: `placeholders: PASS: …`), which `check.sh` gate 39 and `release.yml` require.
+⭐ From cyrius **6.6.9** (agnos's pin is 6.6.20 since 1.57.14) the compiler itself refuses that shape on both backends
+(`error: refusing to emit binary with 1 reachable undefined function(s)` — measured on a dead-first / live-second probe:
+6.6.6 built it rc 0, x86 with a warning and aarch64 silently; 6.6.20 refuses both). The gate stays as the belt: it
+scans the IMAGE, and it is the only check on a deliberately off-pin build.
+
+**Late-initializer refusal (1.57.14).** cyrius 6.6.16+ warns once per declaration-zone global whose initializer an x86
+`kernel;` build runs AFTER the top-level program (a string literal, a call — anything not a constant; constants and
+enum-named initializers are baked into the image). This kernel's program never returns, so such a global reads 0
+forever. `build.sh` greps the captured compile stderr for `in a kernel build the initializer of` and **refuses** the
+image (moved to `build/agnos.lateinit-refused`, exit 1). Use a constant, an accessor fn (`version.cyr`'s
+`agnos_version_str()`), or assign it in the program. The 6.6.20 move dropped the two gvars that tripped it
+(`_AGNOS_VERSION`, `kernel_hostname` — nothing read either).
 
 **Image-layout guard (1.57.7; re-based 1.57.12).** After **every** x86_64 build, `build.sh` runs
 `scripts/check/image-layout-check.sh` on the image it just wrote: `LOAD end <= 0x400000` — the top of region 1, which
@@ -261,7 +274,7 @@ None of the smoke harnesses depend on `KTEST` or `XHCI_VERBOSE` output being pre
 The release sweep: the baseline `check.sh` plus every registered QEMU smoke, one row per smoke, each against the
 compile-gated kernel it needs. There were 59 rows at 1.57.9 and 63 at 1.57.10, which added ext2 and blk-write and
 split fg into three rows: default, recovery -smp 1 and recovery -smp 4; 71 at 1.57.12 and 73 at 1.57.13
-(`sock-send-dl-smoke`, `tty-smoke`) — count them with `grep -c '^run_gate "' scripts/sweep.sh`. Each recovery boot is ~6 min, and both
+(`sock-send-dl-smoke`, `tty-smoke`); the 1.57.14 pin move adds `sandhi-async-smoke` (74 in that track) — count them with `grep -c '^run_gate "' scripts/sweep.sh`. Each recovery boot is ~6 min, and both
 default boots together take ~1 min. Since **1.57.9** the rows run **in parallel**.
 
 ```sh
@@ -322,23 +335,32 @@ pytest-xdist `loadgroup`, pytest-rerunfailures, Bazel `exclusive`/`flaky`, CTest
    `build/`. The one exception is `build/rootfs/`, the staged agnos-fs from `scripts/burn/stage-agnsh.sh` and
    `stage-tools.sh`, which is copied over: it is the only `build/` input a row reads (shutdown-smoke seeds from it). A
    tree without it used to fail that row in both modes; since 1.57.10 the sweep stages it when absent (above). It is
-   never copied BACK: the log copy-back excludes `build/rootfs/`. The copies are **siblings** of the tree, so every smoke's `${X_ROOT:-$ROOT/../x}` default (gnoboot,
-   agnoshi, kashi, rekha, naad, cyrius-doom) resolves unchanged; the absolute paths are exported too — since 1.57.13
-   each defaulting through `${SIBLINGS_ROOT:-$ROOT/..}` (from a worktree, `$ROOT/..` holds no sibling; `doom-smoke`,
-   `doom-audio-smoke` and `naad-ring3-smoke` follow the same rule). About 18 MB each.
+   never copied BACK: the log copy-back excludes `build/rootfs/`. The copies are **siblings** of the tree, so every
+   smoke's sibling default (gnoboot, agnoshi, kashi, rekha, naad, cyrius-doom) resolves unchanged; the absolute paths
+   are exported too — since 1.57.13 each defaulting through `${SIBLINGS_ROOT:-$ROOT/..}` (from a worktree, `$ROOT/..`
+   holds no sibling). Since 1.57.14 EVERY smoke and harness follows that one rule — `${<NAME>_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/<repo>}`
+   in the shell, `sibling("<repo>", "<NAME>_ROOT")` (`scripts/harness/_siblings.py`) in Python — and never builds
+   inside a sibling (agnova-install, mishran-audio and vani-tone build from a copy under `build/`, as naad-ring3 has
+   since 1.57.13); `check.sh` gate 40 (`scripts/check/smoke-hygiene-check.sh`, over `scripts/smoke`, `scripts/harness`,
+   `scripts/tool` and `scripts/probe`) refuses anything else. About 18 MB each.
    ⚠ A worker copy's paths are long (`…/.<tree>.sweep.<pid>.w<K>/build/<smoke>/…`), over the 108-byte UNIX `sun_path`
    for any socket under them: since 1.57.13 every QEMU monitor / VNC socket goes through `smoke_qsock`
    (`scripts/smoke/lib/qemu-dwell.sh`; `scripts/harness/_qsock.py` for the harnesses), which binds it at
    `${XDG_RUNTIME_DIR:-/tmp}/agnos-q.<md5(path)[:12]>/<name>` — only when `lstat` says that name is a real directory of
    this uid with no group / other bits (a symlink, a foreign or 0777 directory, a plain file → `mktemp -d` instead), and
-   safe under `set -e`. A new smoke that opens a QEMU socket uses it.
+   safe under `set -e`. A new smoke that opens a QEMU socket uses it — since 1.57.14 every harness and every QEMU
+   driver under `scripts/tool` / `scripts/probe` does too (the fixed `/tmp/agnos-*.sock` names are gone from all four
+   directories), and gate 40 refuses a `unix:` / socket `path=` not bound through a TREE-ROOTED call (the hash is
+   per-tree only because the argument names the tree: `smoke_qsock "$WORK/mon.sock"`, never `smoke_qsock "mon.sock"`)
+   and any other fixed `/tmp/<name>` (build logs go to the tree's `build/`). `scripts/burn/` and the top-level
+   `build.sh` / `test.sh` / `bench.sh` are outside its walk (the gate's header lists what it does not follow).
 3. **Placement.** The `check.sh` row runs in the **main** tree, concurrently with the workers (it needs `.git`; no
    worker touches the main `build/`). Every other row belongs to a **group**, the optional 4th `run_gate` argument
    (keyless = a group of one). A group runs on one worker, in table order. Idle workers claim the next group with an
    atomic `mkdir claim.<group>`, longest group first, weighted by the previous runs' `build/sweep-logs/durations.tsv`
    (history kept in `build/sweep-durations.prev.tsv`). Keys at 1.57.9:
-   - `hostport`: tcp-listen and tcp-inbound. Both take a host port from `bind(0)` and close it before QEMU's
-     `hostfwd` binds it.
+   - `hostport`: tcp-listen, tcp-inbound and (since 1.57.14) sandhi-async. Each takes a host port from `bind(0)` and
+     closes it before QEMU's `hostfwd` binds it, so the three run in order on one worker.
    - `naad`: the row that wrote a sibling build dir (`../naad/build/naadex`) until 1.57.13; it now builds naadex from a
      copy in its tree's `build/naad-ring3-src/` and only reads the sibling. The key is kept.
    - `waits`: wait-ring3 and wait-kbd both build `tests/waits`.

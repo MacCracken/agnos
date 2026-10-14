@@ -20,9 +20,9 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-ARK_BIN="${ARK_BIN:-$ROOT/../ark/build/ark_agnos}"
-FIXTURE="${FIXTURE:-$ROOT/../takumi/build/fixture/symlink-test.ark}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+ARK_BIN="${ARK_BIN:-${SIBLINGS_ROOT:-$ROOT/..}/ark/build/ark_agnos}"
+FIXTURE="${FIXTURE:-${SIBLINGS_ROOT:-$ROOT/..}/takumi/build/fixture/symlink-test.ark}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done

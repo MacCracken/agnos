@@ -536,7 +536,9 @@ fn icmp_spin_unlock() {
 # fs_lock is held for whole ZFS commits and the ISR spun on it; design k.132 (3). No heap lock either: a callee walk of
 # every tick-path release found none — 1.57.13 review.) The CPL3 test (its `(frame+128 & 3) == 3` early return) is load-bearing. A CPU
 # interrupted in ring 3 holds no kernel lock, so no same-CPU holder of any of these can exist; another CPU's hold is
-# ordinary contention. fault_kill_current runs the same chain from a CPL3 exception on the same argument. The same
+# ordinary contention. fault_kill_current runs the same chain from a CPL3 exception on the same argument, and since
+# 1.57.14 owes the same REAPS instead of taking fs_lock for them there (syscall.cyr proc_death_in_handler; its ZFS
+# exit commit and covered-console spill stay in its handler, as exit#0's stay in the syscall). The same
 # exception covers the "no ISR calls kprint" rule below; the display hand-back's disk spill + kprint are deferred to
 # the next syscall exit (gpu_release_pid_isr / klug_spill_owed). klug_lock_word (above) is a LEAF below everything.
 #

@@ -524,7 +524,7 @@ done
 # never ran". An empty enumeration reproduces it exactly, from inside the fix.
 # ⚠ Absence stays a WARNING, not an abort, because most burns do not drive the desktop — but it is now
 # printed for BOTH ways of having no wallpaper, and the count is printed when there are some.
-AE_WP_DIR="${AE_WP_DIR:-$ROOT/../aethersafha/assets/wallpapers}"
+AE_WP_DIR="${AE_WP_DIR:-$SIBLINGS/aethersafha/assets/wallpapers}"
 _nwp=0
 if [ -d "$AE_WP_DIR" ]; then
     for _wp in "$AE_WP_DIR"/*.png "$AE_WP_DIR"/*.jpg; do

@@ -27,8 +27,8 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-VANI_ROOT="${VANI_ROOT:-$ROOT/../vani}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+VANI_ROOT="${VANI_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/vani}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -46,10 +46,19 @@ AGNOS="$ROOT/build/agnos"
 WORK="$ROOT/build/vani-tone-smoke"; rm -rf "$WORK"; mkdir -p "$WORK"
 IMG="$WORK/agnos-vani-tone.img"; SLOG="$WORK/serial.log"; WAV="$WORK/out.wav"
 
-echo "[1/5] Regenerating dist/vani-core.cyr (with the agnos backend branches)..."
-( cd "$VANI_ROOT" && cyrius distlib core ) >/tmp/vani-core-distlib.log 2>&1 || {
-    echo "  DISTLIB-FAIL (see /tmp/vani-core-distlib.log)"; tail -5 /tmp/vani-core-distlib.log; exit 1; }
-BUNDLE="$VANI_ROOT/dist/vani-core.cyr"
+# ⛔ 1.57.14 — NEVER WRITE INTO THE SIBLING (naad-ring3-smoke.sh's rule since 1.57.13). `cyrius distlib core` used to
+# run INSIDE $VANI_ROOT, so every run rewrote the vani repo's TRACKED dist/vani-core.cyr (and whatever the toolchain
+# resolves, lib/, cyrius.lock) — a smoke regenerating a sibling's release artifact under agnos's pin. Now the sources it
+# reads (cyrius.cyml, VERSION, cyrius.lock, src/, lib/, dist/, programs/ — never .git) are copied to $WORK/vani-src
+# and the bundle is regenerated there; the logs are $WORK's (they were fixed /tmp paths shared by every tree).
+VBUILD="$WORK/vani-src"; mkdir -p "$VBUILD"
+for _n in cyrius.cyml VERSION cyrius.lock src lib dist programs; do
+    [ -e "$VANI_ROOT/$_n" ] && cp -a "$VANI_ROOT/$_n" "$VBUILD/"
+done
+echo "[1/5] Regenerating dist/vani-core.cyr (with the agnos backend branches) in a copy of vani ($VBUILD)..."
+( cd "$VBUILD" && cyrius distlib core ) >"$WORK/vani-core-distlib.log" 2>&1 || {
+    echo "  DISTLIB-FAIL (see $WORK/vani-core-distlib.log)"; tail -5 "$WORK/vani-core-distlib.log"; exit 1; }
+BUNDLE="$VBUILD/dist/vani-core.cyr"
 [ -f "$BUNDLE" ] || { echo "  ERROR: bundle not produced at $BUNDLE"; exit 1; }
 grep -q 'sys_snd_open' "$BUNDLE" || { echo "  ERROR: bundle lacks the agnos backend (sys_snd_open) — stale vani-core"; exit 1; }
 echo "  vani-core.cyr $(wc -l < "$BUNDLE") lines, agnos backend present"
@@ -59,7 +68,7 @@ CB="$WORK/consumer"; mkdir -p "$CB/build"
 cp "$BUNDLE" "$CB/vani-core.cyr"
 # Reuse the canonical vanitone source, swapping its include from the in-repo
 # src/alsa.cyr to the bundled vani-core.cyr so the build needs no yukti.
-sed 's|include "src/alsa.cyr"|include "vani-core.cyr"|' "$VANI_ROOT/programs/vanitone.cyr" > "$CB/vanitone.cyr"
+sed 's|include "src/alsa.cyr"|include "vani-core.cyr"|' "$VBUILD/programs/vanitone.cyr" > "$CB/vanitone.cyr"
 # ⚠ NO `cyrius = ` PIN HERE, DELIBERATELY (2026-08-24). This heredoc used to hardcode
 # cyrius = "6.4.2" — an EIGHTH nested manifest that no manifest grep and no git-based gate can
 # see, because it is written into build/ (gitignored) at runtime. It is the same defect that
@@ -81,16 +90,16 @@ output = "build/vanitone"
 [deps]
 stdlib = ["syscalls","string","alloc","str","fmt","vec","io","fs","args","hashmap","tagged","fnptr","chrono","sakshi"]
 EOF
-if ! ( cd "$CB" && cyrius build vanitone.cyr build/vanitone-agnos --agnos ) >/tmp/vanitone-build.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/vanitone-build.log)"; tail -8 /tmp/vanitone-build.log; exit 1
+if ! ( cd "$CB" && cyrius build vanitone.cyr build/vanitone-agnos --agnos ) >"$WORK/vanitone-build.log" 2>&1; then
+    echo "  BUILD-FAIL (see $WORK/vanitone-build.log)"; tail -8 "$WORK/vanitone-build.log"; exit 1
 fi
 VANITONE="$CB/build/vanitone-agnos"
 [ -f "$VANITONE" ] || { echo "  ERROR: vanitone not built"; exit 1; }
 echo "  /bin/vanitone $(stat -c %s "$VANITONE") B"
 
 echo "[3/5] Building VANITONE_AUDIO_SELFTEST kernel..."
-if ! env VANITONE_AUDIO_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/vani-tone-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/vani-tone-kbuild.log)"; tail -5 /tmp/vani-tone-kbuild.log; exit 1
+if ! env VANITONE_AUDIO_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$WORK/kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (see $WORK/kbuild.log)"; tail -5 "$WORK/kbuild.log"; exit 1
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
 

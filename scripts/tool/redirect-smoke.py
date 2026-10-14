@@ -17,19 +17,22 @@
 import socket, subprocess, sys, time, os, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.join(ROOT, "scripts/harness"))   # 1.57.14: the harness helpers (_siblings / _qsock)
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK = os.path.join(ROOT, "build/redirect-smoke")
 IMG = os.path.join(WORK, "agnos-redirect.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-redirect.log")
-MON = "/tmp/agnos-redirect.sock"
+MON = qsock(os.path.join(WORK, "agnos-redirect.sock"))  # 1.57.14: short + per-tree (_qsock.py) — a fixed /tmp name every tree shared
 PART_OFFSET = 33 * 1048576
 PART_BLOCKS = (67 * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES",
                                "^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg")
-AGNSH_SRC = os.environ.get("AGNSH_BIN", os.path.join(ROOT, "../agnoshi/build/agnsh_agnos"))
+AGNSH_SRC = os.environ.get("AGNSH_BIN") or os.path.join(sibling("agnoshi", "AGNOSHI_ROOT"), "build/agnsh_agnos")
 
 def need(*paths):
     for p in paths:

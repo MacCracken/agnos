@@ -37,6 +37,14 @@
 #                                    (>= 10), both reaps are OWED (DYING, nothing reaped under the hold), and after the
 #                                    release an idle step / syscall exit reaps both (state 0, no table, CR3 0x1000, memory
 #                                    back). ("n/a (1 cpu)" at -smp 1)
+#   kstack: fault orphan OK          (1.57.14, the 1.57.13 carry) -smp 4: the same hold, with a ZFS pool reading as imported,
+#                                    while an ORPHAN FAULTS (ud2, exit 134) on an AP with its CR3 cell detached under it and
+#                                    its zombie child Z (faulted first) still HELD in its exit tail on another AP: that CPU
+#                                    keeps ticking (>= 10: the #UD handler took no fs_lock — no reap, and no zfs_release_pid
+#                                    lock for a table with no ZFS fd), the dead orphan LEFT its CPU, Z (flipped 0 -> 4 while
+#                                    held, its cell detached) LEFT its CPU once let go — a DYING-done CPL0 leave is never
+#                                    refused — both reaps are OWED, and after the release both are reaped in process
+#                                    context. ("n/a (1 cpu)" at -smp 1)
 #   sched: resched gate 0xE0 OK      the 0xE0 gate check at boot
 #   kstack: spurious 0xE1 OK         (1.57.7 S3.8) a self-IPI on the 0xE1 kick vector is EOI'd; the timer keeps ticking
 #   kstack: kick gate DPL0 OK        (1.57.7 S3.8) a ring-3 `int 0xE1` is a #GP (exit 141)
@@ -167,6 +175,11 @@ for smp in ${KSTACK_SMP:-1 4}; do
         want "kstack: tick orphan OK"       "[smp$smp] an orphan killed at the tick while kmain holds fs_lock: its CPU kept ticking, both reaps owed, then reaped in process context (1.57.13)"
     else
         want "kstack: tick orphan n/a (1 cpu)" "[smp$smp] single CPU: tick orphan not applicable"
+    fi
+    if [ "$smp" -gt 1 ]; then
+        want "kstack: fault orphan OK"      "[smp$smp] an orphan FAULT-killed while kmain holds fs_lock: its CPU kept ticking, it and its zombie (held in its exit tail) left their CPUs with their CR3 cells detached, both reaps owed, then reaped in process context (1.57.14)"
+    else
+        want "kstack: fault orphan n/a (1 cpu)" "[smp$smp] single CPU: fault orphan not applicable"
     fi
     want "kstack: done"                     "[smp$smp] the selftest ran to its end (no hang)"
     deny "kstack: FAIL"                     "[smp$smp] no kstack FAIL line"

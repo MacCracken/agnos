@@ -47,7 +47,7 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 KFONT_ROOT="$ROOT/tests/kfont"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
@@ -58,9 +58,10 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd stri
 done
 
 echo "[1/4] Building kfont (--agnos) + the KFONT_RING3_SELFTEST kernel..."
-( cd "$KFONT_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build kfont.cyr build/kfont --agnos ) >/tmp/kfont-build.log 2>&1 || { echo "  BUILD-FAIL (kfont)"; tail -8 /tmp/kfont-build.log; exit 1; }
-if ! env KFONT_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/kfont-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/kfont-kbuild.log)"; tail -8 /tmp/kfont-kbuild.log; exit 1
+mkdir -p "$ROOT/build"   # 1.57.14: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+( cd "$KFONT_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build kfont.cyr build/kfont --agnos ) >"$ROOT/build/kfont-build.log" 2>&1 || { echo "  BUILD-FAIL (kfont)"; tail -8 "$ROOT/build/kfont-build.log"; exit 1; }
+if ! env KFONT_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/kfont-kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $ROOT/build/kfont-kbuild.log)"; tail -8 "$ROOT/build/kfont-kbuild.log"; exit 1
 fi
 
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"

@@ -10,25 +10,31 @@
 #   (wait)        -> "SLEEPER-DONE" (the bg job ran to completion) then "[1] Done" (agnsh reaped it)
 # PASS = "[1]" launched + the version response printed BEFORE SLEEPER-DONE (concurrency) +
 #        "SLEEPER-DONE" + "[1] Done". Builds its own image from build/rootfs + a seeded /bin/sleeper.
-import socket, subprocess, sys, time, os, struct
+import socket, subprocess, sys, time, os, struct, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
+# 1.57.14: the shell's `version` answer is ANY agnoshi major.minor. The literal "agnoshi 1." went stale at agnoshi 2.0
+# (it answers `agnoshi 2.0.3`) and scored a live shell as dead; agnsh-type-test.py made the same move at 1.57.13.
+AGNSH_VER = re.compile(r"agnoshi [0-9]+\.[0-9]+")
+def _hit(m, seg): return (m.search(seg) is not None) if hasattr(m, "search") else (m in seg)
 refuse_stale_kernel(ROOT)
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK = os.path.join(ROOT, "build/agnsh-bg")
 IMG = os.path.join(WORK, "agnos-bg.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-bg.log")
-MON = "/tmp/agnos-bg.sock"
+MON = qsock(os.path.join(WORK, "agnos-bg.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 PART_OFFSET = 33 * 1048576
 PART_BLOCKS = (67 * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES",
@@ -168,7 +174,7 @@ try:
         deadline = time.time() + timeout
         while time.time() < deadline:
             seg = ser()[m:]
-            if marker is None or marker in seg: return seg
+            if marker is None or _hit(marker, seg): return seg
             time.sleep(0.5)
         return ser()[m:]
 
@@ -186,10 +192,10 @@ try:
     done_before_version = "SLEEPER-DONE" in bg_seg
     t_launch = time.time()   # the job has been running since "[1]" appeared just above
     # 2) prompt LIVE while the bg job runs — version responds (a fresh "agnoshi 1.") BEFORE done.
-    ver_seg = run_wait("version\n", "agnoshi 1.", timeout=20)
-    ver_live = "agnoshi 1." in ver_seg
+    ver_seg = run_wait("version\n", AGNSH_VER, timeout=20)
+    ver_live = AGNSH_VER.search(ver_seg) is not None
     ver_before_done = ver_live and ("SLEEPER-DONE" not in ver_seg or
-                                    ver_seg.index("agnoshi 1.") < ver_seg.index("SLEEPER-DONE"))
+                                    AGNSH_VER.search(ver_seg).start() < ver_seg.index("SLEEPER-DONE"))
     # 3) the bg job runs to completion + agnsh reaps it. Time launch -> SLEEPER-DONE on the
     # host clock (1.44.16 sched_yield measurement: agnsh donating its slice should cut this
     # vs the busy-polling baseline; same N + same host = comparable across runs).
@@ -221,7 +227,6 @@ try:
     # with them firing until it grepped for them.
     import re as _re_inv
     # 1.57.7 (S3d): loaded from scripts/smoke/lib/qemu-dwell.sh through _invdeny.py — no pasted copy left to drift.
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _invdeny import smoke_invariant_deny
     INV_DENY = smoke_invariant_deny()
     inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]

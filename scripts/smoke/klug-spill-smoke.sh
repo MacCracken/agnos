@@ -19,7 +19,7 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 
 OVMF_CODE_CANDIDATES="/usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/qemu/OVMF_CODE.fd"
 OVMF_VARS_CANDIDATES="/usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/qemu/OVMF_VARS.fd"
@@ -110,6 +110,12 @@ chk "$r" "the kernel reported a non-zero spill (${REPORTED:-0} bytes)" \
 [ "${SPILL_BYTES:-0}" -gt 0 ] && r=1 || r=0
 chk "$r" "/klug.txt exists on the platter and is non-empty ($SPILL_BYTES bytes read by debugfs)" \
         "debugfs could not read /klug.txt — the spill never reached the disk"
+
+# ⭐ 1.57.14 — the spill holds fs_lock like every ext2 writer; the owed (B1) spill takes it by trylock: kmain holds the
+# lock, the owed run must keep its debt, then pay once it is released (main.cyr KLUG_SPILL_SELFTEST).
+grep -aq "klug: spill lock OK" "$LOG" && ! grep -aq "klug: spill lock FAILED" "$LOG" && r=1 || r=0
+chk "$r" "the owed spill kept its debt under a held fs_lock and paid once it was free (trylock)" \
+        "$(grep -aoE 'klug: spill lock FAILED[^[:cntrl:]]*' "$LOG" | head -1 || true) — the owed spill ran under another holder's fs_lock, or never ran"
 
 # The file is pre-allocated to the full 64 KB ring, so its SIZE is 65536; the meaningful check is that the
 # first REPORTED bytes match the serial capture.

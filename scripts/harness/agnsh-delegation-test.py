@@ -8,24 +8,32 @@
 # SYMLINK inode to the kriya dispatcher (which then dispatches on basename(argv0)).
 #
 # Sequence (xHCI keyboard via HMP sendkey, ASSIST mode = no confirm prompts):
-#   mkdir /dtest        kriya mkdir via /bin/mkdir->kriya symlink -> ext2 mkdir
-#   touch /tfile        kriya touch via /bin/touch->kriya symlink -> ext2 create
-#   ls /                kriya ls    via /bin/ls->kriya    -> must list dtest+tfile+hello.txt+bin
-#   owl -p /hello.txt   owl reads the seeded file         -> must print OWLPROOF
-#   cat /hello.txt      agnsh nudge (no /bin/cat)         -> must print the owl hint
-# PASS = ls lists dtest+tfile (symlink->kriya wrote ext2) AND owl prints OWLPROOF
-#        AND the cat line nudges to owl. Builds its own image from build/rootfs.
+#   mkdir /dtest              kriya mkdir via /bin/mkdir->kriya symlink -> ext2 mkdir
+#   cp /hello.txt /h2         kriya cp    via /bin/cp->kriya symlink    -> ext2 create + write
+#   owl -p /hello.txt         owl reads the seeded file                 -> must print OWLPROOF
+#   owl -p /h2                owl reads the copy                        -> must print OWLPROOF (proves cp)
+#   echo VERBPROOF > /vtest   agnsh output REDIRECT (open AO_CREAT|AO_TRUNC + exec_redirect#62) of kriya echo
+#   owl -p /vtest             owl reads the redirect's file             -> must print VERBPROOF
+#   cat /hello.txt            agnsh nudge (no /bin/cat)                 -> must print the owl hint
+#   ls /                      kriya ls    via /bin/ls->kriya            -> must list h2 (LAST: may wedge)
+# PASS = every marker above. Builds its own image from build/rootfs.
+# 1.57.14: the echo-redirect + readback pair is the half of the retired agnsh-verb-test.py (agnoshi < 1.5.0's in-shell
+# `echo VERBPROOF > /vtest` / `cat /vtest`) this test did not carry; scripts/tool/redirect-smoke.py drives the same
+# redirect with owl as the writer. (This header listed `touch /tfile` / "ls lists dtest+tfile" until 1.57.14 — the
+# sequence below never ran touch.)
 import socket, subprocess, sys, time, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
 refuse_stale_kernel(ROOT)
 ROOTFS = os.path.join(ROOT, "build/rootfs")
@@ -33,7 +41,7 @@ WORK = os.path.join(ROOT, "build/agnsh-deleg")
 IMG = os.path.join(WORK, "agnos-deleg.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-deleg.log")
-MON = "/tmp/agnos-deleg.sock"
+MON = qsock(os.path.join(WORK, "agnos-deleg.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 PART_OFFSET = 33 * 1048576
 PART_BLOCKS = (67 * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES",
@@ -109,7 +117,7 @@ try:
     def ser():
         try: return open(SER, "rb").read().decode("latin1")
         except OSError: return ""
-    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash'}
+    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', '>': 'shift-dot'}
     def typ(word, settle=2.0):
         for ch in word:
             key = km.get(ch, ch)
@@ -145,25 +153,30 @@ try:
     run_wait("cp /hello.txt /h2\n", None, timeout=18)                   # kriya cp (no stdout)
     owl_seg = run_wait("owl -p /hello.txt\n", "OWLPROOF", timeout=40)   # owl reads the original
     cpv_seg = run_wait("owl -p /h2\n", "OWLPROOF", timeout=40)          # owl reads the copy -> proves cp
+    run_wait("echo VERBPROOF > /vtest\n", None, timeout=18)            # agnsh redirect of kriya echo (no stdout)
+    vrb_seg = run_wait("owl -p /vtest\n", "VERBPROOF", timeout=40)      # owl reads the redirect's file back
     cat_seg = run_wait("cat /hello.txt\n", "owl", timeout=15)           # agnsh cat->owl nudge
     ls_seg  = run_wait("ls /\n", "h2", timeout=20)                      # dir read (may wedge — last)
     time.sleep(0.6)
 
     for label, seg in (("owl -p /hello.txt", owl_seg), ("owl -p /h2 (cp copy)", cpv_seg),
+                       ("owl -p /vtest (echo > redirect)", vrb_seg),
                        ("cat /hello.txt", cat_seg), ("ls / (kriya getdents)", ls_seg)):
         p(f"=========== {label} ==========="); p(seg if seg.strip() else "(empty / wedged)")
     p("==========================================")
 
     owl_ok = "OWLPROOF" in owl_seg     # owl read the seeded file (owl is cat)
     cp_ok  = "OWLPROOF" in cpv_seg     # cp copied content (owl read the copy back)
+    vrb_ok = "VERBPROOF" in vrb_seg    # agnsh `>` wrote kriya echo's stdout into the ext2 file
     cat_ok = "owl" in cat_seg          # agnsh cat->owl nudge fired
     ls_ok  = "h2" in ls_seg            # kriya ls/getdents on agnos (kriya 1.1.2 fnptr fix)
     p("owl -p prints OWLPROOF (owl is cat):", owl_ok)
     p("cp copied /hello.txt -> /h2 (owl read it back):", cp_ok)
+    p("echo VERBPROOF > /vtest wrote the file (owl read it back):", vrb_ok)
     p("cat nudges to owl:", cat_ok)
     p("ls lists the copy (kriya ls/getdents on agnos):", ls_ok)
-    if owl_ok and cp_ok and cat_ok and ls_ok:
-        p("agnsh-delegation-test: PASS — kriya (mkdir/cp/ls) + owl (cat) + cat->owl nudge all green on agnos")
+    if owl_ok and cp_ok and vrb_ok and cat_ok and ls_ok:
+        p("agnsh-delegation-test: PASS — kriya (mkdir/cp/echo/ls) + agnsh `>` redirect + owl (cat) + cat->owl nudge all green on agnos")
         rc = 0
     else:
         p("agnsh-delegation-test: FAIL")

@@ -10,25 +10,31 @@
 #   version    -> agnsh responds WHILE job 2 still runs (prompt live + job table compacted)
 #   (wait)     -> "SLEEP2-DONE" then "[2] Done"  (job 2 reaped)
 # PASS = both launched + both DONE + both reaped (in order [1] then [2]) + version responded mid-run.
-import socket, subprocess, sys, time, os, struct
+import socket, subprocess, sys, time, os, struct, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
+# 1.57.14: the shell's `version` answer is ANY agnoshi major.minor. The literal "agnoshi 1." went stale at agnoshi 2.0
+# (it answers `agnoshi 2.0.3`) and scored a live shell as dead; agnsh-type-test.py made the same move at 1.57.13.
+AGNSH_VER = re.compile(r"agnoshi [0-9]+\.[0-9]+")
+def _hit(m, seg): return (m.search(seg) is not None) if hasattr(m, "search") else (m in seg)
 refuse_stale_kernel(ROOT)
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK = os.path.join(ROOT, "build/agnsh-multijob")
 IMG = os.path.join(WORK, "agnos-mj.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-mj.log")
-MON = "/tmp/agnos-mj.sock"
+MON = qsock(os.path.join(WORK, "agnos-mj.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 PART_OFFSET = 33 * 1048576
 PART_BLOCKS = (67 * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES",
@@ -150,7 +156,7 @@ try:
         deadline = time.time() + timeout
         while time.time() < deadline:
             t = ser()
-            if all(m in t for m in markers): return True
+            if all(_hit(m, t) for m in markers): return True
             time.sleep(0.5)
         return False
 
@@ -168,7 +174,7 @@ try:
     j1 = waitfor(["SLEEP1-DONE", "[1] Done"], 90)
     # prompt LIVE with job 2 still running.
     base = len(ser()); typ("version\n", settle=1.0)
-    ver = waitfor(["agnoshi 1."], 25) and ("agnoshi 1." in ser()[base:])
+    ver = waitfor([AGNSH_VER], 25) and (AGNSH_VER.search(ser()[base:]) is not None)
     # job 2 finishes + reaped.
     j2 = waitfor(["SLEEP2-DONE", "[2] Done"], 150)
 
@@ -186,7 +192,6 @@ try:
     # with them firing until it grepped for them.
     import re as _re_inv
     # 1.57.7 (S3d): loaded from scripts/smoke/lib/qemu-dwell.sh through _invdeny.py — no pasted copy left to drift.
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _invdeny import smoke_invariant_deny
     INV_DENY = smoke_invariant_deny()
     inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]

@@ -17,14 +17,16 @@
 import os, socket, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
 refuse_stale_kernel(ROOT)
 ROOTFS = os.path.join(ROOT, "build/rootfs")
@@ -32,7 +34,7 @@ WORK = os.path.join(ROOT, "build/puka-term")
 IMG = os.path.join(WORK, "agnos-puka-term.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial.log")
-MON = "/tmp/agnos-puka-term.sock"
+MON = qsock(os.path.join(WORK, "agnos-puka-term.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 PART_OFFSET = 33 * 1048576
 # ⚠ The compositor is ~15 MB and the two clients another ~0.4 MB, so this image is much larger than
 # the 128 MB the other agnsh harnesses use. An ext2 that cannot hold /bin/aethersafha fails at
@@ -126,7 +128,7 @@ subprocess.run(["cp", "-a", ROOTFS, SEED])
 # ⚠ Deliberately NOT changed in stage-tools.sh: aethersafha-clients-test.py's framebuffer oracle
 # counts present_probe's own bright-green border and bars, so swapping the shared rootfs would
 # silently invalidate a green gate. One harness, one override.
-_puka = os.path.join(ROOT, "../puka/build/puka_agnos")
+_puka = os.path.join(sibling("puka", "PUKA_ROOT"), "build/puka_agnos")
 if not os.path.exists(_puka):
     print("FAIL: missing", _puka, "(cd ../puka && cyrius build --agnos src/main.cyr build/puka_agnos)")
     sys.exit(1)

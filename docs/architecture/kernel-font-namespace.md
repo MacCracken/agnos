@@ -233,7 +233,8 @@ size row fire before the layout gate. Arithmetic: `docs/development/build.md` *W
 `cyrius.cyml` carries `[deps.rekha] path = "../rekha" modules = ["fonts/face_data.cyr"]` after
 `[deps.kashi]` — as **documentation of the contract**. The **mechanism** is `scripts/build.sh`: it
 resolves `REKHA_DIR` (the sibling checkout `../rekha` by default, else `git clone --branch $REKHA_REF`
-for a clean CI checkout; `REKHA_REF=0.3.8`) and `cat "$REKHA_DIR/fonts/face_data.cyr"` into the prepped
+for a clean CI checkout; `REKHA_REF` defaults to `1.0.0` since 1.57.14 — the three scripts hold the value, this
+doc does not track it) and `cat "$REKHA_DIR/fonts/face_data.cyr"` into the prepped
 source immediately before `cat kernel/agnos.cyr`, exactly where kashi's `src/font_data.cyr` goes.
 `scripts/test.sh` and `scripts/bench.sh` carry the **same** `REKHA_DIR`/`REKHA_REF` defaults and must
 move with it — the kashi triple diverged three times before 1.56.51 for exactly this reason, and

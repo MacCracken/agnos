@@ -31,7 +31,7 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 BLK_ROOT="$ROOT/tests/blk"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
@@ -42,9 +42,10 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy minfo mdir sgdisk mkfs.e
 done
 
 echo "[1/4] Building gptwr (--agnos) + the GPT_WRITE_SELFTEST kernel..."
-( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build gptwr.cyr build/gptwr --agnos ) >/tmp/gptwr-build.log 2>&1 || { echo "  BUILD-FAIL (gptwr)"; tail -8 /tmp/gptwr-build.log; exit 1; }
-if ! env GPT_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/gptwr-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/gptwr-kbuild.log)"; tail -8 /tmp/gptwr-kbuild.log; exit 1
+mkdir -p "$ROOT/build"   # 1.57.14: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build gptwr.cyr build/gptwr --agnos ) >"$ROOT/build/gptwr-build.log" 2>&1 || { echo "  BUILD-FAIL (gptwr)"; tail -8 "$ROOT/build/gptwr-build.log"; exit 1; }
+if ! env GPT_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/gptwr-kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $ROOT/build/gptwr-kbuild.log)"; tail -8 "$ROOT/build/gptwr-kbuild.log"; exit 1
 fi
 
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"

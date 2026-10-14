@@ -17,8 +17,8 @@ set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-BOTE_REPO="${BOTE_REPO:-$ROOT/../bote}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+BOTE_REPO="${BOTE_REPO:-${SIBLINGS_ROOT:-$ROOT/..}/bote}"
 BOTE_BIN="${BOTE_BIN:-$BOTE_REPO/build/bote-agnos}"
 
 OVMF_CODE_CANDIDATES="

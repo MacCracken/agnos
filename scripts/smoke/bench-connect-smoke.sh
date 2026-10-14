@@ -12,8 +12,8 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-HOOSH_BIN="${HOOSH_BIN:-$ROOT/../hoosh/build/hoosh_agnos}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+HOOSH_BIN="${HOOSH_BIN:-${SIBLINGS_ROOT:-$ROOT/..}/hoosh/build/hoosh_agnos}"
 PORT=18085
 N="${N:-2000}"                                   # connects per bench run
 TARGET="${TARGET:-http://10.0.2.100}"            # guestfwd addr (→ host 127.0.0.1:$PORT), port 80 default

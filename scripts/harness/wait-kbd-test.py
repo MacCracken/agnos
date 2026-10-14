@@ -29,6 +29,7 @@ import os, re, socket, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _siblings import sibling
 from _freshness import refuse_stale_kernel, refuse_stale, exerciser_sources
 from _invdeny import smoke_invariant_deny
 from _qsock import qsock
@@ -36,7 +37,7 @@ from _qsock import qsock
 AGNOS = os.path.join(ROOT, "build/agnos")
 WAITX_DIR = os.path.join(ROOT, "tests/waits")
 WAITX = os.path.join(WAITX_DIR, "build/waitx")
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 refuse_stale_kernel(ROOT)
 refuse_stale(WAITX, exerciser_sources(WAITX_DIR), "sources (tests/waits)",
              "(cd tests/waits && cyrius build --agnos waitx.cyr build/waitx)")

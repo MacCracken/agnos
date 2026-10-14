@@ -8,7 +8,7 @@ language = "cyrius"
 # VALUE here is not a floor — it must EQUAL the ROOT manifest's pin, because CI installs only
 # that one version and the wrapper resolves the manifest at the compile cwd.
 # scripts/check/toolchain-pin-check.sh enforces it.
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 entry = "chantest.cyr"
@@ -29,4 +29,8 @@ output = "build/chantest"
 # ⚠ 1.57.2: `result`, `atomic` and `fnptr` are pulled TRANSITIVELY (io -> result; alloc -> atomic, fnptr)
 # and `cyrius lib sync` copies only what is DECLARED — undeclared, they were vendored-by-accident and
 # `result.cyr` sat at the 6.6.0 copy under a 6.6.1 pin. Same under-declaration klug had at 1.57.0.
-stdlib = ["syscalls", "string", "alloc", "io", "fmt", "args", "result", "atomic", "fnptr"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `fmt` includes `vec` — ALREADY TRUE at 6.6.6 (its lib/fmt.cyr:19), so `vec` was a
+# pre-existing under-declaration the 1.57.5 transitives check missed and the move uncovered — and `alloc` names
+# `poison` since 6.6.18 (under `#ifdef CYRIUS_POISON`; `cyrius deps` walks includes textually). Declared for the
+# same reason (`cyrius deps` vendored both where `cyrius lib sync` did not).
+stdlib = ["syscalls", "string", "alloc", "io", "fmt", "args", "result", "atomic", "fnptr", "vec", "poison"]

@@ -19,7 +19,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
+GNOBOOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}/build/BOOTX64.EFI"
 OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS=/usr/share/edk2/x64/OVMF_VARS.4m.fd
 [ -f "$GNOBOOT" ]   || { echo "ERROR: gnoboot not built at $GNOBOOT — this gate measured NOTHING"; exit 1; }
