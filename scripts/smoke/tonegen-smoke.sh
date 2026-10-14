@@ -18,7 +18,7 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 TG_ROOT="$ROOT/tests/audio"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
@@ -29,9 +29,10 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd stri
 done
 
 echo "[1/4] Building tonegen (--agnos) + the TONEGEN_SELFTEST kernel..."
-( cd "$TG_ROOT" && cyrius build tonegen.cyr build/tonegen --agnos ) >/tmp/tonegen-build.log 2>&1 || { echo "  BUILD-FAIL (tonegen)"; tail -5 /tmp/tonegen-build.log; exit 1; }
-if ! env TONEGEN_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/tonegen-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/tonegen-kbuild.log)"; tail -5 /tmp/tonegen-kbuild.log; exit 1
+mkdir -p "$ROOT/build"   # 1.57.14: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+( cd "$TG_ROOT" && cyrius build tonegen.cyr build/tonegen --agnos ) >"$ROOT/build/tonegen-build.log" 2>&1 || { echo "  BUILD-FAIL (tonegen)"; tail -5 "$ROOT/build/tonegen-build.log"; exit 1; }
+if ! env TONEGEN_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/tonegen-kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $ROOT/build/tonegen-kbuild.log)"; tail -5 "$ROOT/build/tonegen-kbuild.log"; exit 1
 fi
 
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"

@@ -35,21 +35,23 @@
 import os, socket, subprocess, sys, time
 
 ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK   = os.path.join(ROOT, "build/launcher-panel")
 SEED   = os.path.join(WORK, "seed")
 IMG    = os.path.join(WORK, "agnos-launcher.img")
 SER    = os.path.join(WORK, "serial.log")
-MON    = "/tmp/agnos-launcher.sock"
+MON    = qsock(os.path.join(WORK, "agnos-launcher.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 AGNOS  = os.path.join(ROOT, "build/agnos")
 SHOT_BEFORE = os.path.join(WORK, "before.ppm")
 SHOT_AFTER  = os.path.join(WORK, "after.ppm")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
 refuse_stale_kernel(ROOT)
-GNOBOOT = os.path.join(ROOT, "../gnoboot/build/BOOTX64.EFI")
-AE_BIN  = os.environ.get("AE_BIN", os.path.join(ROOT, "../aethersafha/build/aethersafha_agnos"))
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
+AE_BIN  = os.environ.get("AE_BIN") or os.path.join(sibling("aethersafha", "AE_ROOT"), "build/aethersafha_agnos")
 DISK_MB, PART_OFFSET, PART_BLOCKS = 512, 34603008, 122880
 EXT2_FEATURES = "^resize_inode,^dir_index,^ext_attr,^huge_file,^64bit,^metadata_csum"
 

@@ -19,25 +19,31 @@
 # `burn-prep.sh` builds bare and `burn-verify.sh` prints `ARM: bare`; check for that line.
 #
 # Adapted from sweep-test.py (image build + xHCI keyboard driving are identical).
-import socket, subprocess, sys, time, os
+import socket, subprocess, sys, time, os, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
+# 1.57.14: the shell's `version` answer is ANY agnoshi major.minor. The literal "agnoshi 1." went stale at agnoshi 2.0
+# (it answers `agnoshi 2.0.3`) and scored a live shell as dead; agnsh-type-test.py made the same move at 1.57.13.
+AGNSH_VER = re.compile(r"agnoshi [0-9]+\.[0-9]+")
+def _hit(m, seg): return (m.search(seg) is not None) if hasattr(m, "search") else (m in seg)
 refuse_stale_kernel(ROOT)
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK = os.path.join(ROOT, "build/hidinject")
 IMG = os.path.join(WORK, "agnos-hidinject.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-hidinject.log")
-MON = "/tmp/agnos-hidinject.sock"
+MON = qsock(os.path.join(WORK, "agnos-hidinject.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 
 # ⛔ 1.57.1 — WITNESS THAT THIS IS THE FLAG-GATED KERNEL. This harness requires HID_CC_INJECT=1 and
 # never checked, so a run against an ordinary kernel proved nothing while scoring green — its own
@@ -143,7 +149,7 @@ try:
         deadline = time.time() + timeout
         while time.time() < deadline:
             seg = ser()[m:]
-            if marker is not None and marker in seg: return seg
+            if marker is not None and _hit(marker, seg): return seg
             time.sleep(0.5)
         return ser()[m:]
 
@@ -178,8 +184,8 @@ try:
     p("  burned", len(burn), "keypresses through the injection window")
     answered = False
     for attempt in range(4):
-        seg = run_wait("version\n", "agnoshi 1.", timeout=25)
-        if "agnoshi 1." in seg: answered = True; break
+        seg = run_wait("version\n", AGNSH_VER, timeout=25)
+        if AGNSH_VER.search(seg): answered = True; break
         p(f"  attempt {attempt+1}: no response yet")
     results["keyboard recovers after 20 rejected completions"] = answered
     p("  shell answered after the injection window:", answered)

@@ -123,6 +123,8 @@ jobs:
         #   compile now records `compiled` and stages nothing; `built` (= publish) is kept for when a boot
         #   gate exists — the build-vs-boot split kernelci keeps, and Debian's release-architecture rule (an
         #   architecture ships when it meets release criteria, not when it builds).
+        # ⭐ Operator ruling 2026-10-13: a FAILED compile (the else arm, `absent`) does NOT block the release — the x86_64
+        #   release continues — "until aarch64 is ready and proven, then we gate ci" (the 1.6x port). Keep this step soft.
         run: |
           set -o pipefail
           if sh scripts/build.sh --aarch64 2>&1 | tee aarch64-build.log; then

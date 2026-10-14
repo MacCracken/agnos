@@ -16,7 +16,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.1.0 — matching ../kashi/VERSION and its 1.1.0 tag as of 2026-10-09 (agnos 1.57.12; 1.0.10 at 1.57.5, 1.0.8 at 1.57.4, 1.0.6 as of
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.1.1 — matching ../kashi/VERSION and its 1.1.1 tag as of 2026-10-13 (agnos 1.57.14, with the cyrius 6.6.20 move; 1.1.0 at 1.57.12, 1.0.10 at 1.57.5, 1.0.8 at 1.57.4, 1.0.6 as of
 # 2026-08-28. Bump it as kashi cuts new 1.x releases. Affects ONLY the clone fallback: cyrius.cyml
 # declares `[deps.kashi] path`, and the path wins, so a box with the sibling checkout never reads
 # this value. That is exactly why it rots unnoticed.
@@ -26,6 +26,12 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # divergence from producing a visible symptom. 1.1.0 is the first bump that CHANGES it: +~6 KB — the
 # Unicode->CP437 map and two extension glyphs, cells 0x20..0xFF byte-identical — so from here a
 # stale default builds a different kernel image than the sibling path does.)
+# 1.1.1 (agnos 1.57.14) changes it again, and only in STORAGE: the three glyph tables are declared in u64 slots
+# (`[452]`/`[226]`/`[904]`, was the byte counts — 8x reserved), so a 1.1.1 kernel is 88,584 B smaller (6.6.20) with
+# every glyph byte, offset and accessor result unchanged (kashi issue 2026-10-13-font-arrays-declared-u64-for-byte-tables,
+# filed by agnos at 1.57.12, RESOLVED there). The buffers now end flush: a reader past a cell's 16 rows reaches the
+# next table, not zeros — fb_console.cyr reads exactly 16 rows of a 0x20..0x7F cell and gpu.cyr goes through
+# kashi_glyph_row, so nothing here reads past a span.
 # ⭐ 1.57.12 — a fallback clone is a CACHE of the pinned tag, and a cache has to match its key. From a
 # .claude/worktrees/<x> checkout, $ROOT/../kashi is not the dev sibling but the clone an earlier build left
 # behind: one sat at kashi 1.0.3 from July to 2026-10-09 while the pin moved to 1.0.10 and then 1.1.0 —
@@ -50,7 +56,7 @@ dep_pin_sync() { # <name> <dir> <ref>
         || { echo "ERROR: could not move the $1 fallback clone at $2 to $3" >&2; exit 1; }
 }
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.1.0}"
+KASHI_REF="${KASHI_REF:-1.1.1}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Same guard as the rekha block below (2026-09-13): the fallback replaces an ABSENT sibling
     # only, never a checkout that happens to lack the file — see the note there.
@@ -71,13 +77,15 @@ dep_pin_sync kashi "$KASHI_DIR" "$KASHI_REF"
 # rekha freestanding default-face data (1.57.2 — the kernel-embedded TrueType face behind
 # /fonts, core/kfont.cyr). SAME contract as kashi above, mirrored line for line: sibling checkout
 # by default, clone the pinned tag when absent (override via REKHA_REF=<tag-or-branch>). Pinned at
-# 0.9.0 — matching ../rekha/VERSION as of 2026-09-21 (0.3.9 at 1.57.4; 0.3.8 was the first tag carrying fonts/face_data.cyr).
+# 1.0.0 — matching ../rekha/VERSION and its 1.0.0 tag as of 2026-10-13 (agnos 1.57.14, the cyrius 6.6.20 move; fonts/face_data.cyr
+# is BYTE-IDENTICAL to 0.9.0's, so the kernel image does not move with it; 0.9.0 at 1.57.5, 0.3.9 at 1.57.4; 0.3.8 was the first
+# tag carrying fonts/face_data.cyr).
 # ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — the kashi
 # triple diverged three times before 1.56.51 for exactly this reason, and the same failure mode
 # applies here: `[deps.rekha] path` wins locally, so a stale default is invisible until a clean CI
 # checkout builds against a different face than the one that was tested.
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-REKHA_REF="${REKHA_REF:-0.9.0}"
+REKHA_REF="${REKHA_REF:-1.0.0}"
 if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
     # ⛔ NEVER rm -rf A GIT CHECKOUT (2026-09-13). The sentinel probed above is UNTRACKED in a rekha
     # working tree that has not committed fonts/ yet, so ordinary hygiene in the sibling — `git
@@ -172,7 +180,7 @@ if [ "$PIN" != "$TCV" ]; then
         echo "  see the pin and will silently use its default toolchain. This gate is the only thing" >&2
         echo "  that notices. Resolve it deliberately, one of:" >&2
         echo "    · bump the pin to $TCV:  sed -i 's/^cyrius = .*/cyrius = \"$TCV\"/' cyrius.cyml" >&2
-        echo "      (then re-run scripts/check/toolchain-pin-check.sh — all 9 manifests move together)" >&2
+        echo "      (then re-run scripts/check/toolchain-pin-check.sh — EVERY manifest moves together: 25 at 1.57.14)" >&2
         echo "    · install and default to the pin:  cyriusly use $PIN" >&2
         echo "    · build off-pin ON PURPOSE:  AGNOS_ALLOW_PIN_DRIFT=1 sh scripts/build.sh" >&2
         exit 1
@@ -921,10 +929,25 @@ else
     # read its `warning: undefined function` lines — the only place an x86 hole is NAMED. Same status as before: a
     # failed compile exits this script with the compiler's code, the prepped source left for inspection.
     CC_STDERR="$ROOT/build/agnos.compile-stderr.log"
-    rm -f "$CC_STDERR" "$ROOT/build/agnos.placeholder-refused"
+    rm -f "$CC_STDERR" "$ROOT/build/agnos.placeholder-refused" "$ROOT/build/agnos.lateinit-refused"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos") 2> "$CC_STDERR" && CCRC=0 || CCRC=$?
     cat "$CC_STDERR" >&2
     [ "$CCRC" = "0" ] || exit "$CCRC"
+    # ⛔ 1.57.14 — A LATE-REPLAYED INITIALIZER IS A ZERO READ, AND FROM CYRIUS 6.6.16 THE COMPILER NAMES IT. An x86
+    # `kernel;` build runs a declaration-zone initializer that is not a constant (a string literal, a call, an
+    # expression over a variable) AFTER the top-level program — and this kernel's program never returns, so the global
+    # reads 0 forever (`var X = "…";` is a NULL pointer). Constants and enum-named initializers are baked into the image
+    # since 6.6.16 and do not warn. At the 6.6.20 move two such gvars were dropped (`_AGNOS_VERSION`, `kernel_hostname` —
+    # nothing read either: roadmap § "Recorded by cyrius 6.6.16"), and the warning became this refusal, so a new one is
+    # stopped at the build that adds it instead of shipping a global that silently reads 0. The fix is a constant, an
+    # accessor fn (version.cyr's agnos_version_str), or an assignment in the program. Same disposition as the arity
+    # warning check.sh promotes: the compiler's warning is the evidence, the build is where it must stop.
+    if grep -q 'in a kernel build the initializer of' "$CC_STDERR"; then
+        mv -f "$ROOT/build/agnos" "$ROOT/build/agnos.lateinit-refused"
+        echo "ERROR: the compile named a global whose initializer an x86 kernel build never runs (the warning(s) above)" >&2
+        echo "  — the image is moved to build/agnos.lateinit-refused. Use a constant, an accessor fn, or assign it in the program." >&2
+        exit 1
+    fi
     rm -f "$PREPPED"
     SZ=$(wc -c < "$ROOT/build/agnos")
     echo "  -> build/agnos ($SZ bytes)"

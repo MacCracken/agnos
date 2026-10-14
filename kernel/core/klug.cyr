@@ -184,13 +184,22 @@ fn klug_move_to_room() {
 # path) that owned the scanout hands the display back in the ISR itself (gpu_release_pid_isr — ownership never leaks
 # to a recycled pid) but may not write the disk or kprint there, so it sets klug_spill_owed and the spill runs at the
 # next B1 (syscall exit) of ANY process — syscall context, IF=0, exactly the context exit#0's spill ran in.
+# ⛔ 1.57.14 — UNDER fs_lock, TAKEN BY TRYLOCK. The spill is an ext2 write (ext2_write_at through ext2's one shared bounce
+# block), and every other ext2 writer holds fs_lock across exactly such calls; the spill held nothing until 1.57.14, so it
+# could interleave with an ext2 op on another CPU. B1 holds no lock (every dispatch arm closes its fs_lock pair before
+# syscall_hw.cyr's one exit; proc_orphan_owed_run and zfs_wp_owed_run trylock at the same point for the same reason): a
+# busy fs_lock leaves the debt set and the next B1 of any process retries — it never waits a ZFS commit out at IF=0.
+# Lock order fs_lock -> klug's lock, as every kprint under fs_lock already takes them.
 var klug_spill_owed = 0;
 fn klug_spill_owed_run() {
+    if (klug_spill_owed == 0) { return 0; }
+    if (fs_spin_trylock() != 0) { return 0; }   # held: the debt stays, the next B1 retries (a won try raises preempt)
     var so_t = klug_lock_acquire();
     var so_v = klug_spill_owed;
     klug_spill_owed = 0;
     klug_lock_release(so_t);
-    if (so_v != 0) { klug_spill_covered_console(); }
+    if (so_v != 0) { klug_spill_cc_held(); }
+    fs_spin_unlock();
     return 0;
 }
 
@@ -305,7 +314,18 @@ fn klug_spill_prepare() {
 # wrapped ring is spilled as TWO runs — [klug_head, 65536) then [0, klug_head) — which puts the file in
 # chronological order. klug_dump() only ever handled the linear case; a spill taken after a long boot is
 # exactly when the ring HAS wrapped, so getting this wrong would silently rotate the log.
+#
+# ⛔ 1.57.14 — klug_spill() TAKES fs_lock, like every other ext2 writer (syscall.cyr's ext2 arms, power_flush); the
+# caller must NOT hold it (it is not reentrant). Every caller is a syscall (modeset transmit, the GPU audits and
+# forensic dump), exit#0 / a ring-3 fault's death (gpu_release_pid, below) or the boot — none holds fs_lock there.
+# klug_spill_held() is the write itself, for a caller that already holds it (klug_spill_owed_run's trylock).
 fn klug_spill() {
+    fs_spin_lock();
+    var ks_n = klug_spill_held();
+    fs_spin_unlock();
+    return ks_n;
+}
+fn klug_spill_held() {
     if (klug_spill_ino == 0) { return 0; }
     var n = 0;
     if (klug_count >= 65536) {
@@ -343,10 +363,18 @@ fn klug_spill() {
 # tail runs a `kernel_resume`/`iretq` that expects the mappings it arrived with.
 # ⚠ The kprint sits INSIDE the window deliberately — `fb_console` paints through the boot mappings, so it
 # is safe there and would not be under a half-torn-down address space.
+# ⛔ 1.57.14 — under fs_lock (klug_spill above): taken here, around the CR3 window; klug_spill_cc_held() is the body for
+# klug_spill_owed_run, which holds it by trylock.
 fn klug_spill_covered_console() {
+    fs_spin_lock();
+    var kc_n = klug_spill_cc_held();
+    fs_spin_unlock();
+    return kc_n;
+}
+fn klug_spill_cc_held() {
     var kc_cr3 = dm_read_cr3();
     cr3_load(0x1000);
-    var kc_n = klug_spill();
+    var kc_n = klug_spill_held();
     # ⚠ REPORT THE COUNT, because `klug_spill()` is SILENT and returns 0 when `klug_spill_prepare()` never
     # got a usable inode — in which case /klug.txt still holds a STALE BOOT, which is the "looks fine, is
     # wrong" failure this whole mechanism exists to prevent. A number is the difference between evidence

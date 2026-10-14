@@ -1,0 +1,97 @@
+# sandhix — agnos 1.57.14: a BOOT test of sandhi's cooperative server, `sandhi_server_run_async`, on agnos.
+#
+# Why (roadmap § "Recorded by cyrius 6.6.19"): agnos has no readiness probe that leaves data in place
+# (`sock_accept`#57 and `sock_recv`#49 consume, `epoll`#21 never sees a conn), so cyrius 6.6.19 (A2) built
+# `async_await_readable_ms` over a STASH in its agnos socket adapter — `_agnos_fd_ready` pre-accepts a listener's
+# pending conn and `sys_sock_accept` hands it out before issuing #57, polled with a `sleep_ms`#41 1 -> 32 ms
+# backoff. It was verified only under cyrius's PTRACE_SYSEMU fake kernel; this program runs it on a booted kernel.
+#
+# Seeded as /bin/agnsh (kybernet launches it on a PLAIN kernel, IF=1, time-sliced — ring3-seed.sh). It serves HTTP on
+# guest port 8090 through `sandhi_server_run_async` with NO stop flag, so the idle path is exactly the one sandhi
+# ships: `async_await_readable(sfd)` (a stop flag swaps it for a plain sleep_ms poll and would test nothing).
+# The host half (scripts/smoke/sandhi-async-smoke.sh) connects only after the server has parked, so every accept
+# comes through the stash. `GET /quit` ends the run: the handler prints `SANDHIX-DONE served=N` and exits 0 from
+# inside the handler (the cooperative loop never returns on success; a non-zero exit would drop kybernet into the
+# emergency shell). `GET /ready` (the host's listen probe) is answered `200 sandhi-async-ready` and NOT counted. Any
+# other request is answered `200 sandhi-async-ok` and counted.
+# Output is line-buffered, one write#1 per line, so a marker is never split.
+
+var SX_SERVED = 0;
+var sx_lb[32];          # module scope: 32 u64 = 256 B, the current output line
+var SX_LN = 0;
+fn sx_flush() { if (SX_LN > 0) { syscall(1, 1, &sx_lb, SX_LN, 0); } SX_LN = 0; return 0; }
+fn sx_putc(ch) {
+    if (SX_LN >= 250) { sx_flush(); }
+    store8(&sx_lb + SX_LN, ch);
+    SX_LN = SX_LN + 1;
+    if (ch == 10) { sx_flush(); }
+    return 0;
+}
+fn sx_out(s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { sx_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn sx_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { sx_putc(45); n = 0 - n; }
+    if (n == 0) { sx_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; sx_putc(load8(&b + i)); }
+    return 0;
+}
+# 1 when the request line is `GET /quit` (bytes 4..8 of the request).
+fn sx_is_quit(req, n) {
+    if (n < 9) { return 0; }
+    if (load8(req + 4) != 47) { return 0; }
+    if (load8(req + 5) != 113) { return 0; }
+    if (load8(req + 6) != 117) { return 0; }
+    if (load8(req + 7) != 105) { return 0; }
+    if (load8(req + 8) != 116) { return 0; }
+    return 1;
+}
+# 1 when the request line is `GET /ready` (bytes 4..9). The host's readiness probe: answered, NOT counted.
+fn sx_is_ready(req, n) {
+    if (n < 10) { return 0; }
+    if (load8(req + 4) != 47) { return 0; }
+    if (load8(req + 5) != 114) { return 0; }
+    if (load8(req + 6) != 101) { return 0; }
+    if (load8(req + 7) != 97) { return 0; }
+    if (load8(req + 8) != 100) { return 0; }
+    if (load8(req + 9) != 121) { return 0; }
+    return 1;
+}
+# sandhi's handler shape: fn(ctx, cfd, req_buf, req_len) -> 0; sandhi closes cfd after it returns.
+fn sx_handler(ctx, cfd, req, n): i64 {
+    if (sx_is_quit(req, n) == 1) {
+        sx_out("SANDHIX-DONE served="); sx_num(SX_SERVED); sx_out("\n");
+        syscall(SYS_EXIT, 0);
+    }
+    # `SANDHIX-LISTENING` is printed BEFORE sandhi_server_run_async binds and listens, and agnos DROPS a SYN to a
+    # port with no listener (net_tcp.cyr: `tcp_find_listen` < 0 -> return, no RST), so a host GET racing listen()
+    # is not refused — SLIRP re-sends its SYN later and the GET is served SLOW. The host therefore polls `/ready`
+    # until it is answered, and only then times P1. It is kept out of SX_SERVED so the count stays exactly 10.
+    if (sx_is_ready(req, n) == 1) {
+        sx_out("SANDHIX-READY\n");
+        sandhi_server_send_response(cfd, 200, "OK", "text/plain", "sandhi-async-ready\n", 19, 0);
+        return 0;
+    }
+    SX_SERVED = SX_SERVED + 1;
+    sx_out("SANDHIX-REQ n="); sx_num(SX_SERVED); sx_out("\n");
+    sandhi_server_send_response(cfd, 200, "OK", "text/plain", "sandhi-async-ok\n", 16, 0);
+    return 0;
+}
+fn main(): i64 {
+    var opts = sandhi_server_options_new();
+    sandhi_server_options_max_conns(opts, 4);       # a 6-client burst needs two batches
+    sandhi_server_options_idle_ms(opts, 3000);      # SO_RCVTIMEO on each accepted conn
+    sx_out("SANDHIX-LISTENING port=8090\n");
+    var rc = sandhi_server_run_async(0, 8090, &sx_handler, 0, opts);
+    # Reached only when bind / listen / the arena failed.
+    sx_out("SANDHIX-FAIL run_async returned rc="); sx_num(rc); sx_out("\n");
+    return 0;
+}
+var _sx_rc = main();
+syscall(SYS_EXIT, 0);

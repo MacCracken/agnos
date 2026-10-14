@@ -47,12 +47,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel, refuse_stale, exerciser_sources
 from _invdeny import smoke_invariant_deny
 from _qsock import qsock
+from _siblings import sibling
 
 AGNOS = os.path.join(ROOT, "build/agnos")
 WAITX_DIR = os.path.join(ROOT, "tests/waits")
 WAITX = os.path.join(WAITX_DIR, "build/waitx")
-# 1.57.13 merge (the carry track's sibling rule): <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo>.
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(os.environ.get("SIBLINGS_ROOT", os.path.join(ROOT, "..")), "gnoboot")) + "/build/BOOTX64.EFI"
+# 1.57.13 merge (the carry track's sibling rule): <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> — through
+# _siblings.py since 1.57.14 (the inline form read an exported-but-empty SIBLINGS_ROOT as "", a cwd-relative path).
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 refuse_stale_kernel(ROOT)
 # ⛔ The geometry knob exists only in a TTY_SELFTEST build: a plain kernel answers -1 and T7 would fail for the WRONG
 # reason. scripts/build.sh records the flags of the image it wrote.

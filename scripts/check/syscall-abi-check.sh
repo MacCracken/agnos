@@ -47,15 +47,30 @@ cd "$ROOT"
 # one of its three inputs is a false green, and this tree has paid for those.
 SIBLINGS="${SIBLINGS_ROOT:-$(cd "$ROOT/.." && pwd)}"
 CYPEER=""
+# ⚠ 1.57.14 — THE FALLBACK READS THE PINNED TOOLCHAIN FIRST. It took the NEWEST installed version (`sort -V -r`)
+# while the comment above calls it "what this kernel is actually built against": identical on the CI runner (one
+# version installed — the pin), different on a box that caches every release (at the 6.6.20 move the newest was
+# 6.7.10). The root pin's version dir under ${CYRIUS_HOME:-~/.cyrius} is tried first; the newest stays the last resort.
+PIN=$(grep -oE '^cyrius = "[^"]+"' "$ROOT/cyrius.cyml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')
+CYH="${CYRIUS_HOME:-$HOME/.cyrius}"
 if [ -f "$SIBLINGS/cyrius/lib/syscalls_x86_64_agnos.cyr" ]; then
     CYPEER="$SIBLINGS/cyrius/lib/syscalls_x86_64_agnos.cyr"
+elif [ -n "$PIN" ] && [ -f "$CYH/versions/$PIN/lib/syscalls_x86_64_agnos.cyr" ]; then
+    CYPEER="$CYH/versions/$PIN/lib/syscalls_x86_64_agnos.cyr"
 else
-    for d in $(ls -d "$HOME"/.cyrius/versions/*/ 2>/dev/null | sort -V -r); do
+    # Last resort: the NEWEST version across both roots. ⚠ Sorted on the version BASENAME, not the path — `sort -V`
+    # over full paths compares the root prefix first, so with CYRIUS_HOME != ~/.cyrius it picked the newest version
+    # under the alphabetically LAST root, not the newest version. `-s` keeps $CYH ahead of ~/.cyrius for the same
+    # version, and the awk drops the duplicate (the two roots are one directory when CYRIUS_HOME is ~/.cyrius).
+    # The two roots are listed by SEPARATE `ls` calls: one `ls` sorts all of its arguments together.
+    for d in $( { ls -d "$CYH"/versions/*/ 2>/dev/null; ls -d "$HOME"/.cyrius/versions/*/ 2>/dev/null; } \
+               | while IFS= read -r p; do printf '%s %s\n' "$(basename "$p")" "$p"; done \
+               | sort -s -V -r -k1,1 | awk '!seen[$1]++ { print $2 }'); do
         if [ -f "$d/lib/syscalls_x86_64_agnos.cyr" ]; then CYPEER="$d/lib/syscalls_x86_64_agnos.cyr"; break; fi
     done
 fi
 
-python3 - "$CYPEER" <<'PY'
+python3 - "$CYPEER" "$SIBLINGS" "$CYH" "${PIN:-<no pin in cyrius.cyml>}" <<'PY'
 import re, sys
 
 cypeer = sys.argv[1]
@@ -65,9 +80,12 @@ def die(msg):
     print("  FAIL: " + msg)
 
 if not cypeer:
-    print("  FAIL: cyrius syscall peer not found — looked for ../cyrius/lib/syscalls_x86_64_agnos.cyr and")
-    print("        ~/.cyrius/versions/*/lib/syscalls_x86_64_agnos.cyr. Set SIBLINGS_ROOT, or install a")
-    print("        toolchain. This check does NOT skip: two of three sources cannot verify an ABI.")
+    print("  FAIL: cyrius syscall peer not found — looked for, in order:")
+    print("        " + sys.argv[2] + "/cyrius/lib/syscalls_x86_64_agnos.cyr (the sibling repo),")
+    print("        " + sys.argv[3] + "/versions/" + sys.argv[4] + "/lib/syscalls_x86_64_agnos.cyr (the root pin),")
+    print("        and the newest " + sys.argv[3] + "/versions/*/lib or ~/.cyrius/versions/*/lib copy.")
+    print("        Set SIBLINGS_ROOT or CYRIUS_HOME, or install the pinned toolchain. This check does NOT")
+    print("        skip: two of three sources cannot verify an ABI.")
     sys.exit(1)
 
 # ---------------------------------------------------------------- 1. KERNEL — the number set

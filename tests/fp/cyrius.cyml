@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 f64 first-touch exerciser (1.53.x FP/SIMD arc, bite B4) — real f64 arithmetic in ring 3; exits 84 iff correct, proving the B1→B3 FP stack end to end."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 src = "fpex.cyr"
@@ -14,4 +14,10 @@ output = "build/fpex"
 # code, checked via the exec path's "run: exit N" (no console/alloc/f64-lib needed —
 # the f64 arithmetic is native cyrius codegen, the whole point of the test).
 [deps]
-stdlib = ["syscalls"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `syscalls` alone is NOT a closed set — it names `alloc` (since 6.6.6; CX-only under
+# `#ifdef CYRIUS_TARGET_CX` through 6.6.8, unconditional since 6.6.9), which names `atomic` + `fnptr` and, since
+# 6.6.18, `poison` (under `#ifdef CYRIUS_POISON`, never compiled here). `cyrius deps` walks includes textually, so
+# it resolved alloc/atomic/fnptr at the 6.6.6 pin too: this manifest was short BEFORE the move, which uncovered it.
+# `cyrius lib sync` copies only what is DECLARED, so the transitives are declared (the 1.57.2 tests/chan
+# precedent); `cyrius deps` vendoring 15 files where lib sync vendored 7 is how the 1.57.14 move measured it.
+stdlib = ["syscalls", "alloc", "atomic", "fnptr", "poison"]

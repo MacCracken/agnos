@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 raw block-device read-path exerciser (1.53.10 Phase 1) — blk_enum#75 / blk_open#76 (RO) / blk_read#77 LBA 1 + GPT 'EFI PART' check; exits 95 iff the read-path works end to end."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 src = "blkprobe.cyr"
@@ -14,4 +14,10 @@ output = "build/blkprobe"
 # call sys_blk_enum/open/read/write/info/close — no raw syscall numbers. The result IS
 # the exit code, checked via the exec path's "run: exit N" (95 read-path / 96 write-path).
 [deps]
-stdlib = ["syscalls"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `syscalls` alone is NOT a closed set — it names `alloc` (since 6.6.6; CX-only under
+# `#ifdef CYRIUS_TARGET_CX` through 6.6.8, unconditional since 6.6.9), which names `atomic` + `fnptr` and, since
+# 6.6.18, `poison` (under `#ifdef CYRIUS_POISON`, never compiled here). `cyrius deps` walks includes textually, so
+# it resolved alloc/atomic/fnptr at the 6.6.6 pin too: this manifest was short BEFORE the move, which uncovered it.
+# `cyrius lib sync` copies only what is DECLARED, so the transitives are declared (the 1.57.2 tests/chan
+# precedent); `cyrius deps` vendoring 15 files where lib sync vendored 7 is how the 1.57.14 move measured it.
+stdlib = ["syscalls", "alloc", "atomic", "fnptr", "poison"]

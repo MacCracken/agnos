@@ -12,7 +12,7 @@
 #
 # Checks, in this order (see the ordering note below):
 #   1. iam Kernel line   — `iam` printed a bare "AGNOS" with no version. The whole chain is wired
-#                          (_AGNOS_VERSION -> uname#34 release@32 -> mihi_uname -> iam_render_kernel),
+#                          (agnos_version_str() -> uname#34 release@32 -> mihi_uname -> iam_render_kernel),
 #                          so the standing hypothesis is a stale staged binary. This runs a freshly
 #                          built one; a bare AGNOS here means the hypothesis is WRONG and there is
 #                          a real bug.
@@ -34,25 +34,31 @@
 # exactly the kind of answer this exists to produce, and it should be read as data.
 #
 # Builds its own image from build/rootfs (so run stage-tools.sh first) + build/agnos.
-import socket, subprocess, sys, time, os
+import socket, subprocess, sys, time, os, re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
+# 1.57.14: the shell's `version` answer is ANY agnoshi major.minor. The literal "agnoshi 1." went stale at agnoshi 2.0
+# (it answers `agnoshi 2.0.3`) and scored a live shell as dead; agnsh-type-test.py made the same move at 1.57.13.
+AGNSH_VER = re.compile(r"agnoshi [0-9]+\.[0-9]+")
+def _hit(m, seg): return (m.search(seg) is not None) if hasattr(m, "search") else (m in seg)
 refuse_stale_kernel(ROOT)
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK = os.path.join(ROOT, "build/sweep")
 IMG = os.path.join(WORK, "agnos-sweep.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-sweep.log")
-MON = "/tmp/agnos-sweep.sock"
+MON = qsock(os.path.join(WORK, "agnos-sweep.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 PART_OFFSET = 33 * 1048576
 PART_BLOCKS = (67 * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES",
@@ -148,7 +154,7 @@ try:
         deadline = time.time() + timeout
         while time.time() < deadline:
             seg = ser()[m:]
-            if marker is not None and marker in seg: return seg
+            if marker is not None and _hit(marker, seg): return seg
             time.sleep(0.5)
         return ser()[m:]
 
@@ -204,8 +210,8 @@ try:
     vacuous = "FAULTER-DID-NOT-FAULT" in ser()
     # The shell must still answer AFTER the job faulted. That is the whole question.
     time.sleep(3.0)
-    post = run_wait("version\n", "agnoshi 1.", timeout=30)
-    survived = "agnoshi 1." in post
+    post = run_wait("version\n", AGNSH_VER, timeout=30)
+    survived = AGNSH_VER.search(post) is not None
     results["shell survives a faulted & job"] = alive and survived and not vacuous
     p("  faulter reached ring 3 (FAULTER-ALIVE):", alive,
       "| shell answered after the fault:", survived,

@@ -26,7 +26,7 @@ set -u
 . "$(cd "$(dirname "$0")" && pwd)/lib/qemu-dwell.sh"   # qemu_attempt_verdict (1.57.7 IMG-fix)
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
-GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
+GNOBOOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}/build/BOOTX64.EFI"
 OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS=/usr/share/edk2/x64/OVMF_VARS.4m.fd
 # ⛔ 1.56.55 — A MISSING PREREQUISITE EXITS 1, NOT 0. These guards used to `exit 0`, and sweep.sh

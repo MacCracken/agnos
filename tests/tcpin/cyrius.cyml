@@ -5,7 +5,7 @@ description = "agnos 1.57.7 (S4) ring-3 inbound-TCP exerciser — a passive open
 license = "GPL-3.0-only"
 language = "cyrius"
 # The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 entry = "tcpin.cyr"
@@ -14,4 +14,6 @@ output = "build/tcpin"
 # AGNOS ONLY — build with `cyrius build --agnos tcpin.cyr build/tcpin`.
 [deps]
 # ⚠ The FULL closure, transitives included (D19): alloc -> atomic, fnptr; string and args -> alloc.
-stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `alloc` includes `poison` since 6.6.18 — declared because `cyrius lib sync` copies only
+# what is declared (the 1.57.2 tests/chan precedent; `cyrius deps` vendored it where lib sync did not).
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr", "poison"]

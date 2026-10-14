@@ -22,23 +22,25 @@
 import os, socket, subprocess, sys, time
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK   = os.path.join(ROOT, "build/ae-resize-fault")
 SEED   = os.path.join(WORK, "seed")
 IMG    = os.path.join(WORK, "agnos-aefault.img")
 SER    = os.path.join(WORK, "serial.log")
-MON    = "/tmp/agnos-aefault.sock"
+MON    = qsock(os.path.join(WORK, "agnos-aefault.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 AGNOS  = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
 refuse_stale_kernel(ROOT)
-GNOBOOT= os.path.join(ROOT, "../gnoboot/build/BOOTX64.EFI")
-AE_BIN = os.environ.get("AE_BIN", os.path.join(ROOT, "../aethersafha/build/aethersafha_agnos"))
+GNOBOOT= os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
+AE_BIN = os.environ.get("AE_BIN") or os.path.join(sibling("aethersafha", "AE_ROOT"), "build/aethersafha_agnos")
 DISK_MB, PART_OFFSET, PART_BLOCKS = 512, 34603008, 122880
 EXT2_FEATURES = "^resize_inode,^dir_index,^ext_attr,^huge_file,^64bit,^metadata_csum"
 

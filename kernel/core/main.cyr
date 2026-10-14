@@ -1575,6 +1575,24 @@ gpu_pixclk_discover();
 # spilled bytes can be byte-compared against the serial capture from the host.
 # Top level, its own flag — same reason as the ATOM selftests below: this touches the FS, not the display,
 # so it must not be reachable only via a console-risky gate.
+# ⭐ 1.57.14 — THE SPILL IS AN EXT2 WRITER AND HOLDS fs_lock (klug.cyr). The owed spill (B1, after a tick death of a
+# scanout owner) takes it by TRYLOCK: under a held fs_lock it must keep its debt and write nothing; once the lock is free
+# it must pay. kmain holds the lock here as another CPU's ext2 op would. The removed trylock (the 1.57.13 runner) pays
+# under the held lock and fails this line.
+fs_spin_lock();
+klug_spill_owed = 1;
+klug_spill_owed_run();
+var _klug_owed_held = klug_spill_owed;
+fs_spin_unlock();
+klug_spill_owed_run();
+var _klug_owed_free = klug_spill_owed;
+if (_klug_owed_held == 1 && _klug_owed_free == 0) {
+    kprintln("klug: spill lock OK -- the owed spill kept its debt under a held fs_lock, then ran", 82);
+}
+if (_klug_owed_held != 1 || _klug_owed_free != 0) {
+    kprint("klug: spill lock FAILED -- debt under a held fs_lock=", 53); kprint_num(_klug_owed_held);
+    kprint(" after release=", 15); kprint_num(_klug_owed_free); kprintln("", 0);
+}
 var _klug_spilled = klug_spill();
 kprint("klug: spilled ", 14); kprint_num(_klug_spilled); kprintln(" bytes to /klug.txt", 19);
 #endif
@@ -7986,6 +8004,163 @@ fn kst_phase_tickorphan() {
     return 0;
 }
 
+# PHASE (1.57.14, the 1.57.13 carry; Z in its exit tail since its review) — A FAULT-KILLED ORPHAN WHILE ANOTHER CPU HOLDS
+# fs_lock, ITS ZOMBIE STILL ON ITS CPU. kmain holds fs_lock throughout. O — an ORPHAN — spins in ring 3 on an AP on a
+# gate in its data page. Its child Z, gate open, runs into `ud2` on another AP: #UD, fault_kill_current, exit 128 + 6 =
+# 134, a ZOMBIE of its live parent O (state 0, death done) — and Z is HELD at the top of sched_exit_tail (sched.cyr
+# kst_note_exit_tail): published, not yet off its CPU. Then O is released into `ud2` too: its final hold flips Z 0 -> 4
+# and owes both reaps. For O's death a ZFS pool reads as imported (zfs_active planted 1, restored before the release:
+# O's table holds no ZFS file fd, so zfs_release_pid must not take fs_lock — before 1.57.14 it took it for ANY dying
+# process), and O's CR3 cell is DETACHED to 0x1000 on O's own CPU between its death's publish and its leave (sched.cyr
+# kst_note_fault_death, called by fault_kill_current). After the 300 ms Z's cell is detached while Z is still held, and
+# Z is let go. Each detach is the state an owed drain that won the claim before that CPU switched leaves the slot in
+# (proc_reap_orphan_space; both restored at the end of the hold). A detach of O from kmain cannot be placed there: O,
+# still in ring 3, is switched out and back in by its CPU's ticks (another READY process shares it), and a restore under
+# the detached cell #PFs it (measured: exit 142). The fault death must OWE both reaps, never take fs_lock in the
+# exception handler, and neither dead process may be refused its leave:
+#   held   Z faulted (exit 134) and is held in its exit tail as a zombie (state 0, done), on an AP that is not O's, from
+#          before O's death until its release (no 2 s timeout);
+#   ticks  O's CPU keeps taking timer ticks through the hold (>= 10 in 300 ms). Before 1.57.14 the #UD handler spun on
+#          fs_lock at IF=0 — zfs_release_pid, then proc_reap_child(Z) / proc_reap_orphan(O) — and that CPU's count froze
+#          (negatives N-FAULT: proc_death_in_handler's VIA_FAULT arm removed; N-FREAP: proc_death_finish's sites keyed on
+#          VIA_TICK again; N-ZLOOK: zfs_release_pid's lock-free look removed, fs_lock first as before — each -> ticks <= 1,
+#          this phase FAILs);
+#   left   the detach ran (detached=1) and O LEFT its CPU during the hold (on_cpu -1) although its CR3 cell read 0x1000;
+#   zleft  Z, flipped 0 -> 4 by O's death while held, LEFT its CPU within 200 ms of its release although its CR3 cell
+#          read 0x1000 — the leave 1.57.13 refused forever for a TICK parent's zombie still in its exit tail (state 0 was
+#          the only exemption). sched_cpl0_switch_ok switches ANY DYING current whose death is done (negative N-FLEAVE:
+#          that test removed -> left=0 zleft=0, FAIL);
+#   owed   at the end of the hold O's death is done with exit 134, O and Z are DYING (4) and both owed — nothing reaped;
+#   reaped after the release a process context (an idle step or a syscall exit) reaps both within 2 s: state 0, ppid 0,
+#          no fd table, CR3 0x1000, nothing owed, and the free pool back within 16 pages of its level before the spawns.
+# -smp >= 3 only: kmain's hold keeps the BSP, Z holds one AP and O needs another.
+fn kst_phase_faultorphan() {
+    if (cpu_count < 2) { kprintln("kstack: fault orphan n/a (1 cpu)", 32); return 0; }
+    if (cpu_count < 3) { kprintln("kstack: fault orphan n/a (2 cpus)", 33); return 0; }
+    var fo_free0 = pmm_free_count();
+    var fo_zpg = kst_page_new();
+    var fo_opg = kst_page_new();
+    if (fo_zpg == 0 || fo_opg == 0) { kprintln("kstack: FAIL fault orphan: no data page", 39); return 0; }
+    # F (16 bytes): BB 00 00 00 02 mov ebx, 0x2000000 · 48 83 7B 18 00 cmp qword [rbx+24], 0 · 74 F9 je -7 (the cmp) ·
+    # 0F 0B ud2 · EB FE jmp $ — W's gate spin (its first 12 bytes), then #UD. The DPL0 phases' 4 bytes are overwritten.
+    store64(&kst_payload_g, 0x7B834802000000BB);
+    store64(&kst_payload_g + 8, 0xFEEB0B0FF9740018);
+    var fo_z = kst_spawn(&kst_payload_g, fo_zpg, 0, 0, 0, 0);    # O's child: faults first, then held in its exit tail
+    var fo_o = kst_spawn(&kst_payload_g, fo_opg, 0, 0, 0, 0);    # gate [+24] = 0: spins in ring 3 until kmain opens it
+    if (fo_z < 0 || fo_o < 0) { kprintln("kstack: FAIL fault orphan: spawn", 32); return 0; }
+    store64(&proc_ppid + fo_o * 8, 15);                          # a parent incarnation nobody has: O is an ORPHAN
+    store64(&proc_ppid_epoch + fo_o * 8, 0x7EADBEEF00000002);
+    store64(&proc_ppid + fo_z * 8, fo_o);                        # Z is a child of THIS incarnation of O
+    store64(&proc_ppid_epoch + fo_z * 8, proc_epoch_get(fo_o));
+    var fo_cr3 = proc_get_cr3(fo_o);
+    var fo_zcr3 = proc_get_cr3(fo_z);
+    fs_spin_lock();                                              # THE HOLD: kmain is non-preemptible, so O and Z run on APs
+    proc_set_state(fo_o, 1);
+    var fo_t = kst_now_us();
+    while (kst_now_us() - fo_t < 1000000) {
+        if (proc_get_state(fo_o) == 2) { if (on_cpu_get(fo_o) > 0) { break; } }
+        asm { 0xF3; 0x90; }                                      # pause (no GPR touched)
+    }
+    kst_fz_timeout = 0;
+    kst_fz_parked = 0;
+    kst_fz_hold = 1;
+    kst_fz_arm = fo_z;                                           # THE Z HOLD: sched.cyr kst_note_exit_tail, on Z's CPU
+    store64(kst_pg(fo_zpg) + 24, 1);                             # Z's gate open: it runs straight into ud2
+    proc_set_state(fo_z, 1);
+    fo_t = kst_now_us();
+    while (kst_now_us() - fo_t < 1000000) {
+        if (kst_fz_parked == 1) { break; }
+        asm { 0xF3; 0x90; }                                      # pause (no GPR touched)
+    }
+    var fo_cz = on_cpu_get(fo_z);
+    var fo_zs0 = lc_st(fo_z);
+    var fo_zd0 = lc_done(fo_z);
+    var fo_zx = proc_get_exit_code(fo_z);
+    if (kst_fz_parked != 1 || fo_cz < 1 || fo_cz > 3 || fo_zs0 != 0 || fo_zd0 != 1 || fo_zx != 134) {
+        kst_fz_arm = 0 - 1;
+        kst_fz_hold = 0;
+        fs_spin_unlock();
+        kprint("kstack: FAIL fault orphan: Z not held as a zombie in its exit tail (parked=", 75); kprint_num(kst_fz_parked);
+        kprint(" cpu=", 5); kprint_num(fo_cz); kprint(" st=", 4); kprint_num(fo_zs0); kprint(" done=", 6); kprint_num(fo_zd0);
+        kprint(" exit=", 6); kprint_num(fo_zx); kprintln(")", 1);
+        return 0;
+    }
+    fo_t = kst_now_us();                                         # O on an AP that is not Z's (a tick may have moved it)
+    while (kst_now_us() - fo_t < 1000000) {
+        if (proc_get_state(fo_o) == 2) { if (on_cpu_get(fo_o) > 0) { if (on_cpu_get(fo_o) != fo_cz) { break; } } }
+        asm { 0xF3; 0x90; }                                      # pause (no GPR touched)
+    }
+    var fo_c = on_cpu_get(fo_o);
+    if (fo_c < 1 || fo_c > 3 || fo_c == fo_cz) {
+        kst_fz_hold = 0;
+        fs_spin_unlock();
+        kprint("kstack: FAIL fault orphan: O never ran on a free AP (on_cpu=", 60); kprint_num(fo_c); kprintln(")", 1);
+        return 0;
+    }
+    var fo_za = zfs_active;
+    zfs_active = 1;                                              # a pool "imported": zfs_release_pid's look must find no ZFS fd
+    var fo_k0 = load64(&cpu_user_ticks + fo_c * 8) + load64(&cpu_kern_ticks + fo_c * 8);
+    kst_fo_detached = 0;
+    kst_fo_arm = fo_o;                                           # THE O DETACH: sched.cyr kst_note_fault_death, on O's CPU
+    store64(kst_pg(fo_opg) + 24, 1);                             # THE GATE: O runs into ud2 on its AP
+    kst_spin_us(300000);
+    var fo_k1 = load64(&cpu_user_ticks + fo_c * 8) + load64(&cpu_kern_ticks + fo_c * 8);
+    kst_fo_arm = 0 - 1;
+    var fo_det = kst_fo_detached;
+    var fo_left = 0;
+    if (on_cpu_get(fo_o) == 0 - 1) { fo_left = 1; }
+    var fo_done = lc_done(fo_o);
+    var fo_so = lc_st(fo_o);
+    var fo_sz = lc_st(fo_z);
+    var fo_ex = proc_get_exit_code(fo_o);
+    var fo_ow = (proc_orphan_owed >> fo_o) & (proc_orphan_owed >> fo_z) & 1;
+    zfs_active = fo_za;
+    var fo_zh = 0;                                               # Z still held on its CPU through O's death
+    if (kst_fz_parked == 1 && kst_fz_timeout == 0 && on_cpu_get(fo_z) == fo_cz) { fo_zh = 1; }
+    proc_set_cr3(fo_z, 0x1000);                                  # THE Z DETACH, while Z is still in its exit tail ...
+    kst_fz_hold = 0;                                             # ... then Z is let go: its exit tail raises the switch
+    var fo_zl = 0;
+    fo_t = kst_now_us();
+    while (kst_now_us() - fo_t < 200000) {
+        if (on_cpu_get(fo_z) == 0 - 1) { fo_zl = 1; break; }
+        asm { 0xF3; 0x90; }                                      # pause (no GPR touched)
+    }
+    proc_set_cr3(fo_z, fo_zcr3);                                 # undo both detaches: the real drain detaches and frees them
+    proc_set_cr3(fo_o, fo_cr3);
+    fs_spin_unlock();
+    var fo_r = 0;
+    fo_t = kst_now_us();
+    while (kst_now_us() - fo_t < 2000000) {
+        fo_r = 1;
+        if (lc_st(fo_o) != 0 || lc_pp(fo_o) != 0 || proc_fd_base_get(fo_o) != 0 || proc_get_cr3(fo_o) != 0x1000) { fo_r = 0; }
+        if (lc_st(fo_z) != 0 || lc_pp(fo_z) != 0 || proc_fd_base_get(fo_z) != 0 || proc_get_cr3(fo_z) != 0x1000) { fo_r = 0; }
+        if (((proc_orphan_owed >> fo_o) & 1) != 0 || ((proc_orphan_owed >> fo_z) & 1) != 0) { fo_r = 0; }
+        if (fo_r == 1) { break; }
+        arch_wait();
+    }
+    var fo_free1 = pmm_free_count();
+    kprint("kstack: fault orphan O=", 23); kprint_num(fo_o); kprint(" Z=", 3); kprint_num(fo_z);
+    kprint(" cpu=", 5); kprint_num(fo_c); kprint(" zcpu=", 6); kprint_num(fo_cz);
+    kprint(" ticks_in_hold=", 15); kprint_num(fo_k1 - fo_k0);
+    kprint(" detached=", 10); kprint_num(fo_det); kprint(" left=", 6); kprint_num(fo_left);
+    kprint(" zheld=", 7); kprint_num(fo_zh); kprint(" zleft=", 7); kprint_num(fo_zl);
+    kprint(" done=", 6); kprint_num(fo_done); kprint(" exit=", 6); kprint_num(fo_ex);
+    kprint(" st=", 4); kprint_num(fo_so); kprint("/", 1); kprint_num(fo_sz);
+    kprint(" owed=", 6); kprint_num(fo_ow); kprint(" reaped=", 8); kprint_num(fo_r);
+    kprint(" free_lost=", 11); kprint_num(fo_free0 - fo_free1);
+    kprintln("", 0);
+    if (fo_k1 - fo_k0 < 10) { kprintln("kstack: FAIL fault orphan (its CPU stopped ticking: the fault handler spun on fs_lock)", 86); return 0; }
+    if (fo_det != 1) { kprintln("kstack: FAIL fault orphan (the CR3 detach never ran: O did not die by its fault)", 80); return 0; }
+    if (fo_left != 1) { kprintln("kstack: FAIL fault orphan (O never left its CPU: a DYING-done CPL0 leave was refused)", 85); return 0; }
+    if (fo_zh != 1) { kprintln("kstack: FAIL fault orphan (Z was not held in its exit tail through O's death)", 77); return 0; }
+    if (fo_zl != 1) { kprintln("kstack: FAIL fault orphan (Z never left its CPU: a flipped zombie's exit-tail leave was refused)", 96); return 0; }
+    if (fo_done != 1 || fo_ex != 134 || fo_so != 4 || fo_sz != 4 || fo_ow != 1) { kprintln("kstack: FAIL fault orphan (the fault death did not owe both reaps)", 66); return 0; }
+    if (fo_r != 1) { kprintln("kstack: FAIL fault orphan (not reaped after the release)", 56); return 0; }
+    if (fo_free0 - fo_free1 > 16) { kprintln("kstack: FAIL fault orphan (memory not returned)", 47); return 0; }
+    kprintln("kstack: fault orphan OK", 23);
+    return 0;
+}
+
 fn kstack_selftest_verify() {
     if (kst_setup_ok == 0) { kprintln("kstack: FAIL setup did not complete", 35); return 0; }
     kst_accel_line();
@@ -8004,6 +8179,7 @@ fn kstack_selftest_verify() {
     kst_phase_isrclac();                                # after frame (mode 1) and pause (mode 5): the AC samples
     kst_phase_rmw();
     kst_phase_tickorphan();                             # 1.57.13 (k.132 (3)): a tick-killed orphan never spins on fs_lock
+    kst_phase_faultorphan();                            # 1.57.14: nor does a fault-killed one (proc_death_in_handler)
     kprint("kstack: isr samples=", 20); kprint_num(kst_isr_samples);
     kprint(" bad=", 5); kprint_num(kst_isr_bad); kprintln("", 0);
     if (kst_isr_samples > 0 && kst_isr_bad == 0) { kprintln("kstack: isr cannot block OK", 27); } else { kprintln("kstack: FAIL isr body preemptible", 33); }

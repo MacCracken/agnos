@@ -156,6 +156,19 @@ sh "$ROOT/scripts/check/issue-pointer-check.sh" > "$CHECK_LOGS/issue-pointer-che
 check "docs/development/issues pointers resolve (scripts/ tests/ kernel/ docs/)" $rc
 [ "$rc" = "0" ] || cat "$CHECK_LOGS/issue-pointer-check.log"
 
+# ⭐ 1.57.14 — GATE 40: SMOKE / HARNESS HYGIENE. 1.57.13 fixed the SWEEP rows only; ~90 other smokes and ~40 harnesses
+# still defaulted siblings to $ROOT/.. (from a worktree that holds no sibling — the 1.57.12 sweep's doom / naad rows
+# failed in 7 s on exactly that), bound QEMU sockets at fixed /tmp/agnos-*.sock names two trees share, wrote build logs
+# to fixed /tmp paths, and three built INSIDE a sibling repo (agnova, mishran, vani — vani's rewrote a tracked dist/
+# bundle). All converted at 1.57.14; this refuses the next one: S1 a sibling default other than
+# ${<NAME>_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/<repo>} / _siblings.sibling(), S2 a socket not from a TREE-ROOTED
+# smoke_qsock / qsock, S3 a fixed /tmp path, S4 a build in the scope of `cd "$<sibling>"` — over scripts/smoke, harness,
+# tool and probe. A text + Python-ast walk (~1.5 s), never builds. Prior art, floors, the mutation record and the
+# forms it does NOT follow are in the script header.
+sh "$ROOT/scripts/check/smoke-hygiene-check.sh" > "$CHECK_LOGS/smoke-hygiene-check.log" 2>&1 && rc=0 || rc=$?
+check "smoke/harness hygiene (sibling rule, qsock sockets, no fixed /tmp, no sibling build)" $rc
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/smoke-hygiene-check.log"
+
 # Syscall ABI three-way consistency: kernel dispatch == ABI doc == the cyrius SysNrAgnos peer.
 # agnos redefines the syscall numbers (exit is #0, not Linux's 60), so a wrong number COMPILES CLEAN
 # and calls a different arm — confirmed shipping in jalwa as `poll`(7) -> `open` PER FRAME and
@@ -431,8 +444,8 @@ echo "  VERSION file: $VERSION"
 # alone — a COMMENT on line 1 — and never read kernel/version.cyr, where every
 # string the running kernel actually emits lives. So the two non-banner sites in
 # that generated file sat at 1.56.17 on a 1.56.19 kernel across two releases with
-# check.sh green, and both are user-visible, not cosmetic: _AGNOS_VERSION fills
-# uname#34's release field (syscall.cyr), so mihi -> iam printed "Kernel: 1.56.17"
+# check.sh green, and both are user-visible, not cosmetic: _AGNOS_VERSION then filled
+# uname#34's release field (syscall.cyr; agnos_version_str() since 2026-08-11), so mihi -> iam printed "Kernel: 1.56.17"
 # to every ring-3 reader, and agnos_version_str() feeds the TCP_LISTEN_SMOKE HTTP
 # banner, which served "AGNOS 1.56.17 tcp_listen smoke" over the wire. The banner
 # literals are covered too — the scan asserts EVERY version token on a non-comment
@@ -445,10 +458,10 @@ grep -q "AGNOS kernel v$VERSION" "$ROOT/kernel/agnos.cyr" 2>/dev/null \
     || VDRIFT="$VDRIFT    kernel/agnos.cyr: banner comment is not v$VERSION\n"
 VFN=$(sed -n 's/^ *return "\([0-9][^"]*\)";$/\1/p' "$ROOT/kernel/version.cyr" 2>/dev/null)
 [ "$VFN" = "$VERSION" ] \
-    || VDRIFT="$VDRIFT    kernel/version.cyr: agnos_version_str() returns '$VFN' (feeds the tcp_listen HTTP banner)\n"
-VGV=$(sed -n 's/^var _AGNOS_VERSION = "\([^"]*\)";$/\1/p' "$ROOT/kernel/version.cyr" 2>/dev/null)
-[ "$VGV" = "$VERSION" ] \
-    || VDRIFT="$VDRIFT    kernel/version.cyr: _AGNOS_VERSION is '$VGV' (feeds uname#34 release -> iam's Kernel: line)\n"
+    || VDRIFT="$VDRIFT    kernel/version.cyr: agnos_version_str() returns '$VFN' (feeds uname#34 release + the tcp_listen HTTP banner)\n"
+# ⛔ 1.57.14: the `_AGNOS_VERSION` row that stood here is gone with the gvar (version-bump.sh no longer emits it —
+# a declaration-zone string initializer an x86 kernel build never runs; uname#34 reads agnos_version_str(), the row
+# above). A gvar coming BACK is refused at build time (scripts/build.sh's late-initializer gate), not here.
 for v in $(grep -vE '^[[:space:]]*#' "$ROOT/kernel/version.cyr" 2>/dev/null \
            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?' || true); do
     [ "$v" = "$VERSION" ] || VDRIFT="$VDRIFT    kernel/version.cyr: stale version token $v\n"

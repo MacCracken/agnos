@@ -61,8 +61,8 @@ cd "$ROOT"
 #   · GROUPS: run_gate's optional 4th argument is a group key; rows sharing a key run on ONE worker, in table order
 #     (xdist loadgroup). Keyless rows are singleton groups. Workers PULL the next group with an atomic
 #     `mkdir claim.<group>`, longest-first by the previous run's build/sweep-logs/durations.tsv.
-#     Keys: `hostport` (two rows that pick a host port by bind(0) and release it before QEMU binds — a TOCTOU
-#     window), `naad` (the one row that writes a sibling repo's build dir), `waits` (three rows that build
+#     Keys: `hostport` (three rows — tcp-listen, tcp-inbound and, since 1.57.14, sandhi-async — that pick a host port
+#     by bind(0) and release it before QEMU binds — a TOCTOU window), `naad` (the one row that writes a sibling repo's build dir), `waits` (three rows that build
 #     tests/waits: wait-ring3, wait-kbd, tty since 1.57.13), and `exclusive` — a row whose oracle is a ratio against wall time runs ALONE, serially, in the
 #     main tree after the parallel phase (Bazel `exclusive`; SWEEP_EXCLUSIVE=0 pools them instead).
 #     ⭐ SWEEP_EXCLUSIVE=1 STAYS THE DEFAULT (1.57.10, issue 2026-09-26-harness-backlog-after-1-57-9 item 9: the
@@ -619,12 +619,18 @@ run_gate "1.57.8 virtio-net under KVM boots at normal speed (-smp 1 + 4)" "" "kv
 # smokes existed and were never run by the sweep (D15); S4.1 gave them the banner-gated retry + the invariant deny.
 run_gate "1.57.7 TCP hermetic (ring/retx/mss/wnd + locks/lo-inplace/txslots/claim/gen/syncap/eof/halfclose + S6 net waits/graceful close; -smp 1 + -smp 4)" "TCP_SELFTEST=1" "tcp-smoke.sh"
 run_gate "1.57.7 loopback lo (UDP/ICMP/TCP/sockfd/epoll/close-wait)" "LOOPBACK_SELFTEST=1" "loopback-smoke.sh"
-# Group `hostport` (1.57.9 PSWEEP): tcp-listen and tcp-inbound pick a host port with bind(0) and CLOSE it before
-# QEMU's hostfwd binds it — a TOCTOU window, so the two never run at the same time (CTest RESOURCE_LOCK).
+# Group `hostport` (1.57.9 PSWEEP): tcp-listen, tcp-inbound and (1.57.14) sandhi-async below pick a host port with
+# bind(0) and CLOSE it before QEMU's hostfwd binds it — a TOCTOU window, so the three never run at the same time
+# (CTest RESOURCE_LOCK).
 run_gate "1.57.7 tcp_listen accept-one (TCP_LISTEN_SMOKE)" "TCP_LISTEN_SMOKE=1" "tcp-listen-smoke.sh" "hostport"
 # 1.57.7 (S4) — inbound TCP served in interrupt context, #49 EOF after the peer's FIN, FIN-before-accept half-close,
 # and a cross-CPU loopback mix: tests/tcpin as /bin/agnsh on a PLAIN kernel, three GATED variants.
 run_gate "1.57.7 inbound TCP in interrupt context (+ #49 EOF, half-close; -smp 1 msix/vectors0 + -smp 4)" "" "tcp-inbound-smoke.sh" "hostport"
+# 1.57.14 — sandhi's cooperative server booted on agnos (roadmap § "Recorded by cyrius 6.6.19"): tests/sandhi as /bin/agnsh on
+# a PLAIN kernel serves through sandhi_server_run_async with no stop flag, so its idle path is async_await_readable — the
+# cyrius 6.6.19 readiness STASH (pre-accept + sleep_ms backoff), verified until now only under cyrius's fake kernel.
+# Group `hostport`: it picks its host port by bind(0) and releases it before QEMU binds, as tcp-inbound does.
+run_gate "1.57.14 sandhi run_async on agnos (async_await_readable stash: park, accept, burst, re-park; -smp 1 + -smp 4)" "" "sandhi-async-smoke.sh" "hostport"
 run_gate "1.57.7 socket ownership (TCP+UDP), loopback-only listen, 127/8, sock_peer#106 (kernel arms + ring 3 -smp 1/4)" "" "sock-owner-smoke.sh"
 run_gate "1.57.7 sock/icmp waits block only the caller (ring 3; -smp 1 + -smp 4)" "" "sock-wait-smoke.sh"
 # 1.57.13 — sock_send_dl#109, a caller ceiling on #48 (issue archived/2026-10-02-sock-send-ignores-the-caller-deadline.md):

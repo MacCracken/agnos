@@ -6,9 +6,83 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-10-13 (**1.57.13 closeout — the full sweep 72/73 (row 1 KNOWN RED by design), check.sh 38/39, test.sh --all 8/8; the release tallies filled**; see the 1.57.13 block below). Before that: 2026-10-13 (**1.57.13 — the five repair tracks merged and read together; the ABI bookkeeping for #109–#111; state / roadmap / CLAUDE.md / build.md reconciled**). Before that: 2026-10-13 (**1.57.13 track a64**). Before that: 2026-10-13 (**1.57.12 B12 gates — every flag build re-weighed, the § i.4 mutation table, the full sweep 71/71, k.134; the closeout tallies filled**; see the first 1.57.12 block below). Before that: 2026-10-13 (**1.57.12 closeout docs — B12: the ZFS write path written up for release; `architecture/zfs-read-only.md` → `architecture/zfs.md`**). Before that: 2026-10-13 (**the ZFS writer's B10 (log hygiene) and B11 (policy B, the deferral window, the crash cut), built in two parallel tracks, reviewed and merged**). Before that: 2026-10-12 (**the B8 / B9 / ROOM merge**). Before that: 2026-10-12 (**the B7 review: five findings fixed, and k.70, the free_bpobj budget its coverage found**). Before that: 2026-10-11 (**ZFS write bite B7 (unlink / rmdir / rename / link) and k.68, the space map histograms its gate found**). Previous: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**). Before that: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
+> **Last refresh**: 2026-10-13 (**1.57.14 closeout — the full sweep 73/74 (row 1 KNOWN RED by design), check.sh 39/40, test.sh --all 8/8; the release tallies filled**; see the 1.57.14 closeout block below). Before that: 2026-10-13 (**1.57.14 — the three repair tracks (pin, fault, hyg) merged and read together; the aarch64 release ruling recorded; two defects found along the way fixed**; see the 1.57.14 merge block below). Before that: 2026-10-13 (**1.57.13 closeout — the full sweep 72/73 (row 1 KNOWN RED by design), check.sh 38/39, test.sh --all 8/8; the release tallies filled**; see the 1.57.13 block below). Before that: 2026-10-13 (**1.57.13 — the five repair tracks merged and read together; the ABI bookkeeping for #109–#111; state / roadmap / CLAUDE.md / build.md reconciled**). Before that: 2026-10-13 (**1.57.13 track a64**). Before that: 2026-10-13 (**1.57.12 B12 gates — every flag build re-weighed, the § i.4 mutation table, the full sweep 71/71, k.134; the closeout tallies filled**; see the first 1.57.12 block below). Before that: 2026-10-13 (**1.57.12 closeout docs — B12: the ZFS write path written up for release; `architecture/zfs-read-only.md` → `architecture/zfs.md`**). Before that: 2026-10-13 (**the ZFS writer's B10 (log hygiene) and B11 (policy B, the deferral window, the crash cut), built in two parallel tracks, reviewed and merged**). Before that: 2026-10-12 (**the B8 / B9 / ROOM merge**). Before that: 2026-10-12 (**the B7 review: five findings fixed, and k.70, the free_bpobj budget its coverage found**). Before that: 2026-10-11 (**ZFS write bite B7 (unlink / rmdir / rename / link) and k.68, the space map histograms its gate found**). Previous: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**). Before that: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
 >
 >
+>
+> ### 1.57.14 (2026-10-13) — the closeout (release phase): the tallies from a real run
+>
+> ✅ **`CHANGELOG.md` [1.57.14] § Closeout** — new: the full `sweep.sh` **73/74** (4 workers, 5,453 s, the first full
+> sweep on cyrius 6.6.20; row 1 `baseline check.sh` KNOWN RED by design on the ABI gate alone; 0 serial retries, no row
+> re-run; 19 firmware VOIDs (`gnoboot: fail @ EBS`) relaunched inside 12 rows, named, two of them inside exec-redirect's
+> nested agnsh-smoke; the ZFS write row 5,324 s). It compares the run with 1.57.13's closeout row by row: 69 of the 73
+> shared rows the same or faster, the timing-sensitive rows green, three rows slower by firmware VOIDs, and the ZFS
+> write row +7.4 %, not attributed. It also records `check.sh` 39/40 and `test.sh --all` 8/8, plain and the binding
+> flag build re-measured unchanged (400,872 / 259,560 B), the ktest-smoke and agnsh-smoke boot checkpoints, the version
+> verify and the leftovers removed. ✅ **`CLAUDE.md`** closeout step 1: `check.sh` 39/40 at 1.57.14 and the sweep tally
+> 73/74 (1.57.13's 72/73 kept as history). ✅ **`development/state.md`**: the Last-refresh line, the Kernel-head row's
+> sweep tally (it read "the full sweep is the closeout's"), and the flag-build clause (plain + binding re-measured at
+> the closeout). The file stays at 120 lines. No other doc changed. No kernel, script or test changed at the closeout.
+>
+> ### 1.57.14 (2026-10-13) — the merge: pin + fault + hyg, read together
+>
+> ✅ **`CHANGELOG.md` [1.57.14]** — one section set per track (the pin move; the fault-path reap; smoke / harness
+> hygiene) plus § Changed / Fixed / Gates — the merge. ✅ **`development/state.md`** — the kernel-head row (1.57.14 on
+> top, 1.57.13 as the previous head), the `build/agnos` row RE-MEASURED on the merged tree (the pin track left it at
+> 1.57.13's numbers, marked pre-move), the aarch64 bullet's release ruling, the last-refresh line.
+> ✅ **`development/roadmap.md`** aarch64 row + **`CLAUDE.md`** "Compiles is not boots" + **`.github/workflows/release.yml`**
+> (comment only) — ⭐ operator ruling 2026-10-13: a failed aarch64 compile does NOT block a release (`aarch64=absent`, the
+> x86_64 release continues) until the port is ready and proven, then CI gates it. ✅ **gate counts consistent**:
+> `CLAUDE.md` (Quick Start 40-gate, closeout step 1), `README.md` (40-gate), `build.md` (gate 40, gate 39 = the aarch64
+> placeholder row), state.md. ✅ **`development/build.md`** § parallel sweep — the `hostport` group is three rows
+> (tcp-listen, tcp-inbound, sandhi-async). ✅ **`scripts/harness/README.md`** — sweep-test's uname chain names
+> `agnos_version_str()` and its version oracle, and "Running one" names gate 40's rules for a new harness.
+> ✅ **`architecture/process-lifecycle.md`**, **`proposals/2026-10-09-zfs-write.md`** k.136 and `syscall.cyr`'s
+> `proc_death_release` / `proc_death_in_handler` comments — the covered-console spill now holds `fs_lock` (they said
+> "no `fs_lock` on that path"). ✅ **`scripts/burn/burn-prep.sh`** — the staleness loop's comment records the
+> duplicate-row fix.
+>
+> ### 1.57.14 (2026-10-13) — track: the fault-path reap (ring-3 fault deaths reap out of the exception handler)
+>
+> ✅ **`architecture/process-lifecycle.md`** — the invariant after INV-L2 (`proc_death_in_handler`: the tick and a
+> post-scheduler ring-3 fault owe their reaps; the releases stay keyed on `via=tick`), the death-chain paragraph, the
+> DYING-done leave, the limits list (owed work has no bound when every CPU runs syscall-free ring-3 work — now including
+> every post-scheduler fault of an orphan or a parent of zombies). ✅ **`proposals/2026-10-09-zfs-write.md`** k.136 —
+> the decision, the path table, the gate, the negatives (N-FAULT, N-FREAP, N-ZLOOK, N-FLEAVE). ✅ **`CHANGELOG.md`
+> [1.57.14]** — Added (`kstack: fault orphan`) / Fixed (the in-handler reap, `zfs_release_pid`'s lock-free look, the
+> DYING-done leave and the 1.57.13 hang it also closes).
+>
+> ### 1.57.14 (2026-10-13) — track: the cyrius 6.6.6 → 6.6.20 pin move (kashi 1.1.1, rekha 1.0.0, klug 0.2.1)
+>
+> ✅ **`development/state.md`** § Cyrius pin — 6.6.20, 25 manifests, the siblings, the 2×2's attribution, the declared
+> closure (472/472, tests/gpu's source-level io included), the late-initializer refusal, 6.6.9's undefined-call refusal. ✅ **`development/roadmap.md`** —
+> § "Recorded by cyrius 6.6.16" and § 6.6.17 DONE (what was acted on), § 6.6.19: the sandhi boot test DONE (NEW `sandhi-async-smoke`), the
+> readiness probe a forward row (unslotted), § 6.7.6 marked left for the 6.7.x move; the `Built with` trailer (6.6.20).
+> ✅ **`development/build.md`** — the pin line, the placeholder gate's 6.6.9 note, NEW § late-initializer refusal and its
+> refused-image path. ✅ **`development/agnos-userland-abi.md`** §O5 — the BSD socket names safe on agnos since 6.6.17;
+> the agnos CLI answers version/help only. ✅ **`architecture/kernel-image-room.md`** — `CYRIUS_DCE` declined on
+> `kernel;` (6.6.20 REVBE-01); the kashi row 101,248 → 12,656 B. ✅ **`CLAUDE.md`** — the compiler-OK rule (6.6.9+ refuses
+> the shape; the gate stays as the belt). ✅ **`CHANGELOG.md`** [1.57.14] — the pin track's Changed / Added / Fixed / Gates.
+> ✅ **review fixes (same track)**: `agnos-userland-abi.md` §4.3 + **`development/syscall-additions.md`** row 34 — uname's
+> nodename / release name `kernel_hostname_str()` / `agnos_version_str()` (the gvars they named were deleted);
+> **`architecture/kernel-font-namespace.md`** Inv. 6 — `REKHA_REF` no longer carries a stale literal (`0.3.8`); state.md's
+> `build/agnos` row marked PRE-MOVE until the merge re-measures it; the closure history corrected (`syscalls` → `alloc`
+> since 6.6.6 CX-only / 6.6.9 unconditional, `fmt` → `vec` already at 6.6.6, `poison` under `#ifdef`).
+>
+> ### 1.57.14 (2026-10-13) — smoke / harness hygiene track (the 1.57.13 carried repair)
+>
+> ✅ **`CLAUDE.md`** — Quick Start "40-gate"; closeout step 1 says 39 gates at 1.57.13, **40** since 1.57.14, and
+> describes the 40th (`smoke/harness hygiene`, `scripts/check/smoke-hygiene-check.sh`). ✅ **`README.md`** — the tree
+> listing called `check.sh` an "11-point" validation; 40-gate. ✅ **`development/build.md`** § parallel sweep — the
+> sibling rule is every smoke's and harness's since 1.57.14 (`_siblings.py` for Python), the three sibling-copy builds,
+> gate 40, and the harnesses' sockets through `qsock`. ✅ **`scripts/harness/README.md`** — rows for `_siblings.py`
+> (new) and `_qsock.py` (never listed), the agnsh row's `agnsh-verb-test.py` RETIRED (it asserted agnoshi 1.4.2's
+> removed in-process verbs), and the `SIBLINGS_ROOT` note under "Running one". ✅ **`CHANGELOG.md`
+> [1.57.14]** — Added / Changed / Fixed for the track. `state.md` / `roadmap.md` untouched by this track (the release
+> tallies are the closeout's). ✅ Review fix: CHANGELOG / `build.md` / `CLAUDE.md` claimed "every harness binds through
+> `qsock`" while six QEMU drivers under `scripts/tool` + `scripts/probe` still bound fixed `/tmp/agnos-*.sock` names
+> outside gate 40's walk — the drivers are converted, the walk covers both directories, and the wording names the four
+> directories; the harness README / CHANGELOG name where the retired verb test's redirect half lives now.
 >
 > ### 1.57.13 (2026-10-13) — the repair sweep: five tracks (a64, carry, VTD, sock, tty), merged
 >

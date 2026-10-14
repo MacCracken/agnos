@@ -162,16 +162,21 @@ fn print_agnos_shell_banner() {
 # Program-body-safe version accessor. Returns a pointer to the NUL-terminated
 # version literal; the rodata pointer is baked into the function at compile
 # time (same reason the banners above are functions), so this is safe to call
-# from the kernel program body — unlike the _AGNOS_VERSION gvar below. Callers
-# strlen() the result. Used by e.g. the TCP_LISTEN_SMOKE HTTP banner.
+# from the kernel program body — unlike a \`var\` global's string initializer.
+# Callers strlen() the result. Used by uname#34's release field
+# (core/syscall.cyr) and the TCP_LISTEN_SMOKE HTTP banner.
 fn agnos_version_str() {
     return "$NEW";
 }
 
-# Bare version string — safe to use from any consumer that runs AFTER
-# gvar init has completed (kybernet, userspace, etc.). NOT safe to use
-# from the kernel program body (same kmode init-order constraint above).
-var _AGNOS_VERSION = "$NEW";
+# ⛔ 1.57.14 — no \`var _AGNOS_VERSION = "…";\` here any more. That gvar was the
+# "bare version string" for consumers running after gvar init, and in this
+# kernel that is NOBODY: an x86 \`kernel;\` build runs a declaration-zone string
+# initializer after the top-level program, which never returns, so the gvar
+# read 0 forever. uname#34 used the accessor above since 2026-08-11; cyrius
+# 6.6.16+ warns on the gvar at every build, and scripts/build.sh refuses that
+# warning since 1.57.14. Version text from the kernel goes through
+# agnos_version_str().
 EOF
     updated="$updated  kernel/version.cyr (regenerated)\n"
 fi

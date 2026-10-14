@@ -84,6 +84,40 @@ they end at B1 or a wait interrupt. `/bin/agnsh` is unstoppable (kmain waits on 
   in process context on the way back to user mode and drops a dead task's mm in the next task's `finish_task_switch`
   (the idle task included); FreeBSD exits from `ast()`. Gate: `kstack-smoke`'s `kstack: tick orphan OK` (-smp 4),
   which also checks the pipe ends and both runners' refusal of a held `fs_lock`.
+- **A RING-3 FAULT's death owes the same REAPS (1.57.14, the 1.57.13 carry).** `fault_kill_current` runs the death
+  chain in the #DE/#UD/#GP/#PF exception handler — IF=0 on the faulting process's own kernel stack, no vector in
+  service — and until 1.57.14 it freed its zombie children's and its own orphan fd tables there under `fs_lock`; a ZFS
+  commit on another CPU (k.126) held that CPU at IF=0, no tick, until the commit ended. One predicate decides the reaps
+  for both handler deaths — `syscall.cyr` `proc_death_in_handler(via)`: 1 for `via=tick`, and for `via=fault` once the
+  scheduler runs (before it, the boot's `exec_and_wait` child: nothing else can hold `fs_lock`, and the owed reap's
+  off-CPU fence is the scheduler's to open, so that fault reaps in place as before). Such a death OWES its reaps
+  (`proc_orphan_owed`). ⛔ **The predicate keys the reaps only.** A fault death's ZFS exit commit and covered-console
+  spill run in its handler before the publish, as exit#0's run in its syscall (same context class: IF=0, own stack, no
+  vector in service, no lock held) — keyed on `via=tick` alone: a fault death is durable at exit (ABI § 3.6 `write`#1,
+  design D1), and the spill (an ext2 write — under `fs_lock` since the 1.57.14 merge, taken only for a process that owned
+  the scanout) is the crash evidence it exists for. `zfs_release_pid` takes
+  `fs_lock` only for a dying table that holds a ZFS file fd (a lock-free look on every path, 1.57.14 — it used to take
+  it for every death while a pool was imported); the look is on the fd's type, because `zfs_commit` clears
+  `zfs_wp_ref` before it commits under the lock. ⛔ **A DYING (4) current whose death is done is never refused its
+  leave for its CR3** — whoever made it 4: (1) the fault-killed orphan itself, and (2) a ZOMBIE still in its exit tail
+  (its exit#0 or fault published it, it has not left its CPU) that its parent's tick or fault death flipped 0 → 4 in
+  the parent's final hold. Its CPU is still on the slot's stack and CR3 when another CPU's B1 / idle step can claim
+  the owed bit and run `proc_reap_orphan_space`, which rewrites the slot's CR3 cell to 0x1000 and spins in the off-CPU
+  fence; `sched_exit_tail`'s switch is a CPL0 frame, so `sched_cpl0_switch_ok` treats a DYING-done current like a dead
+  (0) one — "live != slot" would otherwise refuse every switch and the two CPUs would wait on each other forever. Way
+  (2) shipped in 1.57.13 under a tick parent (state 0 was the only exemption); the tick-killed process itself never
+  meets it (its frame is CPL3). Every other death runs in process context — exit#0 (`via=none`, the syscall), a kill
+  at B1 (`via=b1`, the syscall exit; a wait's ABORT reaches it), a claim (`via=claim`: kill#16 / execwait#37's publish
+  and abort, the claimer's syscall) — and reaps in place as before; #DF and every other CPL0 exception halt. Prior
+  art: Linux never runs `do_exit` in a fault handler (a user fault posts the signal, `force_sig_fault`, and the task
+  exits from `exit_to_user_mode_loop`, its mm and stack dropped by the next task in `finish_task_switch`); FreeBSD's
+  `trap()` posts it (`trapsignal`) and the thread exits from `ast()` / `userret()`. Gate: `kstack-smoke`'s
+  `kstack: fault orphan OK` (-smp 4): kmain holds `fs_lock` while O's child Z faults and is HELD in its exit tail as a
+  zombie (`sched.cyr` `kst_note_exit_tail`), then the ORPHAN O faults (`ud2`, exit 134) with a pool reading as
+  imported and its CR3 cell detached in the race window (`kst_note_fault_death`), then Z's cell is detached and Z let
+  go: O's CPU keeps ticking, O and Z both leave their CPUs, both reaps are owed, then reaped after the release.
+  Negatives N-FAULT / N-FREAP (the deferral removed, whole or reaps only) and N-ZLOOK (`zfs_release_pid`'s look
+  removed): `ticks_in_hold=0`; N-FLEAVE (the DYING-done switch test removed): `left=0 zleft=0`.
 - **Every transition INTO 5 re-checks the pending kill and the parent's liveness under the lock** and refuses when
   set / gone (a process about to die is never parked; a stopped process whose parent is gone would have no
   authority left that could continue it — D-33). A dying parent continues its stopped children.
@@ -109,8 +143,10 @@ ORPHAN publishes 4, frees its own fd table and address space (`proc_reap_orphan`
 never the reap fence's self-owned path), then publishes dead AND reaped in one proctab hold. ⭐ 1.57.13: a TICK death
 (`via=tick`) does neither reap in the ISR — its zombies become DYING (4) in the final hold instead of being reaped
 before it, and its own orphan reap is skipped; both are owed (`proc_orphan_owed`, INV-L2 above) and reaped remotely
-by the next syscall exit or idle step. A zombie reaped that way prints an `orphan … reaped` line (it is one: its
-parent is dying and nobody will read its status). The reuse tripwire in
+by the next syscall exit or idle step; ⭐ 1.57.14: a FAULT death (`via=fault`, once the scheduler runs) the same
+(`proc_death_in_handler`, above — the reaps only: its ZFS exit commit and console spill stay before its publish). A
+zombie reaped that way prints an `orphan … reaped` line (it is one: its parent is dying and nobody will read its
+status). The reuse tripwire in
 `proc_slot_reusable` (`proc: orphan zombie recycled unreaped`, denied) fires if an orphan slot with a live address
 space is ever handed out again — the D-29 leak (≈ 6 MB per orphan) this closes. kmain's own children (ppid 0) are
 never orphans: kmain reaps them through `fgwait`.
@@ -144,9 +180,20 @@ boundary. exit#0 and fault deaths emit no line.
   context, so an owed slot stays DYING until the next syscall exit or idle step of any CPU that wins `fs_lock` by
   trylock — while every CPU runs ring-3 code that never syscalls, an owed orphan's memory and its slot wait (no waiter
   needs them: nobody reads an orphan's status, and its pipe ends stopped counting at its final hold).
+- ⚠ **Accepted limit (1.57.14 review): the owed reaps have no progress bound but "some CPU makes a syscall or
+  idles".** Since 1.57.14 that covers every post-scheduler RING-3 FAULT of an orphan or of a process with zombie
+  children, not only the rarer tick kill (a kill landing on a CPL3 tick, or the CPU cap): on a box whose every CPU runs
+  syscall-free ring-3 work, each such death holds its slot (one of 16), its address space (≈ 6 MB) and its zombies'
+  slots DYING until one of them syscalls or idles. `fs_lock`'s trylock is not the risk (every syscall exit on every CPU
+  retries while a bit is set). Linux bounds it in the switch path (`finish_task_switch` drops the dead mm on the next
+  switch, any task); here every switch runs inside the 0xE0 / timer ISR at IF=0, where k.132 (3) keeps `fs_lock` and
+  the reaps out. A bound needs a process context that ring-3 spinners cannot starve — a reaper kthread
+  (a permanent proc slot and one of the 4 kthread stacks) or a post-EOI return-to-user hook on the tick — an operator
+  decision, not taken in this repair minor.
 - A post-scheduler ppid-0 child that kmain does not fg-wait leaks as before (none exists in production).
 - New iron-only surfaces (built and gated, NOT burned): the tick-path death, the B1 park (`int 0xE0` from the
-  syscall exit), the self-reap's CR3 hand-back, the ISR display hand-back.
+  syscall exit), the self-reap's CR3 hand-back, the ISR display hand-back; since 1.57.14 the fault death's owed reaps
+  and the DYING-done CPL0 leave (the faulted orphan's, and a flipped zombie's from its exit tail).
 
 ## Resource limits
 

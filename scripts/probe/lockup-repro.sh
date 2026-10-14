@@ -17,12 +17,12 @@
 #
 # Usage:   sh scripts/probe/lockup-repro.sh [DURATION_SECONDS]   (default 120)
 # Requires: qemu-system-x86_64, OVMF, python3, parted, mtools, sgdisk,
-#           mkfs.ext2. gnoboot at ../gnoboot/build/BOOTX64.EFI. agnos built.
+#           mkfs.ext2. gnoboot at ${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-..}/gnoboot}/build/BOOTX64.EFI. agnos built.
 set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 DURATION="${1:-120}"
 
 OVMF_CODE=""
@@ -77,6 +77,10 @@ mkfs.ext2 -F -q -L agnos-fs -b 4096 -m 0 \
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 
 echo "Launching QEMU + driving keystrokes for ${DURATION}s..."
+# 1.57.14: the QMP socket through smoke_qsock (qemu-dwell.sh) — under $WORK it overflowed sun_path's 108 bytes from a
+# deep worktree, and the rule's hash name is per-tree like every smoke's.
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+QMP=$(smoke_qsock "$WORK/qmp.sock")
 exec python3 "$ROOT/scripts/probe/lockup-driver.py" \
     --image "$IMG" --ovmf-code "$OVMF_CODE" --ovmf-vars "$WORK/vars.fd" \
-    --serial "$WORK/serial.log" --qmp "$WORK/qmp.sock" --duration "$DURATION"
+    --serial "$WORK/serial.log" --qmp "$QMP" --duration "$DURATION"

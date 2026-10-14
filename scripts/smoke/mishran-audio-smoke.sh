@@ -19,8 +19,8 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-MISHRAN_ROOT="${MISHRAN_ROOT:-$ROOT/../mishran}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
+MISHRAN_ROOT="${MISHRAN_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/mishran}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -38,17 +38,26 @@ AGNOS="$ROOT/build/agnos"
 WORK="$ROOT/build/mishran-audio-smoke"; rm -rf "$WORK"; mkdir -p "$WORK"
 IMG="$WORK/agnos-mishran.img"; SLOG="$WORK/serial.log"; WAV="$WORK/out.wav"
 
-echo "[1/4] Building /bin/mishtone --agnos (mishran mixer consumer)..."
-if ! ( cd "$MISHRAN_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build --agnos programs/mishtone.cyr build/mishtone-agnos ) >/tmp/mishtone-build.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/mishtone-build.log)"; tail -8 /tmp/mishtone-build.log; exit 1
+# ⛔ 1.57.14 — NEVER WRITE INTO THE SIBLING (naad-ring3-smoke.sh's rule since 1.57.13). mishtone used to be built INSIDE
+# $MISHRAN_ROOT, so every run wrote build/mishtone-agnos — and whatever `cyrius build` resolves (lib/, cyrius.lock) —
+# into the mishran repo. Now the sources it reads (cyrius.cyml, VERSION, cyrius.lock, src/, lib/, dist/, programs/,
+# vendor/ — never .git) are copied to $WORK/mishran-src and mishtone is built there; the logs are $WORK's (they were
+# fixed /tmp paths shared by every tree).
+MBUILD="$WORK/mishran-src"; mkdir -p "$MBUILD"
+for _n in cyrius.cyml VERSION cyrius.lock src lib dist programs vendor; do
+    [ -e "$MISHRAN_ROOT/$_n" ] && cp -a "$MISHRAN_ROOT/$_n" "$MBUILD/"
+done
+echo "[1/4] Building /bin/mishtone --agnos (mishran mixer consumer, from a copy of the mishran sources in $MBUILD)..."
+if ! ( cd "$MBUILD" && mkdir -p build && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build --agnos programs/mishtone.cyr build/mishtone-agnos ) >"$WORK/mishtone-build.log" 2>&1; then
+    echo "  BUILD-FAIL (see $WORK/mishtone-build.log)"; tail -8 "$WORK/mishtone-build.log"; exit 1
 fi
-MISHTONE="$MISHRAN_ROOT/build/mishtone-agnos"
+MISHTONE="$MBUILD/build/mishtone-agnos"
 [ -f "$MISHTONE" ] || { echo "  ERROR: mishtone not built"; exit 1; }
 echo "  /bin/mishtone $(stat -c %s "$MISHTONE") B"
 
 echo "[2/4] Building MISHRAN_AUDIO_SELFTEST kernel..."
-if ! env MISHRAN_AUDIO_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/mishran-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/mishran-kbuild.log)"; tail -5 /tmp/mishran-kbuild.log; exit 1
+if ! env MISHRAN_AUDIO_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$WORK/kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (see $WORK/kbuild.log)"; tail -5 "$WORK/kbuild.log"; exit 1
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
 

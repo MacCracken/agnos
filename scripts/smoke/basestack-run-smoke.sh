@@ -22,9 +22,9 @@ set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 
-BIN="${1:-${BIN:-$ROOT/../hoosh/build/hoosh_agnos}}"
+BIN="${1:-${BIN:-${SIBLINGS_ROOT:-$ROOT/..}/hoosh/build/hoosh_agnos}}"
 EXPECT="${2:-${EXPECT:-2.4.11}}"
 NAME="${3:-${NAME:-probe}}"
 

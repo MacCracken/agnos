@@ -381,6 +381,7 @@ fn console_spin_lock() { return 0; }
 fn console_spin_unlock() { return 0; }
 fn fs_spin_lock() { return 0; }
 fn fs_spin_unlock() { return 0; }
+fn fs_spin_trylock() { return 0; }   # always won (one core) — klug_spill_owed_run (1.57.14), zfs_wp_owed_run, proc_orphan_owed_run
 fn vfs_spin_lock() { return 0; }
 fn vfs_spin_unlock() { return 0; }
 fn sched_spin_lock() { return 0; }

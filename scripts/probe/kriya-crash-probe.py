@@ -10,10 +10,12 @@
 import socket, subprocess, sys, time, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(ROOT, "scripts/harness"))   # 1.57.14: the harness helper (_qsock)
+from _qsock import qsock
 WORK = os.path.join(ROOT, "build/agnsh-deleg")
 IMG  = os.path.join(WORK, "agnos-deleg.img")
 SER  = os.path.join(WORK, "serial-probe.log")
-MON  = "/tmp/agnos-probe.sock"
+MON  = qsock(os.path.join(WORK, "agnos-probe.sock"))  # 1.57.14: short + per-tree (_qsock.py) — a fixed /tmp name every tree shared
 if not os.path.exists(IMG):
     print("FAIL: image missing — run agnsh-delegation-test.py first"); sys.exit(1)
 for c in ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_CODE.fd",

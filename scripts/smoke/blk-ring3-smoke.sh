@@ -15,7 +15,7 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-${SIBLINGS_ROOT:-$ROOT/..}/gnoboot}"
 BLK_ROOT="$ROOT/tests/blk"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
@@ -26,9 +26,10 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd stri
 done
 
 echo "[1/4] Building blkprobe (--agnos) + the BLK_RING3_SELFTEST kernel..."
-( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build blkprobe.cyr build/blkprobe --agnos ) >/tmp/blkprobe-build.log 2>&1 || { echo "  BUILD-FAIL (blkprobe)"; tail -8 /tmp/blkprobe-build.log; exit 1; }
-if ! env BLK_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/blkprobe-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/blkprobe-kbuild.log)"; tail -8 /tmp/blkprobe-kbuild.log; exit 1
+mkdir -p "$ROOT/build"   # 1.57.14: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build blkprobe.cyr build/blkprobe --agnos ) >"$ROOT/build/blkprobe-build.log" 2>&1 || { echo "  BUILD-FAIL (blkprobe)"; tail -8 "$ROOT/build/blkprobe-build.log"; exit 1; }
+if ! env BLK_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/blkprobe-kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $ROOT/build/blkprobe-kbuild.log)"; tail -8 "$ROOT/build/blkprobe-kbuild.log"; exit 1
 fi
 
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"

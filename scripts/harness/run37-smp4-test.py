@@ -19,14 +19,16 @@
 import socket, subprocess, sys, time, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _qsock import qsock
+from _siblings import sibling
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 AGNOS = os.path.join(ROOT, "build/agnos")
 
 # ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
 # checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
 # nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
 # matters most. See scripts/harness/_freshness.py for the measurement that produced it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
 refuse_stale_kernel(ROOT)
 ROOTFS = os.path.join(ROOT, "build/rootfs")
@@ -34,7 +36,7 @@ WORK = os.path.join(ROOT, "build/run37")
 IMG = os.path.join(WORK, "agnos-run37.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-run37.log")
-MON = "/tmp/agnos-run37.sock"
+MON = qsock(os.path.join(WORK, "agnos-run37.sock"))  # 1.57.14: short + per-tree (_qsock.py)
 PART_OFFSET = 33 * 1048576
 PART_BLOCKS = (67 * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES",
@@ -250,7 +252,6 @@ try:
     # with them firing until it grepped for them.
     import re as _re_inv
     # 1.57.7 (S3d): loaded from scripts/smoke/lib/qemu-dwell.sh through _invdeny.py — no pasted copy left to drift.
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _invdeny import smoke_invariant_deny
     INV_DENY = smoke_invariant_deny()
     inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]

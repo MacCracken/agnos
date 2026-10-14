@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 exerciser for mountlist (#104, 1.56.59) — proves the kernel's mount table reaches ring 3 intact, that the record is NUL-padded, that the max budget is respected, and that the wrap-safe validator refuses a hostile count; exits 95 iff the whole contract holds."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.6"
+cyrius = "6.6.20"
 
 [build]
 src = "mlist.cyr"
@@ -16,4 +16,10 @@ output = "build/mlist"
 # ABI exerciser, and routing it through the stdlib wrapper would test the wrapper's agreement with
 # itself rather than the kernel's arm.
 [deps]
-stdlib = ["syscalls"]
+# ⚠ 1.57.14 (cyrius 6.6.20): `syscalls` alone is NOT a closed set — it names `alloc` (since 6.6.6; CX-only under
+# `#ifdef CYRIUS_TARGET_CX` through 6.6.8, unconditional since 6.6.9), which names `atomic` + `fnptr` and, since
+# 6.6.18, `poison` (under `#ifdef CYRIUS_POISON`, never compiled here). `cyrius deps` walks includes textually, so
+# it resolved alloc/atomic/fnptr at the 6.6.6 pin too: this manifest was short BEFORE the move, which uncovered it.
+# `cyrius lib sync` copies only what is DECLARED, so the transitives are declared (the 1.57.2 tests/chan
+# precedent); `cyrius deps` vendoring 15 files where lib sync vendored 7 is how the 1.57.14 move measured it.
+stdlib = ["syscalls", "alloc", "atomic", "fnptr", "poison"]

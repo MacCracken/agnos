@@ -1,0 +1,19 @@
+[package]
+name = "sandhix"
+version = "0.1.0"
+description = "agnos 1.57.14 boot test of sandhi's cooperative server (sandhi_server_run_async) on a booted kernel — the idle path parks in async_await_readable, whose agnos peer (cyrius 6.6.19 A2) is a readiness STASH that pre-accepts a pending conn. Verified until now only under cyrius's PTRACE_SYSEMU fake kernel. Seeded as /bin/agnsh by scripts/smoke/sandhi-async-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# Must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh).
+cyrius = "6.6.20"
+
+[build]
+entry = "sandhix.cyr"
+output = "build/sandhix"
+
+[deps]
+# `sandhi` is the folded stdlib module (lib/sandhi.cyr); every module it pulls TRANSITIVELY is declared, because
+# `cyrius lib sync` copies only what is declared (the 1.57.2 tests/chan precedent). Measured at 1.57.14 (lib/
+# emptied before EACH command): `cyrius deps` resolves 66 files, and `cyrius lib sync` vendors those 66 plus
+# `hashmap_fast.cyr`, which it copies as a peer of `hashmap` — 67 files, all equal to 6.6.20's lib/.
+stdlib = ["sandhi", "alloc", "args_agnos", "args_macos", "async", "atomic", "bayan", "boxed", "chrono", "ct", "dynlib", "fdlopen", "fmt", "fnptr", "freelist", "hashmap", "hashseed", "io", "keccak", "mmap", "net", "poison", "process", "random", "result", "sakshi", "sigil", "slice", "str", "string", "sync", "sys", "syscalls", "tagged", "thread", "tls", "vec"]

@@ -63,18 +63,19 @@ import os, re, shutil, socket, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _siblings import sibling
 from _freshness import refuse_stale_kernel
 from _invdeny import smoke_invariant_deny
 from _qsock import qsock
 
-KERNEL = os.environ.get("VTD_KERNEL", os.path.join(ROOT, "build/agnos"))
+KERNEL = os.environ.get("VTD_KERNEL") or os.path.join(ROOT, "build/agnos")
 refuse_stale_kernel(ROOT, KERNEL)
 KERNEL_REG = os.environ.get("VTD_KERNEL_REG", "")          # 1.57.13: the VTD_REGISTER_INV kernel (boot AR)
 if KERNEL_REG:
     refuse_stale_kernel(ROOT, KERNEL_REG)
-AGNSH = os.environ.get("AGNSH_BIN", os.path.join(os.environ.get("AGNOSHI_ROOT", os.path.join(ROOT, "../agnoshi")),
-                                                 "build/agnsh_agnos"))
-GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
+AGNSH = os.environ.get("AGNSH_BIN") or os.path.join(sibling("agnoshi", "AGNOSHI_ROOT"),
+                                                 "build/agnsh_agnos")
+GNOBOOT = os.path.join(sibling("gnoboot", "GNOBOOT_ROOT"), "build/BOOTX64.EFI")
 WORK = os.path.join(ROOT, "build/vtd-smoke")
 TRIES = int(os.environ.get("QEMU_TRIES", "6"))
 INV_DENY = re.compile(smoke_invariant_deny())
