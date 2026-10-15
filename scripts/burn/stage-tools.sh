@@ -547,6 +547,41 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
+# ⭐ BNRMR FONTS — bannermanor's fonts/*.cyml at /share/bannermanor/fonts, beside /bin/bnrmr.
+# bnrmr 1.6.0+ (its ADR 0003) looks for `--font NAME` in <prefix>/share/bannermanor/fonts when it
+# runs as <prefix>/bin/bnrmr; agnsh hands it the absolute /bin/bnrmr as argv[0], so the prefix is
+# empty and the directory is /share/bannermanor/fonts. Without this block the rootfs carried the
+# binary only: `bnrmr -f slim` and `-f big` answered "not found" and only the built-in block font
+# rendered. Checked in QEMU at bnrmr 1.7.0 (its scripts/agnos-smoke.py) with the fonts at this path.
+# ⚠ An ERROR, not a WARNING like the wallpapers: bnrmr is staged on every burn, so a rootfs without
+# its fonts is a staging failure. The directory belongs to this block: its *.cyml are cleared first,
+# so a font bannermanor retires does not linger in the image.
+BNRMR_FONTS_SRC="$SIBLINGS/bannermanor/fonts"
+BNRMR_FONTS_DEST="$ROOT/build/rootfs/share/bannermanor/fonts"
+_nfont=0
+if [ -d "$BNRMR_FONTS_SRC" ] && mkdir -p "$BNRMR_FONTS_DEST"; then
+    rm -f "$BNRMR_FONTS_DEST"/*.cyml
+    for _f in "$BNRMR_FONTS_SRC"/*.cyml; do
+        [ -f "$_f" ] || continue
+        _fd="$BNRMR_FONTS_DEST/$(basename "$_f")"
+        if ! cp -f "$_f" "$_fd" || ! chmod 0644 "$_fd" || ! cmp -s "$_f" "$_fd"; then
+            echo "ERROR: could not stage bnrmr font $_f -> $_fd"; rc=1; continue
+        fi
+        _nfont=$((_nfont + 1))
+    done
+    if [ "$_nfont" -eq 0 ]; then
+        echo "ERROR: $BNRMR_FONTS_SRC holds no .cyml — 0 bnrmr fonts staged (bnrmr -f slim / big: not found)"
+        rc=1
+    else
+        echo "staged: $_nfont bnrmr font(s) at $BNRMR_FONTS_DEST <- bannermanor/fonts"
+    fi
+else
+    echo "ERROR: no bannermanor fonts at $BNRMR_FONTS_SRC (or $BNRMR_FONTS_DEST could not be made)"
+    echo "       /bin/bnrmr would have only its built-in block font"
+    rc=1
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
 # ⛔ VACUITY FLOOR — assert AND PRINT how many rows actually reached the rootfs.
 #
 # `rc` is a COUNT OF FAILURES over the table above: it starts 0 and only a failing row raises it. That
