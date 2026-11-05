@@ -179,7 +179,7 @@ moved to `build/agnos.placeholder-refused` / `build/agnos-aarch64.placeholder-re
 FAIL-CLOSED: an image it cannot scan (no section table, no executable section, no python3) is refused too (on x86_64
 without python3 the layout guard's own rules below apply). On a PASS it prints one `placeholders (<flags | plain>):
 PASS: …` line (aarch64: `placeholders: PASS: …`), which `check.sh` gate 39 and `release.yml` require.
-⭐ From cyrius **6.6.9** (agnos's pin is 6.7.9 since 1.57.15; 6.6.20 at 1.57.14) the compiler itself refuses that shape on both backends
+⭐ From cyrius **6.6.9** (agnos's pin is 6.7.18 since 1.57.16; 6.7.9 at 1.57.15, 6.6.20 at 1.57.14) the compiler itself refuses that shape on both backends
 (`error: refusing to emit binary with 1 reachable undefined function(s)` — measured on a dead-first / live-second probe:
 6.6.6 built it rc 0, x86 with a warning and aarch64 silently; 6.6.20 refuses both). The gate stays as the belt: it
 scans the IMAGE, and it is the only check on a deliberately off-pin build.

@@ -5,7 +5,7 @@ description = "agnos 1.57.14 boot test of sandhi's cooperative server (sandhi_se
 license = "GPL-3.0-only"
 language = "cyrius"
 # Must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh).
-cyrius = "6.7.9"
+cyrius = "6.7.18"
 
 [build]
 entry = "sandhix.cyr"
@@ -16,4 +16,12 @@ output = "build/sandhix"
 # `cyrius lib sync` copies only what is declared (the 1.57.2 tests/chan precedent). Measured at 1.57.14 (lib/
 # emptied before EACH command): `cyrius deps` resolves 66 files, and `cyrius lib sync` vendors those 66 plus
 # `hashmap_fast.cyr`, which it copies as a peer of `hashmap` — 67 files, all equal to 6.6.20's lib/.
-stdlib = ["sandhi", "alloc", "args_agnos", "args_macos", "async", "atomic", "bayan", "boxed", "chrono", "ct", "dynlib", "fdlopen", "fmt", "fnptr", "freelist", "hashmap", "hashseed", "io", "keccak", "mmap", "net", "poison", "process", "random", "result", "sakshi", "sigil", "slice", "str", "string", "sync", "sys", "syscalls", "tagged", "thread", "tls", "vec"]
+# ⚠ 1.57.16 (cyrius 6.7.18): bayan 1.11.1 includes `lib/math.cyr` and the `lib/unicode/` family (7 files) — declared as
+# "math" and "unicode" (a family directory is ONE leaf, named by the family — cyrius guide). `cyrius deps` resolves 68
+# entries; `lib sync` vendors 75 files (68 + the 6 other unicode files + hashmap_fast), all equal to 6.7.18's lib/.
+# ⛔ 1.57.16: `args_macos` is NOT declared (it was from 1.57.14). A declared module is AUTO-PREPENDED to the build, so
+# the macOS peer compiled into this --agnos program and replaced args_agnos's `args_init` / `argc` / `argv` ("duplicate
+# fn … last definition wins", 3 warnings, present at 6.7.9 too). io.cyr includes it only under #ifdef CYRIUS_TARGET_MACOS,
+# and the build's own resolve vendors it for that textual include — so it is the one closure file `lib sync` alone does
+# not copy. Do not re-add it (or any other target's peer) to satisfy a closure check.
+stdlib = ["sandhi", "alloc", "args_agnos", "async", "atomic", "bayan", "boxed", "chrono", "ct", "dynlib", "fdlopen", "fmt", "fnptr", "freelist", "hashmap", "hashseed", "io", "keccak", "math", "mmap", "net", "poison", "process", "random", "result", "sakshi", "sigil", "slice", "str", "string", "sync", "sys", "syscalls", "tagged", "thread", "tls", "unicode", "vec"]

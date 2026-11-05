@@ -474,9 +474,10 @@ sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 # ⚠ 1.57.15 — THE PEER LANDED IN cyrius 6.7.11, AFTER THE 6.7.9 PIN. The gate reads the sibling ../cyrius first, so on a
 # box whose ../cyrius is >= 6.7.11 it is GREEN and this run prints "the mark is STALE"; against the pinned 6.7.9 lib (CI,
 # or no sibling) it is still red on exactly this signature. The mark stays until the pin itself reaches >= 6.7.11.
-run_gate "baseline check.sh (build/test/version/size)" "" "CHECK" "" \
-    "by design: the syscall ABI gate is red until cyrius's SysNrAgnos peer carries #109-#111 (filed in cyrius 2026-10-13)" \
-    'syscall ABI \(kernel/doc/cyrius agree\)|syscall\(s\) the kernel implements are absent from cyrius'
+# ✅ 1.57.16 — DROPPED. The pin is cyrius 6.7.18, whose lib/syscalls_x86_64_agnos.cyr carries #109-#111: the gate reads
+# "kernel 111 · abi-doc 111 · cyrius 111" against the PINNED lib too (SIBLINGS_ROOT=/nonexistent, as CI sees it), so the
+# row has no reason to be red and any red in it is a real one.
+run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
 # ⭐ 1.57.12 — THE KTEST BOOT SELF-TESTS AND THE IN-KERNEL SUITE. scripts/ktest.sh had no row anywhere (sweep, check.sh,
 # test.sh, CI), so the KTEST self-tests the 1.57.12 rebuild made runnable again (syscall, context switch, VFS/initrd,
 # userland exec), the NVMe round-trips that must write outside the GPT and put it back, and ktest.sh's scoring of all

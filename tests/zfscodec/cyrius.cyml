@@ -6,7 +6,7 @@ license = "GPL-3.0-only"
 language = "cyrius"
 # Tracks the ROOT pin (scripts/check/toolchain-pin-check.sh compares the strings): this binary
 # compiles the kernel's own codec source, so it must be built by the compiler the kernel is.
-cyrius = "6.7.9"
+cyrius = "6.7.18"
 
 [build]
 src = "zfscodec.cyr"

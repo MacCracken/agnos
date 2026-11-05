@@ -57,8 +57,11 @@ else
     cp "$ROOT/build/agnos" "$KERNEL"
 fi
 # ⛔ REBUILD THE TEST PROGRAM EVERY RUN (the stale-artifact lesson); vendor its stdlib at the pin first.
+# ⚠ 1.57.16: this line used to `rm -f cyrius.lock` after the build (an untracked byproduct at 1.57.14). From cyrius 6.7.x
+# every tests/* dir carries a TRACKED cyrius.lock (re-locked at each pin move), so deleting it dirtied the tree whenever
+# the smoke ran in the main checkout; the resolve rewrites it byte-identically at a matching pin, so it is left alone.
 echo "Building tests/sandhi/sandhix (--agnos)..."
-( cd "$ROOT/tests/sandhi" && cyrius lib sync && rm -f build/sandhix && cyrius build --agnos sandhix.cyr build/sandhix; rc=$?; rm -f cyrius.lock; exit $rc ) \
+( cd "$ROOT/tests/sandhi" && cyrius lib sync && rm -f build/sandhix && cyrius build --agnos sandhix.cyr build/sandhix ) \
     > "$LOGS/sandhix-build.log" 2>&1 || { echo "  ERROR: sandhix build failed (see $LOGS/sandhix-build.log)"; exit 1; }
 SEED="$WORK/seed"; mkdir -p "$SEED/bin"
 cp "$ROOT/tests/sandhi/build/sandhix" "$SEED/bin/agnsh"

@@ -20,6 +20,89 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.16] — 2026-11-04 — the toolchain step: cyrius 6.7.18, kashi 1.3.0, rekha 1.1.2, klug 0.3.2
+
+The second toolchain cut of the step (1.57.15 took cyrius 6.7.9): the pin moves to **cyrius 6.7.18** and the siblings to
+their latest tags — kashi **1.3.0**, rekha **1.1.2**, klug **0.3.2**, each pinned 6.7.18 (gnoboot 0.9.0 and agnoshi 2.2.0,
+which agnos does not pin, are on it too). No kernel source change but the version strings. No syscall minted (the next
+free is **#112**). The `syscall ABI` gate is **GREEN against the pinned lib** for the first time since 1.57.13. **Built,
+gated, NOT burned.**
+
+### Changed — the toolchain: cyrius 6.7.9 → 6.7.18, kashi 1.3.0, rekha 1.1.2, klug 0.3.2
+
+- **All 25 manifests pin `cyrius = "6.7.18"`** (`toolchain-pin-check.sh`: `OK — 25 manifests, all pin 6.7.18`); the
+  roadmap's `Built with cyrius` trailer reads 6.7.18 (`version-bump.sh`).
+- **Siblings, their latest tags:** `KASHI_REF` 1.2.0 → **1.3.0**, `REKHA_REF` 1.1.0 → **1.1.2** in `build.sh` /
+  `test.sh` / `bench.sh`; klug **0.3.2** (state.md only). rekha's `fonts/face_data.cyr` is byte-identical (0.9.0 through
+  1.1.2). kashi 1.3.0 (its P(-1) hardening audit) changes `src/font_data.cyr` by comments and ONE bound:
+  `kashi_cp437_from_unicode` clamps its binary search to the 128-slot index (kashi audit C1) — **+32 B**, no glyph byte
+  moved, and agnos does not call that fn (it calls `kashi_font_init`, `kashi_glyph_ptr`, `kashi_glyph_row`). kashi's HEAD
+  is one docs-only commit past 1.3.0. Every build below used `git archive <tag>` exports.
+- **Vendored stdlib: `tests/sandhi` declares two new leaves.** bayan 1.11.1 (the fold, in cyrius 6.7.18) includes
+  `lib/math.cyr` and the `lib/unicode/` family, so `cyrius deps` resolved them and `lib sync` did not vendor them:
+  `"math"` and `"unicode"` are declared (a family directory is ONE leaf, named by the family — the cyrius guide). Per
+  `tests/<dir>` (24), `lib/` emptied before each command: `lib sync` ⊇ `cyrius deps` plus every source-level
+  `include "lib/…"` — except, by design, `tests/sandhi`'s `args_macos.cyr` (below); sync also copies sandhi's
+  `hashmap_fast.cyr` peer as before — and, after the build's own resolve, **480/480** vendored files (472 + the 7 unicode
+  files + math) `cmp`-equal `~/.cyrius/versions/6.7.18/lib/`. All 24 `cyrius.lock` files re-locked to 6.7.18.
+- **The 6.7.10 – 6.7.18 migration notes** (cyrius `docs/development/ecosystem-migration.md`, ~6,700 lines, read in
+  full against `kernel/`, `tests/` and the prepended kashi / rekha data): the changes that reach this tree are FE-15 /
+  FE-16 (§ Measured). The asm-encoding fixes — 6.7.15 IT-6 (`lgdt` / `lidt` / `invlpg` / `mov crN` / `ltr` now encode
+  the register named; before, always rax / ax), 6.7.14 IN-13 (`out dx, ax|eax` were the byte write `EE`), 6.7.15 IT-7
+  (aarch64 `dsb` / `wfe`) — leave every kernel site's bytes as they were: the ~26 mnemonic sites name `[rax]` / `cr3,
+  rax`, `ltr` / CR0 / CR4 and port I/O are raw bytes, and aarch64 uses raw words. Of the new refusals (enum / struct
+  separators, a statement that is only a value builtin such as `load32(reg);`, unknown asm mnemonics, top-level
+  `return`, …) none occurs. The three kernel globals declared twice (`MDO_OP_SUPPORTED`, `iommu_qi_forbid`,
+  `hid_cc_inject_left`) are `#ifdef` alternates; `build.sh` already refuses the one pair that could both be live
+  (`HID_CC_INJECT` + `HID_CC_INJECT_HALT`). cyrfmt's formatting is unchanged (`fmt-check` green). cyrius 6.7.16 W0-1
+  retired cyrius's own agnos ABI parity gates ("agnos's CI's job") — `check.sh`'s `syscall ABI` gate is that job.
+  The agnos peer's 6.7.11 – 6.7.12 behaviour (a negative fd is no longer socket slot 7; `sock_*` refuse a non-socket fd;
+  socket / TLS writes probe `#109` with a zero-length call and pass a per-call deadline) reaches the ring-3 tests only.
+- **`tests/sandhi` no longer declares `args_macos`.** A declared module is auto-prepended to the build, so since 1.57.14
+  the macOS peer compiled into this `--agnos` program and replaced `args_agnos`'s `args_init` / `argc` / `argv` ("duplicate
+  fn … last definition wins", 3 warnings — at 6.7.9 too; sandhix calls none of them, so the smoke passed). `io.cyr`
+  includes it only under `#ifdef CYRIUS_TARGET_MACOS`, and the build's own resolve vendors it for that textual include —
+  the one closure file `lib sync` alone does not copy. Its build is warning-free; its lock is what the smoke's `lib sync`
+  + `build` write (75 rows, stable across reruns).
+- **`sandhi-async-smoke.sh` no longer deletes `tests/sandhi/cyrius.lock`** after building (an untracked byproduct at
+  1.57.14): from 6.7.x every `tests/*` lock is tracked, so the deletion dirtied the tree whenever the smoke ran in the
+  main checkout.
+- **Sweep row 1's KNOWN RED mark is dropped.** cyrius 6.7.18's `lib/syscalls_x86_64_agnos.cyr` carries `#109`–`#111`
+  (since 6.7.11), so the gate reads **"kernel 111 · abi-doc 111 · cyrius 111"** against the PINNED lib too
+  (`SIBLINGS_ROOT=/nonexistent`, as CI sees it), not only against a newer sibling `../cyrius`.
+
+### Measured — the 2x2 (the 1.57.15 tree × cyrius 6.7.9 / 6.7.18, old / new sibling tags)
+
+- **1.57.15 tree, cyrius 6.7.9, kashi 1.2.0 / rekha 1.1.0: 2,680,280 B** — byte for byte the 1.57.15 image. The same
+  tree on **6.7.18: 2,664,312 B (−15,968)** — `.text` 1,752,344 → **1,736,384 (−15,960)**, `.bss` −8 (alignment),
+  `.rodata` byte-identical. With kashi 1.3.0 / rekha 1.1.2: **2,664,344 B (+32**, the clamp). The 1.57.16 tree: 3 bytes
+  differ (the version digit). Bisected over the installed compilers: 6.7.10 – 6.7.13 build the 6.7.9 image; the whole
+  −15,968 B arrives with **6.7.14**.
+- **The −15,960 B of `.text`, decoded** (`objdump`, operands normalised, sites named through `CYRIUS_SYMS`): 3,227
+  instructions removed, 4 bytes of zero padding added at the end, nothing else changed.
+  - **3,159 (1,053 × `xor eax,eax; movabs rcx,&G; mov [rcx],rax`, 15 B each = 15,795 B)** are one block: the
+    declaration-zone `= 0` initializer stores a `kernel;` build emits AFTER the top-level program, between its last
+    statement (`arch_halt()`: `cli; hlt; jmp $`) and the exit `syscall` — never executed. cyrius 6.7.14 **FE-15** emits no
+    startup store for a declaration-zone global whose initializer folds to a constant; all 1,053 targets are in `.bss`,
+    which this image carries as file bytes (zero). The data is unchanged: the same 1,376 nonzero `.bss` qwords in the
+    same order, one qword lower (the section starts 8 B earlier); no new constant was baked.
+  - **68 in 12 fns** (`pt_init`, `ext2_jbd2_commit_tx` −30 B; `pdpt_guard_selftest` −20; `apic_init`, `smp_start_aps`,
+    `kstack_guard_init`, `user_test_proc` and five more `ext2_jbd2_*` −10 each) are constant expressions now folded to an
+    immediate (6.7.14 FE-16) — the same values.
+- The unreachable-fn note reads 210 (165,295 B) and now offers `CYRIUS_DCE=1` "to eliminate" (6.7.11: compaction of a
+  `kernel;` image works again). Not adopted here — measured only: such a build is **2,499,064 B (−165,280)**, and
+  `build.sh`'s placeholder gate REFUSES it (1 unresolved-call placeholder, in `ramdisk_register_block_dev` — a dead fn,
+  like its callee `blk_register_ramdisk`; DCE kept the body and retargeted the call). Recorded in the roadmap.
+- **Headroom under gate 34's `0x400000`:** plain **416,200 B** (400,264 at 1.57.15). All 160 `build.sh` flag builds
+  (150 single flags, 6 built with their prerequisite, 4 combos): 0 failures, 0 refusals, 0 compiler warnings. The binding
+  `ZFS_SELFTEST ZFS_WRITE_SELFTEST ZFS_WRITE_OPS` **275,192 B** (258,920), still the tightest.
+- **aarch64:** 640,200 B (642,216 at 1.57.15), 0 unresolved-call placeholders.
+
+### Closeout
+
+- S16-PENDING
+- **Dead-code audit: waived** — the operator's standing rule *grow before refactor* (2026-10-11) stands.
+
 ## [1.57.15] — 2026-11-04 — the toolchain step: cyrius 6.7.9, kashi 1.2.0, rekha 1.1.0, klug 0.3.0
 
 A toolchain-only cut in the repair minor (operator ruling 2026-09-21: 1.57.x = arising-issue repairs): the pin moves
@@ -91,7 +174,15 @@ NOT burned.**
 
 ### Closeout
 
-- SWEEP-PENDING
+- **The full sweep, on cyrius 6.7.9 — STOPPED by the operator at ~37 min (2026-11-04: "you can stop the sweep of
+  1.57.15, as its out the door"), so it is a partial record:** `sweep.sh` (`SWEEP_JOBS=4`) had **71 of 74 rows PASS,
+  0 red**; it was interrupted (rc 143) inside row 8 (the ZFS write row, ~85 min alone), and the two exclusive rows (`tsc`,
+  `kvm-net-boot`) never started. **Not covered at 1.57.15: the ZFS write lanes, the TSC calibration row, the KVM
+  net-boot row.** Row 1 `baseline check.sh`: `check.sh` **40/40** — the `syscall ABI` gate green because it read the
+  sibling `../cyrius` (6.7.18, which carries #109–#111), not the pinned 6.7.9 lib; the row's KNOWN RED mark therefore
+  went unused. Firmware VOIDs (`gnoboot: fail @ EBS`, the kernel never ran) were relaunched inside 10 rows, each of which
+  then passed. Before the sweep: the plain build, aarch64 (642,216 B, 0 placeholders), all 160 flag builds, and
+  `agnsh-smoke` PASS on the plain 6.7.9 image. 1.57.16's full sweep (cyrius 6.7.18) is the next full record.
 - **Dead-code audit: waived** — the operator's standing rule *grow before refactor* (2026-10-11) stands.
 
 ## [1.57.14] — 2026-10-13 — repairs: cyrius 6.6.20, ring-3 fault deaths reap out of the handler, one sibling and socket rule for every smoke
