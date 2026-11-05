@@ -44,7 +44,9 @@
 #            full      agnosfull the near-full pool (half of it is OpenZFS's slop): the commits' metadata goes into the
 #                                slop, as OpenZFS's syncing context does (design § k.17), and the list holds the pool
 #                                at ONE resident bitmap slot, so every commit loads, evicts and reloads metaslabs
-#                                mid-txg (design § k.22: the no-pin rule on a real pool)
+#                                mid-txg (design § k.22: the no-pin rule on a real pool); after B5's fill to the slop a
+#                                GIVE-BACK of two records (k.137) makes the room B7's rename is admitted with the list's,
+#                                not the fixture build's
 #            wr@u0     agnoswr   the wr image as an UPGRADED pool OpenZFS last ran at its slop with its logs kept:
 #                                zfs-damage.py pre-defer (log T0 frees and re-allocates features_for_write's block, so
 #                                its units are allocated AND deferred — the single-log form of what an export with
@@ -188,8 +190,10 @@ rc=0; lanes=0; voids=0; rwlanes=""
 # scripts/smoke/lib/zfs-expect.py ops: every op that SUCCEEDS; the refused ones (agnostank's zstd partial overwrite,
 # agnosfull's last write) change nothing. (B7) gang/gang.bin's truncation — to 1 MiB, its 8 freed GANG L0s deferred to
 # free_bpobj — lands now (refused until B7). agnosfull's fill is a SHORT write at the slop: its
-# line is added from the kernel's own `-> <bytes>` (b5_fill). b5_nops: every op the list runs on the pool, refused ones
-# included (agnos9 / agnostank / agnoswr / agnosfull; every other pool runs none).
+# line is added from the kernel's own `-> <bytes>` (b5_fill); (1.57.17, design k.137) so is its GIVE-BACK, the truncation
+# of two records off fill-5.bin's end that makes B7's rename room — from the kernel's own `trunc begin ... len=<n>`.
+# b5_nops: every op the list runs on the pool, refused ones included (agnos9 / agnostank / agnoswr / agnosfull; every
+# other pool runs none).
 b5_ops() {
     case "$1" in
     agnos9) cat <<'OPS'
@@ -224,7 +228,7 @@ OPS
     ;;
     esac
 }
-b5_nops() { case "$1" in agnos9) echo 5 ;; agnostank) echo 11 ;; agnoswr) echo 7 ;; agnosfull) echo 2 ;; *) echo 0 ;; esac; }
+b5_nops() { case "$1" in agnos9) echo 5 ;; agnostank) echo 11 ;; agnoswr) echo 7 ;; agnosfull) echo 3 ;; *) echo 0 ;; esac; }
 # B6 (design § h B6): the op list's CREATE / MKDIR / SYMLINK ops per fixture pool (core/zfs_write.cyr zfs_wt_b6 — the same
 # list), run BEFORE the file-data ops (b5_ops), as zfs-expect.py ops: every op that SUCCEEDS, the writes into the new
 # files included (B6 review: ashift9's b6/l144, a 144-byte target — the 320-byte bonus exactly full); the refused ones
@@ -284,7 +288,8 @@ b6_nops() { case "$1" in agnos9) echo 22 ;; agnoswr) echo 14 ;; agnostank) echo 
 b6_nw() { case "$1" in agnos9|agnoswr) echo 2 ;; agnostank|agnosfull|agnoslogs) echo 1 ;; *) echo 0 ;; esac; }
 # B7 (design § h B7): the op list's UNLINK / RMDIR / RENAME / LINK ops per fixture pool (core/zfs_write.cyr zfs_wt_b7pre —
 # on agnoswr / agnostank / agnoslogs right after the B6 ops, before B5's — and zfs_wt_b7, on agnos9 / agnostank /
-# agnosfull after B5's — agnosfull's at the slop B5's fill leaves: the rename there is REFUSED; the same lists) as
+# agnosfull after B5's — agnosfull's at the slop B5's fill leaves: the unlink and rmdir netfree, the rename admitted
+# with the room B5's give-back returned (k.137: --fit holds it to the space record); the same lists) as
 # zfs-expect.py ops: every op that SUCCEEDS, the creates / writes among them
 # included (the D11 fd tests' creates into a freed number, agnostank's off/lazy.bin that the unlink puts on the
 # DELETE_QUEUE). b7_nops: the unlink / rmdir / rename / link ops the list runs, refused ones included; b7_nc / b7_nw: its
@@ -522,6 +527,10 @@ want() {
 #   --room "OP PATH B COPIES [MSMAX]"   (B5 review) the first SHORT OP (write | burst) to PATH stopped where the space
 #                 record says it must (zfs-room-check.py; B = one block's asize; MSMAX (B9): the op list's allocation cap,
 #                 zfs_wt_msmax — the first MSMAX metaslabs with a space map are the room)
+#   --fit "OP PATH B COPIES GOP GPATH [MSMAX]"   (1.57.17, design k.137) the first OP on PATH (its `begin txg=T` line;
+#                 a namespace op near the slop) was admitted with its charge (B x COPIES) left, and with that room only
+#                 because the give-back GOP on GPATH (its txg U) had left the deferral window — every `zfs-wtest: room
+#                 after txg K` line the writer printed held to the space record (zfs-room-check.py --fit)
 #   --fbpo N      (B7) the txgs whose plan line has fbpo > 0 — kills deferred to free_bpobj (gang / dedup / clone blocks,
 #                 design § e.2) — are exactly N (default 0), and $FREE on the image holds their Σ (uacct --freeing)
 #   --hist E      (B7, design k.68) the txgs whose plan line has hist > 0 — space map histograms LOWERED because the txg
@@ -531,7 +540,7 @@ lane() {
     _name="$1"; _pool="$2"; _kind="$3"; shift 3
     _why=""; [ "$_kind" = refused ] && { _why="$1"; shift; }
     _img="$_name"; _extra=0; _dev=nvme; _tear=0; _same=""; _forge=""; _nc=0; _nn=3; _wants=(); _touch=""
-    _l1='[0-9]+'; _p1=0; _q1=0; _tmo="${QEMU_TIMEOUT:-300}"; _room=""; _fbt=0; _fbs=0; _hst='[0-9]+'; _dlt=0; _mtt=0
+    _l1='[0-9]+'; _p1=0; _q1=0; _tmo="${QEMU_TIMEOUT:-300}"; _room=""; _fit=""; _fbt=0; _fbs=0; _hst='[0-9]+'; _dlt=0; _mtt=0
     _cut=""; _cfin=0; _clab=0
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -550,6 +559,7 @@ lane() {
             --want) _wants+=("$2"); shift 2 ;;
             --timeout) _tmo="$2"; shift 2 ;;
             --room) _room="$2"; shift 2 ;;
+            --fit) _fit="$2"; shift 2 ;;
             --fbpo) _fbt="$2"; shift 2 ;;
             --hist) _hst="$2"; shift 2 ;;
             --dl) _dlt="$2"; shift 2 ;;
@@ -641,6 +651,9 @@ lane() {
         { b6_ops "$_pool"; b7_pre "$_pool"; b11_pre "$_pool"; b9_ops "$_pool"; b5_ops "$_pool"; b7_ops "$_pool"; b8_ops "$_pool"; b10_ops "$_pool"; b11_ops "$_pool"; } > "$_opsf"
         _fr=$(slog "$_log" | sed -n -E 's/^(\[[^]]*\] )?zfs-wtest: write \/agnosfull\/fill-5\.bin -> ([0-9]+) txgs=[0-9]+$/\2/p' | head -1)
         [ "$_pool" = agnosfull ] && [ -n "$_fr" ] && [ "$_fr" -gt 0 ] && echo "write /agnosfull/fill-5.bin 917504 $_fr b5/fill" >> "$_opsf"
+        # (1.57.17, k.137) the give-back after it: fill-5.bin truncated to the length the kernel's own `trunc begin` names
+        _gbl=$(slog "$_log" | sed -n -E 's/^(\[[^]]*\] )?zfs-wtest: trunc begin txg=[0-9]+ \/agnosfull\/fill-5\.bin len=([0-9]+)$/\2/p' | head -1)
+        [ "$_pool" = agnosfull ] && [ -n "$_gbl" ] && echo "truncate /agnosfull/fill-5.bin $_gbl" >> "$_opsf"
         # (B5 review) wr's exhausting burst: the bytes that landed before ENOSPC, from the kernel's `-> <bytes>` too — the
         # host's room check (zfs-room-check.py, below) then holds where it stopped to the space record
         _fx=$(slog "$_log" | sed -n -E 's/^(\[[^]]*\] )?zfs-wtest: burst \/agnoswr\/rs4k\/r64k\.bin -> ([0-9]+) txgs=[0-9]+$/\2/p' | head -1)
@@ -1023,6 +1036,23 @@ for b in bad:
                 elif [ "$_rm_rc" != 0 ]; then _ok=0; fi
             fi
         fi
+        # (1.57.17, design k.137) a namespace op admitted near the slop (--fit "<op> <path> <B> <copies> <gop> <gpath>"):
+        # the room it was admitted with is the writer's own figure (its `room after txg` line) == the space record, at
+        # least its charge, and there only because the give-back's frees had left the deferral window
+        if [ -n "$_fit" ]; then
+            set -- $_fit
+            _ft=$(slog "$_log" | awk -v k="$1" -v p="$2" '{ sub(/^\[[^]]*\] /, "") } $1 == "zfs-wtest:" && $2 == k && $3 == "begin" && $5 == p && !d { split($4, a, "="); print a[2]; d = 1 }')
+            _fu=$(slog "$_log" | awk -v k="$5" -v p="$6" '{ sub(/^\[[^]]*\] /, "") } $1 == "zfs-wtest:" && $2 == k && $3 == "begin" && $5 == p && !d { split($4, a, "="); print a[2]; d = 1 }')
+            if [ -z "$_ft" ] || [ -z "$_fu" ]; then echo "    FAIL: fit — no $1 to $2 or no $5 of $6 in the log"; _ok=0
+            else
+                python3 -I "$ROOT/scripts/smoke/lib/zfs-room-check.py" --fit "$_ref" "$_fin" "$_ft" "$3" "$4" "$_fu" ${7:+"$7"} --log "$_log" > "$LOGS/$_name.fit" 2>&1
+                _ft_rc=$?
+                grep -E '^room:' "$LOGS/$_name.fit" | head -5 | sed 's/^/    /' | cut -c1-260
+                if [ "$_ft_rc" != 0 ] && [ "${ZWS_SPACE:-}" = advisory ]; then
+                    echo "    fit: red but ADVISORY (ZWS_SPACE=advisory, a negative proof)"
+                elif [ "$_ft_rc" != 0 ]; then _ok=0; fi
+            fi
+        fi
     fi
     if [ -n "$_same" ]; then
         if [ ! -f "$VDIR/$_same.img" ]; then echo "    FAIL: no $_same result to compare with (that lane did not pass)"; _ok=0
@@ -1232,16 +1262,25 @@ lane main          agnostank rw      --cows 2 --touched "/agnostank/sha256/rand-
                                      --want "zfs-wtest: txg [0-9]+ hygiene: flushed=[1-9][0-9]* .* fonly=[1-9][0-9]* .*" \
                                      --want "zfs-wtest: txg [0-9]+ hygiene: flushed=[1-9][0-9]* .* self=[1-9][0-9]* .*" \
                                      --want "zfs-wtest: rename /agnostank/coff/kid/f01 object [0-9]+: moved"
-lane full          agnosfull rw      --cows 1 --nulls 8 --touched "/agnosfull/fill-0.bin" --room "write /agnosfull/fill-5.bin 131072 1" \
-                                     --want "zfs-wtest: residency capped at 1 bitmap slot; 8 null txgs" \
-                                     --want "zfs-wtest: write /agnosfull/fill-5.bin -> [0-9]+ txgs=[0-9]+" \
-                                     --want "zfs-wtest: write ok refused \(no space: the pool is at its slop\)" \
-                                     --want "zfs-wtest: unlink /agnosfull/b6/a.txt object [0-9]+: freed" \
-                                     --want "zfs-wtest: rmdir /agnosfull/b6e object [0-9]+: freed" \
-                                     --want "zfs-wtest: rename /agnosfull/dir/s1.txt object [0-9]+: moved"
+# (1.57.17, design k.137) full / full@pre: the fill leaves the room anywhere in [-(one txg's metadata), one block) — the
+# fixture BUILD decides where (OpenZFS's metadata allocation and the fill files' split move between builds: the
+# leftover measured -24,576 / +69,632 / +118,784 B on three), which made the rename after it pass or fail with the
+# fixture (the 1.57.16 sweep: -8,192 B at the rename, refused). So the list gives back
+# two records (a netfree truncation at the slop) and runs the unlink and rmdir — whose publish releases the give-back's
+# frees — before the rename; --fit holds the rename's admission to the space record (>= its 4 KiB charge, and only
+# because of the release) and every `room after txg` line to the writer's own figures
+FULLB=(--want "zfs-wtest: residency capped at 1 bitmap slot; 8 null txgs"
+       --want "zfs-wtest: write /agnosfull/fill-5.bin -> [0-9]+ txgs=[0-9]+"
+       --want "zfs-wtest: write ok refused \(no space: the pool is at its slop\)"
+       --want "zfs-wtest: trunc /agnosfull/fill-5.bin -> 0 txgs=1"
+       --want "zfs-wtest: unlink /agnosfull/b6/a.txt object [0-9]+: freed"
+       --want "zfs-wtest: rmdir /agnosfull/b6e object [0-9]+: freed"
+       --want "zfs-wtest: rename /agnosfull/dir/s1.txt object [0-9]+: moved"
+       --room "write /agnosfull/fill-5.bin 131072 1"
+       --fit "rename /agnosfull/dir/s1.txt 4096 1 trunc /agnosfull/fill-5.bin")
+lane full          agnosfull rw      --cows 1 --nulls 8 --touched "/agnosfull/fill-0.bin" "${FULLB[@]}"
 lane full@pre      agnosfull rw      --cows 1 --img full --forge pre-defer --nulls 8 --pre1 '[1-9][0-9]*' --reapply1 '[1-9][0-9]*' \
-                                     --room "write /agnosfull/fill-5.bin 131072 1" \
-                                     --want "zfs-wtest: residency capped at 1 bitmap slot; 8 null txgs"
+                                     "${FULLB[@]}"
 lane logs          agnoslogs rw
 # B8 (design § h B8, fixture RECIPE 7): the FAT-ZAP pool — b8/'s microzap upgraded by a 60-byte name, its leaf split
 # down to the pointer table's prefix, the embedded table moved out and DOUBLED (at once, then one block per op: a

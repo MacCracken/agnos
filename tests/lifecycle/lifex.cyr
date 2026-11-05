@@ -824,15 +824,75 @@ fn ph_flockcycle() {
     if (ar != 265) { return lx_bad("LIFE-FLOCK-CYCLE", "status_a", ar); }
     return lx_v(br == 0, "LIFE-FLOCK-CYCLE", "status_b", br);
 }
+# ═══ 1.57.17 — THE SILENT LOCAL PEER for NETBLOCKED's blocked connects. A closed local port stopped being silent in
+# 1.57.17: agnos answers a SYN to a port nobody listens on with RST|ACK (RFC 9293 § 3.10.7.1; issue
+# 2026-10-31-a-segment-for-no-connection-gets-no-rst), so the dial child was refused before it could block. The one
+# SILENT refusal left is a passive open refused for CAPACITY, so the driver OWNS THE WHOLE TCP TABLE: two listeners +
+# two loopback pairs (each a client end here and an unaccepted ESTABLISHED child) = 6 slots, leaving exactly
+# LX_TCP_RESERVE + 1 = 2 free. Each dial child's SYN_SENT takes one; its SYN (and every retransmit) then finds 1 free
+# slot <= TCP_PASSIVE_RESERVE and is dropped — the child blocks in #47 until it is killed, and its death returns the
+# slot for the next child. ⛔ ASSERTED, not assumed: the free slots are COUNTED (LISTEN claims on port+2.. until one is
+# refused — a LISTEN claim is not subject to the reserve — then released), and a changed table size or reserve, or a
+# slot an earlier phase leaked, fails LIFE-KILL-BLOCKED-CONNECT-BAD fullnet by name.
+var LX_TCP_SLOTS = 8;     # kernel/core/net_tcp.cyr: the connection table (tcp_pool_init's 8, tcp_alloc_conn_slot's cap)
+var LX_TCP_RESERVE = 1;   # kernel/core/net_tcp.cyr TCP_PASSIVE_RESERVE: a passive open never takes the last free slot
+var lx_fn[8];             # the fixture's ids: 2 listeners, then the pairs' client ends
+var lx_fnp[16];           # the free-slot probe's listener ids
+var LX_FN_N = 0;
+var LX_FN_USED = 0;       # the slots the fixture occupies (its ids + the pairs' unaccepted children)
+fn lx_fn_put(id) { store64(&lx_fn + LX_FN_N * 8, id); LX_FN_N = LX_FN_N + 1; return 0; }
+fn lx_fullnet_down() {
+    var i = 0;
+    while (i < LX_FN_N) { syscall(50, load64(&lx_fn + i * 8), 0, 0, 0); i = i + 1; }   # listeners first (reap RSTs)
+    LX_FN_N = 0;
+    return 0;
+}
+# The free-slot count it measured (>= 0) once the fixture is up; -1 a listener refused, -2/-3 pair 0/1 refused, -4/-5
+# pair 0/1 took over 2 s (it met the reserve: the table was not ours).
+fn lx_fullnet_up(ip, port) {
+    LX_FN_N = 0;
+    LX_FN_USED = 0;
+    var l1 = syscall(56, port, 0, 0, 0);
+    if (l1 >= 0) { lx_fn_put(l1); }
+    var l2 = syscall(56, port + 1, 0, 0, 0);
+    if (l2 >= 0) { lx_fn_put(l2); }
+    if (l1 < 0 || l2 < 0) { return 0 - 1; }
+    var k = 0;
+    while (k < 2) {
+        var t0 = l_us();
+        var c = syscall(47, ip, port, 0, 0);
+        var dt = l_us() - t0;
+        if (c >= 0) { lx_fn_put(c); }
+        if (c < 0) { return 0 - 2 - k; }
+        if (dt > 2000000) { return 0 - 4 - k; }
+        k = k + 1;
+    }
+    var nfree = 0;
+    while (nfree < 16) {
+        var q = syscall(56, port + 2 + nfree, 0, 0, 0);
+        if (q < 0) { break; }
+        store64(&lx_fnp + nfree * 8, q);
+        nfree = nfree + 1;
+    }
+    var i = 0;
+    while (i < nfree) { syscall(50, load64(&lx_fnp + i * 8), 0, 0, 0); i = i + 1; }
+    LX_FN_USED = LX_FN_N + k;     # the ids held here + one unaccepted child per pair
+    lo_out("LIFE-FULLNET"); lo_kv("used", LX_FN_USED); lo_kv("free", nfree); lo_kv("slots", LX_TCP_SLOTS); lo_kv("reserve", LX_TCP_RESERVE); lo_nl();
+    return nfree;
+}
 fn ph_netblocked() {
     lx_phase("NETBLOCKED");
     var i = 0;
     var bad = 0;
     var cbad = 0;
-    while (i < 8) {
+    # CONNECT: a dial to the full-table fixture's listener (127.0.0.1:7100) blocks; it is killed while blocked.
+    var fnf = lx_fullnet_up(2130706433, 7100);
+    var fnok = 0;
+    if (fnf == LX_TCP_RESERVE + 1 && LX_FN_USED + fnf == LX_TCP_SLOTS) { fnok = 1; }
+    while (fnok == 1 && i < 8) {
         var line = &lx_rb;
         var o = l_cat(line, 0, "dial 2130706433 ");
-        o = l_catnum(line, o, 7100 + i);
+        o = l_catnum(line, o, 7100);
         store8(line + o, 0);
         var c = l_spawn(line);
         if (lx_wait_state(c, 6, 3000) == 0) { cbad = cbad + 1; }
@@ -841,15 +901,17 @@ fn ph_netblocked() {
         if (l_us() - t0 > 2000000) { bad = bad + 1; }
         i = i + 1;
     }
+    lx_fullnet_down();
     var lid = syscall(56, 7190, 0, 0, 0);
     var cid = 0 - 1;
     if (lid >= 0) { cid = syscall(47, 2130706433, 7190, 0, 0); }
     if (cid >= 0) { syscall(50, cid, 0, 0, 0); }
     if (lid >= 0) { syscall(50, lid, 0, 0, 0); }
-    if (cbad != 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "never_blocked", cbad); }
+    if (fnok == 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "fullnet", fnf); }
+    else { if (cbad != 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "never_blocked", cbad); }
     else { if (bad != 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "status", bad); }
     else { if (lid < 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "listen_after", lid); }
-    else { lx_v(cid >= 0, "LIFE-KILL-BLOCKED-CONNECT", "connect_after", cid); } } }
+    else { lx_v(cid >= 0, "LIFE-KILL-BLOCKED-CONNECT", "connect_after", cid); } } } }
     # SEND: a peer that accepts and never reads; the sender blocks in #48.
     var sl = syscall(56, 7191, 0, 0, 0);
     var s = l_spawn2("sendblock", 2130706433, 7191);

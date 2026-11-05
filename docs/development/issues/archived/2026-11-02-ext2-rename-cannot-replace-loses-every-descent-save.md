@@ -1,6 +1,12 @@
 # 2026-11-02 — ext2 `rename#31` cannot replace an existing file, so descent never saves a player after creation
 
-**Status:** 🟡 OPEN. This is the same kernel gap as
+**Status:** ✅ RESOLVED in agnos **1.57.17** (track T1) — ext2 `rename#31` replaces an existing destination, atomically
+with respect to a crash (one dirent rewritten in place; see the 2026-10-28 file's Status for what shipped and the
+crash-cut proof). **descent's own confirmation passes:** `AGNOS_KERNEL=<1.57.17 BENCH_CONNECT_SELFTEST=1 kernel>
+SCENARIO=persist scripts/agnos-qemu-smoke.sh` (run in a scratch copy of cyrius-yeomans-descent, KVM) reported
+`[PASS] persistence round-trip — inventory survived logout on a real kernel` (3/3 scenarios); with `KEEP=1` the guest's
+`data/players/a/` held only `agnosone.cyml` (no stranded `.cyml.tmp`) and `e2fsck -fn` of the partition was clean.
+*(Was: 🟡 OPEN.)* This is the same kernel gap as
 [`2026-10-28-ext2-rename-cannot-replace-an-existing-file.md`](2026-10-28-ext2-rename-cannot-replace-an-existing-file.md)
 ("rename-replace is a follow-on bite", `kernel/core/ext2.cyr:3058-3061`). That file records hapi; this one records a
 second consumer, for which the gap means **silent loss of player data**.

@@ -298,6 +298,7 @@ fn proc_destroy_fd_table_held(pid, do_flush) {
         if (do_flush == 1) {
             if (fd >= 3) {
                 if (btag == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), pid); }
+                if (btag == VFS_EXT2_DIR)  { flock_release_inode(kpayload(base, 2), pid); }   # 1.57.17: flock#59 on a dir fd
                 if (btag == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
             }
         }
@@ -316,6 +317,9 @@ fn proc_destroy_fd_table_held(pid, do_flush) {
     # must never walk a table block that is already back on the slab free list.
     proc_fd_base_set(pid, 0);
     kfree_sized(t, 1024);
+    # 1.57.17 — the table is gone: an ext2 inode whose last name went while one of its fds held it is freed now if no
+    # other slot anywhere names it (ext2.cyr ext2_orphan_reap; a fast exit when none is pending).
+    ext2_orphan_reap();
     return 0;
 }
 
@@ -1503,8 +1507,12 @@ fn vfs_close_inner(fd_idx) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
     var base = vfs_fd_table() + fd_idx * 32;
-    # flock#59: release any advisory lock the calling proc holds on this fd's inode.
-    if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), proc_current_get()); }
+    # flock#59: release any advisory lock the calling proc holds on this fd's inode — a file's, or (1.57.17) a
+    # directory's (an AO_DIRECTORY fd).
+    var vc_ext2 = 0;
+    if (ktag(base) == VFS_EXT2_FILE) { vc_ext2 = 1; }
+    if (ktag(base) == VFS_EXT2_DIR)  { vc_ext2 = 1; }
+    if (vc_ext2 == 1) { flock_release_inode(kpayload(base, 2), proc_current_get()); }
     # 1.41.7: a FAT/exFAT write-back fd flushes its buffered content (whole-file
     # via vfs_write_on) to the backend before the slot is reclaimed.
     # 1.41.11 (audit #4): SURFACE the flush result. Previously vfs_close always
@@ -1540,5 +1548,8 @@ fn vfs_close_inner(fd_idx) {
     # via vfs_alloc finds a clean entry. ktag_clear zeroes the full
     # 32-byte slot.
     ktag_clear(base, 32);
+    # 1.57.17 — the slot is gone: an ext2 inode whose last name went while this fd held it (unlink#30, rmdir#10, or
+    # rename#31 over it) is freed now if no other slot anywhere names it (ext2.cyr ext2_orphan_reap).
+    if (vc_ext2 == 1) { ext2_orphan_reap(); }
     return rc;
 }

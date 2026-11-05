@@ -2788,6 +2788,13 @@ kprintln("shtest: end", 11);
 ext2_multichunk_selftest();
 #endif
 
+# 1.57.17 — rename-replace crash cuts (compile-gated, EXT2_RNCUT_SELFTEST=1; scripts/smoke/ext2-rename-replace-smoke.sh).
+# Runs ONE rename over an existing name chosen by the host-seeded /rncut and HALTS the box after the cut it names, or
+# after the whole op — never returns. Off in production: ext2_rncut is an empty function there.
+#ifdef EXT2_RNCUT_SELFTEST
+ext2_rncut_selftest();
+#endif
+
 # 1.40.2 — exec-from-disk self-test (compile-gated, EXEC_SELFTEST=1). Builds a
 # minimal static ELF64 (write(1,"EXEC-DISK-OK\n",13) then exit(42)) into the
 # scratch buffer, writes it to ext2 as /prog, then `run /prog` — exercising

@@ -33,7 +33,8 @@ var S_NCPU = 1;
 var S_HP = 0;
 var S_CP = 0;
 var S_WIRE = 0;         # /sw/mode "wire": N0 + N8 only
-var S_CLOSED = 18999;   # a local port nothing listens on (agnos sends no RST: the dial is silent)
+var S_FULL = 18999;     # N6's SILENT local peer: the full-table fixture's listener (s_fullnet_up; 1.57.17 — a closed
+                        # local port is no longer silent: agnos answers its SYN with RST|ACK, RFC 9293 § 3.10.7.1)
 var S_SP = 0;           # 1.57.13 mode "t": the host stall peer's port (/sw/stallport)
 
 fn s_flush() { if (S_LN > 0) { syscall(1, 1, &s_lb, S_LN, 0); } S_LN = 0; return 0; }
@@ -301,7 +302,7 @@ fn role_persist(ip, port, len) {
     if (sent == len) { return 0; }
     return 1;
 }
-# dial <ip> <port>: exit 0 iff -1 within [7 s, 12 s] (a silent port: the deadline, computed once).
+# dial <ip> <port>: exit 0 iff -1 within [7 s, 12 s] (a silent peer — N6's full-table fixture: the deadline, computed once).
 fn role_dial(ip, port) {
     var t0 = s_us();
     var r = s_connect(ip, port, 0);
@@ -536,15 +537,81 @@ fn ph_n5(port) {
     return 0;
 }
 
-# N6 — #47 blocks only the caller; the deadline is computed once (a silent local port).
+# ═══ 1.57.17 — THE SILENT LOCAL PEER (N6). A closed local port stopped being silent in 1.57.17: agnos now answers a
+# SYN to a port nobody listens on with RST|ACK (RFC 9293 § 3.10.7.1; issue
+# 2026-10-31-a-segment-for-no-connection-gets-no-rst), so a dial to one is refused at once. The one SILENT refusal
+# left is a passive open refused for CAPACITY — the peer's SYN retransmit is the backlog. So this process OWNS THE
+# WHOLE TCP TABLE: two listeners + two loopback pairs (each a client end here and an unaccepted ESTABLISHED child) = 6
+# slots, leaving exactly S_TCP_RESERVE + 1 = 2 free. The dialler's SYN_SENT takes one; its SYN (and every retransmit)
+# then finds 1 free slot <= TCP_PASSIVE_RESERVE and is dropped, so #47 blocks to its own 8 s deadline.
+# ⛔ The arithmetic is ASSERTED, not assumed: the free slots are COUNTED (LISTEN claims on port+2.. until one is
+# refused — a LISTEN claim is not subject to the reserve — then released) and must be exactly S_TCP_RESERVE + 1, with
+# used + free == S_TCP_SLOTS. A changed table size or passive reserve, or a slot some earlier phase leaked, fails
+# `SOCKW-FAIL FULLNET ...` by name instead of quietly changing what N6 measures. (A reserve of 0 would ADMIT the dial:
+# DIAL-DEADLINE then fails with exit=1.)
+var S_TCP_SLOTS = 8;      # kernel/core/net_tcp.cyr: the connection table (tcp_pool_init's 8, tcp_alloc_conn_slot's cap)
+var S_TCP_RESERVE = 1;    # kernel/core/net_tcp.cyr TCP_PASSIVE_RESERVE: a passive open never takes the last free slot
+var s_fn[8];              # the fixture's ids: 2 listeners, then the pairs' client ends
+var s_fnp[16];            # the free-slot probe's listener ids
+var S_FN_N = 0;
+fn s_fn_put(id) { store64(&s_fn + S_FN_N * 8, id); S_FN_N = S_FN_N + 1; return 0; }
+fn s_fullnet_down() {
+    var i = 0;
+    while (i < S_FN_N) { s_close(load64(&s_fn + i * 8)); i = i + 1; }    # listeners first: their reap RSTs the pairs
+    S_FN_N = 0;
+    return 0;
+}
+# 1 = the table is full but for S_TCP_RESERVE + 1 slots (the fixture is up); 0 = it could not be built as asserted.
+fn s_fullnet_up(ip, port) {
+    S_FN_N = 0;
+    var l1 = s_listen(port);
+    var l2 = s_listen(port + 1);
+    if (l1 >= 0) { s_fn_put(l1); }
+    if (l2 >= 0) { s_fn_put(l2); }
+    if (l1 < 0 || l2 < 0) { s_fail("FULLNET listen"); s_kv("l1", l1); s_kv("l2", l2); s_nl(); return 0; }
+    var pairs = 0;
+    while (pairs < 2) {
+        var t0 = s_us();
+        var c = s_connect(ip, port, 0);
+        var dt = s_us() - t0;
+        if (c >= 0) { s_fn_put(c); }
+        if (c < 0 || dt > 2000000) { s_fail("FULLNET pair"); s_kv("k", pairs); s_kv("c", c); s_kv("us", dt); s_nl(); return 0; }
+        pairs = pairs + 1;
+    }
+    var nfree = 0;
+    while (nfree < 16) {
+        var q = s_listen(port + 2 + nfree);
+        if (q < 0) { break; }
+        store64(&s_fnp + nfree * 8, q);
+        nfree = nfree + 1;
+    }
+    var i = 0;
+    while (i < nfree) { s_close(load64(&s_fnp + i * 8)); i = i + 1; }
+    var used = S_FN_N + pairs;    # the ids held here + one unaccepted child per pair
+    s_out("SOCKW-FULLNET"); s_kv("used", used); s_kv("free", nfree); s_kv("slots", S_TCP_SLOTS); s_kv("reserve", S_TCP_RESERVE); s_nl();
+    if (nfree != S_TCP_RESERVE + 1 || used + nfree != S_TCP_SLOTS) {
+        s_fail("FULLNET slots"); s_kv("free", nfree); s_kv("want", S_TCP_RESERVE + 1); s_kv("table", used + nfree); s_kv("want_table", S_TCP_SLOTS); s_nl();
+        return 0;
+    }
+    return 1;
+}
+
+# N6 — #47 blocks only the caller; the deadline is computed once (a silent local peer: the full-table fixture above).
 fn ph_n6(ip) {
-    var p = s_spawn("dial", ip, S_CLOSED, 0 - 999999);
+    if (s_fullnet_up(ip, S_FULL) == 0) {
+        s_fullnet_down();
+        s_fail("DIAL-DEADLINE-"); s_out(s_ipname(ip)); s_out(" nofixture"); s_nl();
+        s_fail("CONNECT-YIELDS-"); s_out(s_ipname(ip)); s_out(" nofixture"); s_nl();
+        return 0;
+    }
+    var p = s_spawn("dial", ip, S_FULL, 0 - 999999);
     s_sleep(200);
     var k = s_spinners(4000);
     s_sleep(100);
     var sh = s_share(k, 2000);
     s_spin_reap(k);
     var e = s_reap(p);
+    s_fullnet_down();
     if (e == 0) { s_ok("DIAL-DEADLINE-"); s_out(s_ipname(ip)); s_nl(); }
     else { s_fail("DIAL-DEADLINE-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
     if (sh >= 800) { s_ok("CONNECT-YIELDS-"); s_out(s_ipname(ip)); s_kv("share", sh); s_nl(); }

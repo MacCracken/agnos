@@ -1,0 +1,17 @@
+[package]
+name = "rnrep"
+version = "0.1.0"
+description = "agnos 1.57.17 ring-3 exerciser — ext2 rename#31 REPLACING an existing name (the write/fsync/rename-over staging pattern, an open fd keeping the replaced file, the POSIX refusal matrix, a directory over an empty directory) and flock#59 on an AO_DIRECTORY fd. Seeded as /bin/agnsh by scripts/smoke/ext2-rename-replace-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.7.18"
+
+[build]
+src = "rnrep.cyr"
+output = "build/rnrep"
+
+# AGNOS ONLY — build with `cyrius build --agnos rnrep.cyr build/rnrep`.
+[deps]
+# The FULL closure, transitives included (the tests/sock / tests/fork closure: alloc -> atomic, fnptr, poison).
+stdlib = ["syscalls", "alloc", "atomic", "fnptr", "poison"]

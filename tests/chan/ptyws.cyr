@@ -1,0 +1,564 @@
+# ptyws — agnos 1.57.17: a TERMINAL channel's window size, `#97 chan_op` ops CH_WINSZ_SET (0x06) / CH_WINSZ_GET (0x07),
+# and SIGWINCH (28) to the terminal's WATCHING HOLDERS on a resize. Issue 2026-10-30-a-terminal-channel-has-no-window-size
+# (puka / darshana / bannermanor).
+#
+# AGNOS ONLY — `cyrius build --agnos ptyws.cyr build/ptyws`. Seeded as /bin/agnsh by scripts/smoke/pty-winsize-smoke.sh
+# (the driver AND every child role: this same program spawned by spawn_path#43 as "/bin/agnsh <role> <args>"). The
+# driver plays the EMULATOR (puka): it mints a channel, sizes the far end, endows it in PTY mode (CH_ENDOW a4 = 1000)
+# and spawns the program that lives in the terminal. One `PTYW-OK <phase> ...` / `PTYW-FAIL <phase> ...` line per
+# phase, then `PTYW-DONE pass=N fail=M` and `PTYW-EXIT 0` (it ALWAYS exits 0: a non-zero exit drops kybernet into the
+# emergency shell).
+#   caps          CH_CAPS advertises bits 6 and 7.
+#   not-terminal  GET is -1 on fd -1 / 32, the console fd 1, a pipe end, a closed fd, and both ends of a fresh channel
+#                 the caller owns; SET refuses a pipe (-5), cols 0 / rows 0 (-6); SET on the caller's end BEFORE the
+#                 endowment is 0 (it sizes the far end) and the far end still reads -1 (sized, not a terminal); a GET
+#                 selector other than 0 / 1 is -6.
+#   display       that far end endowed in DISPLAY mode: the child's GET (grid and pixels) is -1 although a size was
+#                 set on it; the child's SET is -5 (its peer is the driver's end, not a terminal); after the
+#                 endowment the driver's SET is -5 too (its peer is the child's display end).
+#   pty-get       a PTY endowment: the child's GET before any SET is -1; the driver SETs 100x30 (800x480 px); the
+#                 child reads (100<<16)|30 on fd 0, 1 and 2 and (800<<16)|480 with selector 1; its own SET on fd 0 is
+#                 -5 (the terminal does not size itself); a GRANDCHILD (a PTY descendant) reads the same size and its
+#                 SET is -5; the size is unchanged after both refusals; the driver's GET on its own (inert) copy of
+#                 the endowed end is -1; once the child is dead the driver's SET is -9 (PEERGONE).
+#   winch         a PTY endowment sized 100x30 BEFORE the spawn (the child is born sized). Holders: the owner child
+#                 (watches bit 28) and its grandchild (holds the terminal, a bit-10 signalfd only — not a watcher). A
+#                 sibling the driver spawns watches bit 28 but holds only INERT inherited copies of both ends. Five
+#                 rounds — same 100x30 · 120x40 · same 120x40 · pixels only (960x640) · back to 100x30 — expect the
+#                 watching holder to see 0,1,0,1,1 SIGWINCH records, the non-watching holder none (a FRESH bit-28
+#                 signalfd opened after each post reads nothing, so bit 28 was never posted to it) and the
+#                 non-holder watcher none. Each role writes one verdict byte (role << 6 | bits) to a result pipe.
+#   winch-epoll-* (the 1.57.17 merge with the blocking epoll_wait#21) a watching holder (the terminal's owner) watches
+#                 its bit-28 signalfd through epoll_ctl#20 op 3 (EPOLLIN) and BLOCKS in a timed epoll_wait (EPW_TIMED,
+#                 bit 32 of max). The driver waits until #99 shows it BLOCKED (state 6), then SETs: an UNCHANGED size
+#                 must leave a 300 ms wait asleep to its deadline (0, >= 300 ms, no record); a CHANGED size must end a
+#                 5 s wait at once (1 ready, the signalfd's EPOLLIN record, < 1 s; one sig-28 record on the signalfd) —
+#                 the SIGWINCH post has to WAKE an epoll_wait sleeper, not only set its bit.
+#   recycled      every channel closed, a fresh mint's PTY endowment reads -1 before any SET (the size died with
+#                 the endpoint).
+
+var W_SET = 6;
+var W_GET = 7;
+var E_BADFD = 5;
+var E_ARG = 6;
+var E_PEERGONE = 9;
+var PW_STDIO = 1000;                 # CH_ENDOW a4 sentinel: PTY mode
+var pw_fds[2];
+var pw_fds2[2];
+var pw_p[10];                        # winch: five pipes (r, w) x 5
+var pw_rec[8];                       # one 64-byte channel record
+var pw_msg[2];
+var pw_line[32];                     # 256 B spawn line
+var PW_LN = 0;
+var pw_pass = 0;
+var pw_fail = 0;
+var pw_ob[64];
+var PW_ON = 0;
+var pw_words[5];                     # winch: the size word of each round
+var EPW_TIMED = 0x100000000;         # epoll_wait#21: bit 32 of max = a4 is the timeout (ms)
+var pw_evs[8];                       # winch-epoll: 4 event records {u32 mask; u64 data} at a 12 B stride
+var pw_pl[128];                      # 1024 B: proclist#99 (16 x 64-byte records)
+# winch: the watcher's expected SIGWINCH record count in round k (same, change, same, pixels only, change). A FUNCTION,
+# not a table the driver fills: the child roles are separate processes with their own (zeroed) copy of every global.
+fn pw_want(k) { if (k == 1) { return 1; } if (k == 3) { return 1; } if (k == 4) { return 1; } return 0; }
+
+fn o_flush() { if (PW_ON > 0) { syscall(1, 1, &pw_ob, PW_ON, 0); } PW_ON = 0; return 0; }
+fn o_putc(ch) { store8(&pw_ob + PW_ON, ch); PW_ON = PW_ON + 1; if (ch == 10) { o_flush(); } if (PW_ON >= 500) { o_flush(); } return 0; }
+fn o_out(s) { var i = 0; while (load8(s + i) != 0) { o_putc(load8(s + i)); i = i + 1; } return 0; }
+fn o_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { o_putc(45); n = 0 - n; }
+    if (n == 0) { o_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; o_putc(load8(&b + i)); }
+    return 0;
+}
+fn o_kv(k, v) { o_out(" "); o_out(k); o_out("="); o_num(v); return 0; }
+fn ok(ph) { o_out("PTYW-OK "); o_out(ph); pw_pass = pw_pass + 1; return 0; }
+fn bad(ph) { o_out("PTYW-FAIL "); o_out(ph); pw_fail = pw_fail + 1; return 0; }
+fn verdict(c, ph) { if (c == 1) { ok(ph); } else { bad(ph); } return 0; }
+
+fn eq(a, b) {
+    var i = 0;
+    while (1 == 1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn pw_atoi(s) {
+    var v = 0;
+    var i = 0;
+    while (load8(s + i) >= 48) { if (load8(s + i) > 57) { break; } v = v * 10 + (load8(s + i) - 48); i = i + 1; }
+    return v;
+}
+fn rd(fd, buf, n, a4) { return syscall(5, fd, buf, n, a4); }
+fn wr(fd, buf, n) { return syscall(1, fd, buf, n, 0); }
+fn cls(fd) { return syscall(6, fd, 0, 0, 0); }
+fn ch_close(fd) { return syscall(97, 4, fd, 0, 0); }
+fn ch_mint(out) { return syscall(97, 1, out, 0, 0); }
+fn ch_endow(fd, mode) { return syscall(97, 5, fd, 0, mode); }
+fn wset(fd, w) { return syscall(97, W_SET, fd, w, 0); }
+fn wget(fd, sel) { return syscall(97, W_GET, fd, sel, 0); }
+fn pk(c, r) { return (c << 16) | r; }
+fn pkp(c, r, xp, yp) { return (xp << 48) | (yp << 32) | (c << 16) | r; }
+fn reap(pid) { return syscall(4, 0x100 | pid, 0, 0, 0); }
+fn us() { return syscall(95, 0, 0, 0, 0); }                    # uptime_us#95
+# #99: the state of `pid` (6 = BLOCKED in a kernel wait), or -1 when it is not listed.
+fn pstate(pid) {
+    var n = syscall(99, &pw_pl, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        if (load64(&pw_pl + i * 64) == pid) { return load64(&pw_pl + i * 64 + 8); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+# Yield (#44) until `pid` is BLOCKED (state 6), at most 2 s. 1 = seen blocked.
+fn await_blocked(pid) {
+    var t = us();
+    while ((us() - t) < 2000000) {
+        if (pstate(pid) == 6) { return 1; }
+        syscall(44, 0, 0, 0, 0);
+    }
+    return 0;
+}
+fn sfd_open(mask) { var m[8]; store64(&m, mask); return syscall(18, 0 - 1, &m, 0, 0); }   # signalfd#18
+fn sig_block(mask) { var m[8]; store64(&m, mask); return syscall(17, 0, &m, 0, 0); }       # sigprocmask#17 SIG_BLOCK
+# Drain signalfd `fd` (non-blocking): how many records named signal `sig`.
+fn sig_count(fd, sig) {
+    var n = 0;
+    var i = 0;
+    while (i < 8) {
+        var rec[8];
+        store64(&rec, 0);
+        var r = syscall(5, fd, &rec, 8, 1);
+        if (r <= 0) { return n; }
+        if ((load64(&rec) & 0xFFFFFFFF) == sig) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+fn byte_out(fd, v) { var b[8]; store8(&b, v); return wr(fd, &b, 1); }
+fn byte_in(fd) { var b[8]; store64(&b, 0); if (rd(fd, &b, 1, 0) != 1) { return 0 - 1; } return load8(&b); }
+
+# The spawn line "/bin/agnsh <role> <a> <b> <c> <d>" in pw_line.
+fn ln_s(s) { var i = 0; while (load8(s + i) != 0) { store8(&pw_line + PW_LN, load8(s + i)); PW_LN = PW_LN + 1; i = i + 1; } return 0; }
+fn ln_n(n) {
+    var b[24];
+    var i = 0;
+    if (n == 0) { store8(&pw_line + PW_LN, 48); PW_LN = PW_LN + 1; return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(&pw_line + PW_LN, load8(&b + i)); PW_LN = PW_LN + 1; }
+    return 0;
+}
+fn spawn4(role, a, b, c, d) {
+    PW_LN = 0;
+    ln_s("/bin/agnsh "); ln_s(role);
+    ln_s(" "); ln_n(a); ln_s(" "); ln_n(b); ln_s(" "); ln_n(c); ln_s(" "); ln_n(d);
+    store8(&pw_line + PW_LN, 0);
+    return syscall(43, &pw_line, PW_LN, 0, 0);
+}
+
+# A child inside the terminal reports through its stdout (= the channel): one text line.
+fn t_line(head, k, v) {
+    PW_ON = 0;
+    o_out(head); o_kv("r", k); o_kv("c", v); o_putc(10);
+    return 0;
+}
+
+# ── child roles ──
+# disp <tfd>: holds a DISPLAY endowment at tfd (its stdio is the console). Exit bits: 1 GET grid -1 · 2 GET px -1 ·
+# 4 SET -5. Good = 7.
+fn c_disp(tfd) {
+    var g = wget(tfd, 0);
+    var gp = wget(tfd, 1);
+    var s = wset(tfd, pk(50, 20));
+    o_out("PTYW-CHILD disp"); o_kv("get", g); o_kv("getpx", gp); o_kv("set", s); o_out("\n");
+    var bits = 0;
+    if (g == (0 - 1)) { bits = bits | 1; }
+    if (gp == (0 - 1)) { bits = bits | 2; }
+    if (s == (0 - E_BADFD)) { bits = bits | 4; }
+    return bits;
+}
+# ptygc: a grandchild inside the terminal (fd 0..2 inherited from its parent, the endpoint's owner). Exit bits:
+# 1 GET grid = 100x30 · 2 GET px = 800x480 · 4 SET -5. Good = 7.
+fn c_ptygc() {
+    var bits = 0;
+    if (wget(0, 0) == pk(100, 30)) { bits = bits | 1; }
+    if (wget(0, 1) == pk(800, 480)) { bits = bits | 2; }
+    if (wset(0, pk(50, 20)) == (0 - E_BADFD)) { bits = bits | 4; }
+    return bits;
+}
+# ptyget: the endpoint's owner, born holding the terminal at fd 0..2. Record 1 = [1, GET before any set]; then a go
+# record; then record 2 = [2, GET fd0, GET fd1, GET fd2, GET px, own SET, grandchild status, GET after the refusals].
+fn c_ptyget() {
+    store64(&pw_rec, 1);
+    store64(&pw_rec + 8, wget(0, 0));
+    wr(1, &pw_rec, 16);
+    rd(0, &pw_msg, 16, 0);                                       # the driver's go (it has set the size)
+    var v1 = wget(0, 0);
+    var v1b = wget(1, 0);
+    var v1c = wget(2, 0);
+    var vpx = wget(0, 1);
+    var so = wset(0, pk(50, 20));
+    var gst = 0 - 1;
+    var gp = spawn4("ptygc", 0, 0, 0, 0);
+    if (gp >= 0) { gst = reap(gp); }
+    store64(&pw_rec, 2);
+    store64(&pw_rec + 8, v1);
+    store64(&pw_rec + 16, v1b);
+    store64(&pw_rec + 24, v1c);
+    store64(&pw_rec + 32, vpx);
+    store64(&pw_rec + 40, so);
+    store64(&pw_rec + 48, gst);
+    store64(&pw_rec + 56, wget(0, 0));
+    wr(1, &pw_rec, 64);
+    return 0;
+}
+# winw <go_r> <gn_r> <ack_w> <res_w>: the terminal's OWNER and a bit-28 WATCHER. Spawns the non-watching grandchild
+# FIRST (so it does not inherit the watcher signalfd), then watches. Verdict byte 0x40 | bits: bit 0 = born sized
+# 100x30, bit 1+k = round k saw pw_want[k] records. Good = 0x7F.
+fn c_winw(gor, gnr, akw, rsw) {
+    var gp = spawn4("winn", gnr, akw, rsw, 0);
+    var bits = 0;
+    if (wget(0, 0) == pk(100, 30)) { bits = bits | 1; }
+    sig_block(1 << 28);
+    var sfd = sfd_open(1 << 28);
+    byte_out(akw, 1);                                            # ready
+    var k = 0;
+    while (k < 5) {
+        if (byte_in(gor) < 0) { break; }
+        var c = sig_count(sfd, 28);
+        if (sfd < 0) { c = 0 - 1; }
+        if (c == pw_want(k)) { bits = bits | (2 << k); }
+        t_line("winw", k, c);
+        byte_out(akw, 1);                                        # ack
+        k = k + 1;
+    }
+    if (gp >= 0) { reap(gp); }
+    byte_out(rsw, 0x40 | bits);
+    return 0;
+}
+# winn <go_r> <ack_w> <res_w>: a HOLDER of the terminal (a PTY descendant) holding a bit-10 signalfd only. Each round
+# its signalfd and a FRESH bit-28 signalfd (closed again before the ack) must read nothing. Verdict byte 0x80 | bits:
+# bit 0 = it reads the terminal's size (it IS a holder), bit 1+k = round k clean. Good = 0xBF.
+fn c_winn(gor, akw, rsw) {
+    var s10 = sfd_open(1 << 10);
+    var bits = 0;
+    if (wget(0, 0) == pk(100, 30)) { bits = bits | 1; }
+    byte_out(akw, 1);                                            # ready
+    var k = 0;
+    while (k < 5) {
+        if (byte_in(gor) < 0) { break; }
+        var c10 = sig_count(s10, 10);
+        var s28 = sfd_open(1 << 28);
+        var c28 = 0 - 1;
+        if (s28 >= 0) { c28 = sig_count(s28, 28); cls(s28); }
+        if (s10 >= 0) { if (c10 == 0) { if (c28 == 0) { bits = bits | (2 << k); } } }
+        t_line("winn", k, c28);
+        byte_out(akw, 1);                                        # ack
+        k = k + 1;
+    }
+    byte_out(rsw, 0x80 | bits);
+    return 0;
+}
+# winx <go_r> <ack_w> <res_w> <wb>: a bit-28 WATCHER that does NOT hold the terminal — it holds the driver's inert
+# inherited copies of both ends (wb among them). Its stdio is the console. Verdict byte 0xC0 | bits: bit 0 = GET on
+# its copy of wb is -1, bit 1+k = round k saw no record. Good = 0xFF.
+fn c_winx(gor, akw, rsw, wb) {
+    sig_block(1 << 28);
+    var sfd = sfd_open(1 << 28);
+    var bits = 0;
+    if (wget(wb, 0) == (0 - 1)) { bits = bits | 1; }
+    byte_out(akw, 1);                                            # ready
+    var k = 0;
+    while (k < 5) {
+        if (byte_in(gor) < 0) { break; }
+        var c = sig_count(sfd, 28);
+        if (sfd < 0) { c = 0 - 1; }
+        if (c == 0) { bits = bits | (2 << k); }
+        o_out("PTYW-CHILD winx"); o_kv("r", k); o_kv("c", c); o_out("\n");
+        byte_out(akw, 1);                                        # ack
+        k = k + 1;
+    }
+    byte_out(rsw, 0xC0 | bits);
+    return 0;
+}
+# wine <ready_w>: the terminal's OWNER, a bit-28 watcher that waits in epoll_wait#21 on its signalfd. Round A: a
+# 300 ms timed wait (the driver SETs an unchanged size meanwhile); round B: a 5 s timed wait (the driver SETs a new
+# size). Record [tag 5 (6 = setup failed), rA, usA, sig28 after A, rB, usB, B's record is the signalfd's EPOLLIN,
+# sig28 after B] on its stdout (= the channel).
+fn c_wine(rw) {
+    sig_block(1 << 28);
+    var sfd = sfd_open(1 << 28);
+    var ep = syscall(19, 0, 0, 0, 0);                                      # epoll_create
+    var ec = syscall(20, ep, 3, sfd, 1);                                   # epoll_ctl SET EPOLLIN
+    byte_out(rw, 1);                                                       # ready A
+    var t0 = us();
+    var ra = syscall(21, ep, &pw_evs, 4 | EPW_TIMED, 300);
+    var ela = us() - t0;
+    var ca = sig_count(sfd, 28);
+    store64(&pw_evs, 0); store64(&pw_evs + 8, 0);
+    byte_out(rw, 2);                                                       # ready B
+    t0 = us();
+    var rb = syscall(21, ep, &pw_evs, 4 | EPW_TIMED, 5000);
+    var elb = us() - t0;
+    var evok = 0;
+    if (load64(&pw_evs + 4) == sfd) { if ((load32(&pw_evs) & 1) == 1) { evok = 1; } }
+    var cb = sig_count(sfd, 28);
+    var tag = 5;
+    if (sfd < 0) { tag = 6; }
+    if (ep < 0) { tag = 6; }
+    if (ec != 0) { tag = 6; }
+    store64(&pw_rec, tag);
+    store64(&pw_rec + 8, ra);
+    store64(&pw_rec + 16, ela);
+    store64(&pw_rec + 24, ca);
+    store64(&pw_rec + 32, rb);
+    store64(&pw_rec + 40, elb);
+    store64(&pw_rec + 48, evok);
+    store64(&pw_rec + 56, cb);
+    wr(1, &pw_rec, 64);
+    return 0;
+}
+# fresh: inside a freshly minted terminal; record [3, GET before any set].
+fn c_fresh() {
+    store64(&pw_rec, 3);
+    store64(&pw_rec + 8, wget(0, 0));
+    wr(1, &pw_rec, 16);
+    return 0;
+}
+
+fn child(): i64 {
+    var role = argv(1);
+    var a = 0; var b = 0; var c = 0; var d = 0;
+    if (argc() > 2) { a = pw_atoi(argv(2)); }
+    if (argc() > 3) { b = pw_atoi(argv(3)); }
+    if (argc() > 4) { c = pw_atoi(argv(4)); }
+    if (argc() > 5) { d = pw_atoi(argv(5)); }
+    if (eq(role, "disp") == 1) { return c_disp(a); }
+    if (eq(role, "ptyget") == 1) { return c_ptyget(); }
+    if (eq(role, "ptygc") == 1) { return c_ptygc(); }
+    if (eq(role, "winw") == 1) { return c_winw(a, b, c, d); }
+    if (eq(role, "winn") == 1) { return c_winn(a, b, c); }
+    if (eq(role, "winx") == 1) { return c_winx(a, b, c, d); }
+    if (eq(role, "fresh") == 1) { return c_fresh(); }
+    if (eq(role, "wine") == 1) { return c_wine(a); }
+    return 99;
+}
+
+# ── driver phases ──
+fn ph_caps() {
+    var cb[16];                                                  # function-local: 16 BYTES (the CAPS block)
+    store64(&cb, 0); store64(&cb + 8, 0);
+    var r = syscall(97, 0, &cb, 16, 0);
+    var m = load32(&cb);
+    verdict(r == 0 && (m & 0xC0) == 0xC0, "caps"); o_kv("rc", r); o_kv("mask", m); o_out("\n");
+    return 0;
+}
+
+# not-terminal + display share one channel: (fa, fb) minted here, fb sized before the DISPLAY endowment.
+fn ph_notterm_display() {
+    var r1 = wget(0 - 1, 0);
+    var r2 = wget(32, 0);
+    var r3 = wget(1, 0);                                         # the console
+    syscall(25, &pw_fds, 0, 0, 0);
+    var pr = load64(&pw_fds); var pwf = load64(&pw_fds + 8);
+    var r4 = wget(pr, 0);
+    var r5 = wset(pwf, pk(80, 24));
+    cls(pr); cls(pwf);
+    var r6 = wget(pr, 0);                                        # now a closed fd
+    if (ch_mint(&pw_fds2) != 0) { bad("not-terminal"); o_out(" CH_MINT failed\n"); return 0; }
+    var fa = load64(&pw_fds2); var fb = load64(&pw_fds2 + 8);
+    var r7 = wget(fa, 0);
+    var r8 = wget(fb, 0);
+    var r9 = wset(fa, pk(0, 30));
+    var r10 = wset(fa, pk(100, 0));
+    var r11 = wset(fa, pk(100, 30));                             # before the endowment: sizes fb
+    var r12 = wget(fb, 0);                                       # sized, but not a terminal
+    var r13 = wget(fa, 2);
+    verdict(r1 == (0 - 1) && r2 == (0 - 1) && r3 == (0 - 1) && r4 == (0 - 1) && r5 == (0 - E_BADFD)
+      && r6 == (0 - 1) && r7 == (0 - 1) && r8 == (0 - 1) && r9 == (0 - E_ARG) && r10 == (0 - E_ARG)
+      && r11 == 0 && r12 == (0 - 1) && r13 == (0 - E_ARG), "not-terminal");
+    o_kv("fdm1", r1); o_kv("fd32", r2); o_kv("console", r3); o_kv("pipe", r4); o_kv("set_pipe", r5);
+    o_kv("closed", r6); o_kv("own_a", r7); o_kv("own_b", r8); o_kv("set_c0", r9); o_kv("set_r0", r10);
+    o_kv("set_pre_endow", r11); o_kv("sized_not_tty", r12); o_kv("sel2", r13); o_out("\n");
+    # display: fb endowed in DISPLAY mode (a4 = 0).
+    var tfd = ch_endow(fb, 0);
+    var pid = spawn4("disp", tfd, 0, 0, 0);
+    var d4 = wset(fa, pk(100, 30));                              # the peer is now the child's display end
+    var st = 0 - 1;
+    if (pid >= 0) { st = reap(pid); }
+    ch_close(fa);
+    verdict(tfd >= 3 && pid >= 0 && st == 7 && d4 == (0 - E_BADFD), "display");
+    o_kv("tfd", tfd); o_kv("pid", pid); o_kv("child_bits", st); o_kv("set_after_endow", d4); o_out("\n");
+    return 0;
+}
+
+fn ph_ptyget() {
+    if (ch_mint(&pw_fds) != 0) { bad("pty-get"); o_out(" CH_MINT failed\n"); return 0; }
+    var pa = load64(&pw_fds); var pb = load64(&pw_fds + 8);
+    var tfd = ch_endow(pb, PW_STDIO);
+    var pid = spawn4("ptyget", 0, 0, 0, 0);
+    if (pid < 0) { bad("pty-get"); o_kv("spawn", pid); o_out("\n"); return 0; }
+    store64(&pw_rec, 0); store64(&pw_rec + 8, 0);
+    var n1 = rd(pa, &pw_rec, 64, 0);
+    var tag1 = load64(&pw_rec);
+    var v0 = load64(&pw_rec + 8);
+    var s1 = wset(pa, pkp(100, 30, 800, 480));
+    var e1 = wget(pb, 0);                                        # the emulator's own copy of the endowed end: inert
+    store64(&pw_msg, 0x6F67);
+    wr(pa, &pw_msg, 2);                                          # go
+    var n2 = rd(pa, &pw_rec, 64, 0);
+    var st = reap(pid);
+    var s3 = wset(pa, pk(90, 25));                               # the terminal end died with its owner
+    ch_close(pa);
+    verdict(n1 == 16 && tag1 == 1 && v0 == (0 - 1), "pty-get-before-set");
+    o_kv("len", n1); o_kv("get", v0); o_out("\n");
+    verdict(s1 == 0 && n2 == 64 && load64(&pw_rec) == 2 && load64(&pw_rec + 8) == pk(100, 30)
+      && load64(&pw_rec + 16) == pk(100, 30) && load64(&pw_rec + 24) == pk(100, 30)
+      && load64(&pw_rec + 32) == pk(800, 480), "pty-get-owner");
+    o_kv("set", s1); o_kv("len", n2); o_kv("fd0", load64(&pw_rec + 8)); o_kv("fd1", load64(&pw_rec + 16));
+    o_kv("fd2", load64(&pw_rec + 24)); o_kv("px", load64(&pw_rec + 32)); o_out("\n");
+    verdict(load64(&pw_rec + 48) == 7, "pty-get-descendant"); o_kv("grandchild_bits", load64(&pw_rec + 48)); o_out("\n");
+    verdict(load64(&pw_rec + 40) == (0 - E_BADFD) && load64(&pw_rec + 56) == pk(100, 30), "pty-set-refused-inside");
+    o_kv("owner_set", load64(&pw_rec + 40)); o_kv("after", load64(&pw_rec + 56)); o_out("\n");
+    verdict(e1 == (0 - 1) && st == 0 && s3 == (0 - E_PEERGONE) && tfd >= 3, "pty-emulator-side");
+    o_kv("emulator_copy_get", e1); o_kv("child_status", st); o_kv("set_after_death", s3); o_out("\n");
+    return 0;
+}
+
+fn ph_winch() {
+    var i = 0;
+    while (i < 5) { syscall(25, &pw_p + i * 16, 0, 0, 0); i = i + 1; }
+    var gor_w = load64(&pw_p);       var gow_w = load64(&pw_p + 8);    # go -> winw
+    var gor_n = load64(&pw_p + 16);  var gow_n = load64(&pw_p + 24);   # go -> winn
+    var gor_x = load64(&pw_p + 32);  var gow_x = load64(&pw_p + 40);   # go -> winx
+    var akr = load64(&pw_p + 48);    var akw = load64(&pw_p + 56);     # ready / ack
+    var rsr = load64(&pw_p + 64);    var rsw = load64(&pw_p + 72);     # verdict bytes
+    store64(&pw_words, pk(100, 30));                 # same as the pre-endowment size: silent
+    store64(&pw_words + 8, pk(120, 40));             # a change: one
+    store64(&pw_words + 16, pk(120, 40));            # same: silent
+    store64(&pw_words + 24, pkp(120, 40, 960, 640)); # the pixel size alone changes: one (the whole word, as Linux)
+    store64(&pw_words + 32, pk(100, 30));            # a change: one
+    if (ch_mint(&pw_fds) != 0) { bad("winch"); o_out(" CH_MINT failed\n"); return 0; }
+    var wa = load64(&pw_fds); var wb = load64(&pw_fds + 8);
+    var s0 = wset(wa, pk(100, 30));                              # sized BEFORE the endowment: the child is born sized
+    ch_endow(wb, PW_STDIO);
+    var pw = spawn4("winw", gor_w, gor_n, akw, rsw);
+    var px = spawn4("winx", gor_x, akw, rsw, wb);
+    var ready = 0;
+    while (ready < 3) { if (byte_in(akr) < 0) { break; } ready = ready + 1; }
+    var setrc = 0;
+    var k = 0;
+    while (k < 5) {
+        var sr = wset(wa, load64(&pw_words + k * 8));
+        if (sr != 0) { setrc = setrc + 1; }
+        byte_out(gow_w, 1); byte_out(gow_n, 1); byte_out(gow_x, 1);
+        var a = 0;
+        while (a < 3) { if (byte_in(akr) < 0) { break; } a = a + 1; }
+        k = k + 1;
+    }
+    var vw = 0 - 1; var vn = 0 - 1; var vx = 0 - 1;
+    var j = 0;
+    while (j < 3) {
+        var v = byte_in(rsr);
+        if (v < 0) { break; }
+        if ((v >> 6) == 1) { vw = v; }
+        if ((v >> 6) == 2) { vn = v; }
+        if ((v >> 6) == 3) { vx = v; }
+        j = j + 1;
+    }
+    var stw = 0 - 1; var stx = 0 - 1;
+    if (pw >= 0) { stw = reap(pw); }
+    if (px >= 0) { stx = reap(px); }
+    # The terminal's children reported through it: drain wa (non-blocking) and show their lines.
+    var n = 1;
+    while (n > 0) {
+        n = syscall(97, 3, wa, &pw_rec, 64);
+        if (n > 0) {
+            o_out("PTYW-CHILD ");
+            var q = 0;
+            while (q < n) { o_putc(load8(&pw_rec + q)); q = q + 1; }
+        }
+    }
+    ch_close(wa);
+    i = 0;
+    while (i < 10) { cls(load64(&pw_p + i * 8)); i = i + 1; }
+    verdict(s0 == 0 && setrc == 0 && ready == 3, "winch-sets"); o_kv("pre_endow_set", s0); o_kv("set_failures", setrc);
+    o_kv("ready", ready); o_kv("winw_status", stw); o_kv("winx_status", stx); o_out("\n");
+    verdict(vw == 0x7F, "winch-watching-holder"); o_kv("byte", vw); o_out(" (want 127: born 100x30, rounds 0,1,0,1,1)\n");
+    verdict(vn == 0xBF, "winch-nonwatching-holder"); o_kv("byte", vn); o_out(" (want 191: holds the terminal, never posted)\n");
+    verdict(vx == 0xFF, "winch-nonholding-watcher"); o_kv("byte", vx); o_out(" (want 255: inert copies, never posted)\n");
+    return 0;
+}
+
+fn ph_winch_epoll() {
+    if (ch_mint(&pw_fds) != 0) { bad("winch-epoll-wake"); o_out(" CH_MINT failed\n"); return 0; }
+    var ea = load64(&pw_fds); var eb = load64(&pw_fds + 8);
+    syscall(25, &pw_fds2, 0, 0, 0);
+    var rr = load64(&pw_fds2); var rw = load64(&pw_fds2 + 8);
+    var s0 = wset(ea, pk(100, 30));                              # born 100x30
+    ch_endow(eb, PW_STDIO);
+    var pid = spawn4("wine", rw, 0, 0, 0);
+    if (pid < 0) { bad("winch-epoll-wake"); o_kv("spawn", pid); o_out("\n"); return 0; }
+    byte_in(rr);                                                 # ready A
+    var ba = await_blocked(pid);
+    var sa = wset(ea, pk(100, 30));                              # UNCHANGED: must not wake the sleeper
+    byte_in(rr);                                                 # ready B (after A's 300 ms wait)
+    var bb = await_blocked(pid);
+    var sb = wset(ea, pk(120, 40));                              # CHANGED: SIGWINCH must wake the sleeper
+    store64(&pw_rec, 0);
+    var n = rd(ea, &pw_rec, 64, 0);
+    var st = reap(pid);
+    ch_close(ea);
+    cls(rr); cls(rw);
+    var tag = load64(&pw_rec);
+    var ra = load64(&pw_rec + 8); var ela = load64(&pw_rec + 16); var ca = load64(&pw_rec + 24);
+    var rb = load64(&pw_rec + 32); var elb = load64(&pw_rec + 40); var evok = load64(&pw_rec + 48);
+    var cb = load64(&pw_rec + 56);
+    verdict(s0 == 0 && n == 64 && tag == 5 && ba == 1 && sa == 0 && ra == 0 && ela >= 300000 && ca == 0,
+      "winch-epoll-unchanged");
+    o_kv("blocked", ba); o_kv("set", sa); o_kv("ret", ra); o_kv("us", ela); o_kv("sig28", ca); o_kv("tag", tag);
+    o_out(" (want ret 0 at >= 300000 us, no record)\n");
+    verdict(n == 64 && tag == 5 && bb == 1 && sb == 0 && rb == 1 && evok == 1 && cb == 1 && elb < 1000000 && st == 0,
+      "winch-epoll-wake");
+    o_kv("blocked", bb); o_kv("set", sb); o_kv("ret", rb); o_kv("us", elb); o_kv("sigfd_rec", evok); o_kv("sig28", cb);
+    o_kv("child_status", st); o_out(" (want ret 1 < 1000000 us of a 5 s wait, one sig-28 record)\n");
+    return 0;
+}
+
+fn ph_recycled() {
+    if (ch_mint(&pw_fds) != 0) { bad("recycled"); o_out(" CH_MINT failed\n"); return 0; }
+    var ra = load64(&pw_fds); var rb = load64(&pw_fds + 8);
+    ch_endow(rb, PW_STDIO);
+    var pid = spawn4("fresh", 0, 0, 0, 0);
+    store64(&pw_rec, 0); store64(&pw_rec + 8, 0);
+    var n = 0 - 1;
+    if (pid >= 0) { n = rd(ra, &pw_rec, 64, 0); reap(pid); }
+    ch_close(ra);
+    verdict(n == 16 && load64(&pw_rec) == 3 && load64(&pw_rec + 8) == (0 - 1), "recycled");
+    o_kv("len", n); o_kv("get", load64(&pw_rec + 8)); o_out("\n");
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) { return child(); }
+    o_out("PTYW-BEGIN pid="); o_num(syscall(2, 0, 0, 0, 0)); o_out("\n");
+    ph_caps();
+    ph_notterm_display();
+    ph_ptyget();
+    ph_winch();
+    ph_winch_epoll();
+    ph_recycled();
+    o_out("PTYW-DONE"); o_kv("pass", pw_pass); o_kv("fail", pw_fail); o_out("\n");
+    o_out("PTYW-EXIT 0\n");
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

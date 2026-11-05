@@ -425,6 +425,8 @@ fn ext2_print_dir(dir_ino) { return 0 - 1; }
 fn ext2_unlink(dir_ino, name, name_len) { return 0 - 1; }
 fn ext2_rename(sp, sn, snl, dp, dn, dnl) { return 0 - 1; }
 fn ext2_sync() { return 0 - 1; }
+# 1.57.17: vfs.cyr's close#6 and fd-table teardown free a pending in-core orphan (ext2.cyr) — none without a mount.
+fn ext2_orphan_reap() { return 0; }
 fn blk_flush_on(tag) { return 0 - 1; }
 # Pure byte helpers, not a subsystem: the x86 bodies (ext2.cyr), the 32-bit loads spelled with the 16-bit one.
 fn ext2_load16_le(ptr, off) { return load8(ptr + off) | (load8(ptr + off + 1) << 8); }

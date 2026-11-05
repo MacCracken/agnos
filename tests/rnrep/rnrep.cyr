@@ -1,0 +1,351 @@
+# rnrep — the RING-3 half of agnos 1.57.17's ext2 rename-replace + directory-flock repair.
+#
+# Issues: 2026-10-28-ext2-rename-cannot-replace-an-existing-file (hapi's manifest writer) and
+#         2026-11-02-ext2-rename-cannot-replace-loses-every-descent-save (descent's player saves).
+# Seeded as /bin/agnsh on a PLAIN kernel by scripts/smoke/ext2-rename-replace-smoke.sh, which maps the markers below and
+# then reads the partition on the host (e2fsck -fn, debugfs). Raw `syscall(N, a1, a2, a3, a4)` with explicit zeros (a
+# 3-argument call passes a garbage r10). Every check prints its raw values; a failure prints `RNREP-FAIL-<name> v=...`
+# and never its OK marker. The program ALWAYS ends `RNREP-DONE pass=P fail=F` and exits 0 (a non-zero exit drops
+# kybernet into the emergency shell).
+#
+#   S  THE STAGING PATTERN, 20 generations: write /rr/x.tmp (AO_CREAT|AO_EXCL), sync#12 (agnos's fsync — ext2 writes
+#      through), rename#31 it OVER /rr/x. Each time /rr/x must be x.tmp's inode with exactly that generation's bytes and
+#      one link, and /rr/x.tmp gone. Sizes 597..8140 bytes: one block, then two.
+#   O  AN OPEN FD KEEPS THE REPLACED FILE: an fd on /rr/o reads o's own bytes after o.tmp is renamed over it, while three
+#      new files take whatever inodes and blocks first fit hands out (a replaced inode freed under its fd would be one of
+#      them). The same through unlink#30 of an open file. The host's e2fsck -fn then proves the last close freed both.
+#   R  THE REFUSAL MATRIX (each changing nothing): a directory over a NON-empty directory, a directory over a file, a
+#      file over a directory, "." / ".." as either name, a directory into its own subtree. Then the successes: two names
+#      of one inode (a no-op), a file over a HARD-LINKED file, a file over a file across directories, and a directory
+#      over an EMPTY directory in one parent and across parents (its ".." and both parents' link counts).
+#   L  FLOCK#59 ON AN AO_DIRECTORY FD: the parent's EX makes a forked child's LOCK_NB EX and LOCK_NB SH on its OWN dir
+#      fd fail; after UN the child's succeeds; SH + SH share; close releases; a file fd still locks; a console fd is
+#      still refused.
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var r_lb[32];           # 256 B the current output line
+var R_LN = 0;
+var R_PASS = 0;
+var R_FAIL = 0;
+var r_wb[1024];         # 8 KB write buffer
+var r_rb[1104];         # 8832 B read buffer
+var r_st[6];            # 48 B stat#33 struct (§4.1)
+
+# Output is LINE-BUFFERED, one write(1) per line.
+fn r_flush() { if (R_LN > 0) { syscall(1, 1, &r_lb, R_LN, 0); } R_LN = 0; return 0; }
+fn r_putc(ch) {
+    if (R_LN >= 250) { r_flush(); }
+    store8(&r_lb + R_LN, ch);
+    R_LN = R_LN + 1;
+    if (ch == 10) { r_flush(); }
+    return 0;
+}
+fn r_out(s) {
+    var i = 0;
+    while (load8(s + i) != 0) { r_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn r_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { r_putc(45); n = 0 - n; }
+    if (n == 0) { r_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; r_putc(load8(&b + i)); }
+    return 0;
+}
+fn r_kv(k, v) { r_out(" "); r_out(k); r_out("="); r_num(v); return 0; }
+fn r_nl() { r_out("\n"); return 0; }
+fn r_ok(m) { r_out(m); r_nl(); R_PASS = R_PASS + 1; return 0; }
+fn r_fail(m, v) { r_out("RNREP-FAIL-"); r_out(m); r_kv("v", v); r_nl(); R_FAIL = R_FAIL + 1; return 0; }
+fn r_len(s) { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+
+fn r_open(p, fl) { return syscall(7, p, r_len(p), fl, 0); }
+fn r_close(fd) { return syscall(6, fd, 0, 0, 0); }
+fn r_rename(a, b) { return syscall(31, a, r_len(a), b, r_len(b)); }
+fn r_unlink(p) { return syscall(30, p, r_len(p), 0, 0); }
+fn r_mkdir(p) { return syscall(9, p, r_len(p), 0, 0); }
+fn r_rmdir(p) { return syscall(10, p, r_len(p), 0, 0); }
+fn r_link(a, b) { return syscall(32, a, r_len(a), b, r_len(b)); }
+fn r_sync() { return syscall(12, 0, 0, 0, 0); }
+fn r_flock(fd, op) { return syscall(59, fd, op, 0, 0); }
+fn r_fork() { return syscall(96, 0, 0, 0, 0); }
+fn r_wait(pid) { return syscall(4, 0x100 | pid, 0, 0, 0); }   # WAIT_BLOCK: the child's exit code & 0xFF
+# stat#33 fields; -1 when the name does not resolve
+fn r_ino(p)   { if (syscall(33, p, r_len(p), &r_st, 0) != 0) { return 0 - 1; } return load64(&r_st + 24); }
+fn r_nlink(p) { if (syscall(33, p, r_len(p), &r_st, 0) != 0) { return 0 - 1; } return load64(&r_st + 8); }
+
+# The bytes of generation g — a different sequence for every g, so a stale block of any other one is caught.
+fn r_byte(g, k) { return (g * 37 + k * 13 + (k >> 8)) & 0xFF; }
+fn r_fill(g, n) { var k = 0; while (k < n) { store8(&r_wb + k, r_byte(g, k)); k = k + 1; } return 0; }
+# A FRESH file p of generation g, n bytes (AO_WRONLY|AO_CREAT|AO_EXCL — an existing name is refused). 0 / <0.
+fn r_put(p, g, n) {
+    var fd = r_open(p, 0x2101);
+    if (fd < 0) { return 0 - 1; }
+    r_fill(g, n);
+    var w = syscall(1, fd, &r_wb, n, 0);
+    r_close(fd);
+    if (w != n) { return 0 - 2; }
+    return 0;
+}
+# Read fd from its position to EOF into r_rb (at most 8832 bytes); the count.
+fn r_slurp(fd) {
+    var got = 0;
+    while (got < 8832) {
+        var r = syscall(5, fd, &r_rb + got, 8832 - got, 0);
+        if (r <= 0) { return got; }
+        got = got + r;
+    }
+    return got;
+}
+fn r_is(g, n) { var k = 0; while (k < n) { if (load8(&r_rb + k) != r_byte(g, k)) { return 0; } k = k + 1; } return 1; }
+# 1 when the file p holds exactly generation g, n bytes.
+fn r_holds(p, g, n) {
+    var fd = r_open(p, 0);
+    if (fd < 0) { return 0; }
+    var got = r_slurp(fd);
+    r_close(fd);
+    if (got != n) { return 0; }
+    return r_is(g, n);
+}
+
+# ═══ S — the staging pattern ═══
+fn ph_s() {
+    r_mkdir("/rr");
+    if (r_put("/rr/x", 0, 300) != 0) { r_fail("S-SEED", 0); return 0; }
+    var g = 1;
+    var bad = 0;
+    while (g <= 20) {
+        var n = 200 + g * 397;
+        var fd = r_open("/rr/x.tmp", 0x2101);
+        if (fd < 0) { r_fail("S-OPEN", g); bad = 1; break; }
+        r_fill(g, n);
+        var w = syscall(1, fd, &r_wb, n, 0);
+        var sy = r_sync();
+        r_close(fd);
+        var ti = r_ino("/rr/x.tmp");
+        var oi = r_ino("/rr/x");
+        var rr = r_rename("/rr/x.tmp", "/rr/x");
+        var ni = r_ino("/rr/x");
+        var gone = r_ino("/rr/x.tmp");
+        var held = r_holds("/rr/x", g, n);
+        var nl = r_nlink("/rr/x");
+        if (w != n || sy != 0 || rr != 0 || ni != ti || ni == oi || gone != 0 - 1 || held != 1 || nl != 1) {
+            r_out("RNREP-S"); r_kv("g", g); r_kv("w", w); r_kv("sy", sy); r_kv("rr", rr); r_kv("ti", ti);
+            r_kv("oi", oi); r_kv("ni", ni); r_kv("gone", gone); r_kv("held", held); r_kv("nl", nl); r_nl();
+            r_fail("STAGING", g);
+            bad = 1;
+            break;
+        }
+        g = g + 1;
+    }
+    if (bad == 0) {
+        r_out("RNREP-S"); r_kv("generations", 20); r_kv("ino", r_ino("/rr/x")); r_nl();
+        r_ok("RNREP-STAGING-OK");
+    }
+    return 0;
+}
+
+# ═══ O — an open fd keeps the replaced (or unlinked) file ═══
+fn ph_o() {
+    if (r_put("/rr/o", 77, 6000) != 0) { r_fail("O-SEED", 0); return 0; }
+    var oi = r_ino("/rr/o");
+    var ofd = r_open("/rr/o", 0);
+    if (r_put("/rr/o.tmp", 78, 5000) != 0) { r_fail("O-SEED2", 0); r_close(ofd); return 0; }
+    var rr = r_rename("/rr/o.tmp", "/rr/o");
+    # tempt the allocator: first fit gives a just-freed inode and its blocks to the next create
+    var p1 = r_put("/rr/f1", 90, 6000);
+    var p2 = r_put("/rr/f2", 91, 6000);
+    var p3 = r_put("/rr/f3", 92, 6000);
+    var i1 = r_ino("/rr/f1");
+    var i2 = r_ino("/rr/f2");
+    var i3 = r_ino("/rr/f3");
+    var got = r_slurp(ofd);
+    var same = r_is(77, 6000);
+    var newok = r_holds("/rr/o", 78, 5000);
+    var cl = r_close(ofd);
+    r_out("RNREP-O"); r_kv("ofd", ofd); r_kv("rr", rr); r_kv("old_ino", oi); r_kv("f1", i1); r_kv("f2", i2);
+    r_kv("f3", i3); r_kv("puts", p1 + p2 + p3); r_kv("got", got); r_kv("same", same); r_kv("new", newok);
+    r_kv("close", cl); r_nl();
+    if (ofd >= 0 && rr == 0 && got == 6000 && same == 1 && newok == 1 && i1 != oi && i2 != oi && i3 != oi && cl == 0) {
+        r_ok("RNREP-OPEN-OLD-OK");
+    } else { r_fail("OPEN-OLD", got); }
+    # After the last close the replaced inode is free (the host's e2fsck -fn proves it); the next create may take it.
+    r_put("/rr/f4", 93, 100);
+    r_out("RNREP-O-AFTER"); r_kv("old_ino", oi); r_kv("f4", r_ino("/rr/f4")); r_nl();
+
+    # the same through unlink#30
+    if (r_put("/rr/u", 55, 4500) != 0) { r_fail("U-SEED", 0); return 0; }
+    var ui = r_ino("/rr/u");
+    var ufd = r_open("/rr/u", 0);
+    var ur = r_unlink("/rr/u");
+    var ugone = r_ino("/rr/u");
+    var p5 = r_put("/rr/f5", 94, 6000);
+    var i5 = r_ino("/rr/f5");
+    var ugot = r_slurp(ufd);
+    var usame = r_is(55, 4500);
+    var ucl = r_close(ufd);
+    r_out("RNREP-U"); r_kv("ufd", ufd); r_kv("unlink", ur); r_kv("gone", ugone); r_kv("old_ino", ui); r_kv("f5", i5);
+    r_kv("put", p5); r_kv("got", ugot); r_kv("same", usame); r_kv("close", ucl); r_nl();
+    if (ufd >= 0 && ur == 0 && ugone == 0 - 1 && i5 != ui && ugot == 4500 && usame == 1 && ucl == 0) {
+        r_ok("RNREP-UNLINK-OPEN-OK");
+    } else { r_fail("UNLINK-OPEN", ugot); }
+    r_unlink("/rr/f1"); r_unlink("/rr/f2"); r_unlink("/rr/f3"); r_unlink("/rr/f4"); r_unlink("/rr/f5");
+    return 0;
+}
+
+# ═══ R — the refusal matrix, and the successes beside it ═══
+fn ph_r() {
+    r_mkdir("/rr/d1");
+    r_mkdir("/rr/d2");
+    r_put("/rr/d2/f", 40, 100);
+    r_mkdir("/rr/d3");
+    var xi = r_ino("/rr/x");
+    var d1 = r_ino("/rr/d1");
+
+    var a = r_rename("/rr/d1", "/rr/d2");                       # ENOTEMPTY
+    if (a == 0 - 1 && r_ino("/rr/d1") == d1 && r_holds("/rr/d2/f", 40, 100) == 1) { r_ok("RNREP-REFUSE-DIR-NONEMPTY-OK"); }
+    else { r_fail("REFUSE-DIR-NONEMPTY", a); }
+    var b = r_rename("/rr/d1", "/rr/x");                        # ENOTDIR
+    if (b == 0 - 1 && r_ino("/rr/x") == xi && r_ino("/rr/d1") == d1) { r_ok("RNREP-REFUSE-DIR-OVER-FILE-OK"); }
+    else { r_fail("REFUSE-DIR-OVER-FILE", b); }
+    var c = r_rename("/rr/x", "/rr/d3");                        # EISDIR
+    if (c == 0 - 1 && r_ino("/rr/x") == xi && r_ino("/rr/d3") > 0) { r_ok("RNREP-REFUSE-FILE-OVER-DIR-OK"); }
+    else { r_fail("REFUSE-FILE-OVER-DIR", c); }
+    var e1 = r_rename("/rr/d1/.", "/rr/dz");                    # "." / ".." are never an operand
+    var e2 = r_rename("/rr/x", "/rr/d1/..");
+    var e3 = r_rename("/rr/d1/..", "/rr/dz");
+    r_out("RNREP-R-DOT"); r_kv("e1", e1); r_kv("e2", e2); r_kv("e3", e3); r_nl();
+    if (e1 == 0 - 1 && e2 == 0 - 1 && e3 == 0 - 1 && r_ino("/rr/dz") == 0 - 1 && r_ino("/rr/x") == xi && r_ino("/rr/d1") == d1 && r_ino("/rr/d1/.") == d1) {
+        r_ok("RNREP-REFUSE-DOT-OK");
+    } else { r_fail("REFUSE-DOT", e1); }
+    r_mkdir("/rr/d1/sub");                                       # an EMPTY target inside its own subtree
+    var f = r_rename("/rr/d1", "/rr/d1/sub");
+    if (f == 0 - 1 && r_ino("/rr/d1") == d1 && r_ino("/rr/d1/sub") > 0) { r_ok("RNREP-REFUSE-SUBTREE-OK"); }
+    else { r_fail("REFUSE-SUBTREE", f); }
+    r_rmdir("/rr/d1/sub");
+
+    var l = r_link("/rr/x", "/rr/xl");                          # two names of ONE inode: 0, nothing done
+    var g2 = r_rename("/rr/x", "/rr/xl");
+    if (l == 0 && g2 == 0 && r_ino("/rr/x") == xi && r_ino("/rr/xl") == xi && r_nlink("/rr/x") == 2) { r_ok("RNREP-SAME-INODE-NOOP-OK"); }
+    else { r_fail("SAME-INODE-NOOP", g2); }
+    r_unlink("/rr/xl");
+
+    r_put("/rr/h", 60, 3000);                                    # over a HARD-LINKED file
+    r_link("/rr/h", "/rr/h2");
+    r_put("/rr/hn", 61, 2000);
+    var hi = r_ino("/rr/h");
+    var hni = r_ino("/rr/hn");
+    var hr = r_rename("/rr/hn", "/rr/h");
+    if (hr == 0 && r_ino("/rr/h") == hni && r_holds("/rr/h", 61, 2000) == 1 && r_ino("/rr/h2") == hi && r_holds("/rr/h2", 60, 3000) == 1 && r_nlink("/rr/h2") == 1 && r_ino("/rr/hn") == 0 - 1) {
+        r_ok("RNREP-OVER-HARDLINK-OK");
+    } else { r_fail("OVER-HARDLINK", hr); }
+
+    r_mkdir("/rr/p1");                                           # a file over a file across directories
+    r_mkdir("/rr/p2");
+    r_put("/rr/p1/y", 50, 1500);
+    r_put("/rr/p2/y", 51, 2500);
+    var yi = r_ino("/rr/p2/y");
+    var yr = r_rename("/rr/p2/y", "/rr/p1/y");
+    if (yr == 0 && r_ino("/rr/p1/y") == yi && r_holds("/rr/p1/y", 51, 2500) == 1 && r_ino("/rr/p2/y") == 0 - 1) { r_ok("RNREP-XDIR-FILE-OK"); }
+    else { r_fail("XDIR-FILE", yr); }
+
+    r_put("/rr/d1/m", 62, 700);                                  # a directory over an EMPTY one, one parent
+    var rl0 = r_nlink("/rr");
+    var dr = r_rename("/rr/d1", "/rr/d3");
+    var rl1 = r_nlink("/rr");
+    var dn = r_nlink("/rr/d3");
+    r_out("RNREP-R-DIR"); r_kv("rc", dr); r_kv("rr_links", rl0); r_kv("after", rl1); r_kv("d3_links", dn); r_nl();
+    if (dr == 0 && r_ino("/rr/d1") == 0 - 1 && r_ino("/rr/d3") == d1 && r_holds("/rr/d3/m", 62, 700) == 1 && rl1 == rl0 - 1 && r_ino("/rr/d3/..") == r_ino("/rr") && dn == 2) {
+        r_ok("RNREP-DIR-OVER-EMPTY-OK");
+    } else { r_fail("DIR-OVER-EMPTY", dr); }
+
+    r_mkdir("/rr/p1/e");                                         # ... and across parents
+    r_mkdir("/rr/p2/m");
+    r_put("/rr/p2/m/c", 63, 900);
+    var mi = r_ino("/rr/p2/m");
+    var l1a = r_nlink("/rr/p1");
+    var l2a = r_nlink("/rr/p2");
+    var xr = r_rename("/rr/p2/m", "/rr/p1/e");
+    var l1b = r_nlink("/rr/p1");
+    var l2b = r_nlink("/rr/p2");
+    r_out("RNREP-R-XDIR"); r_kv("rc", xr); r_kv("p1", l1a); r_kv("p1_after", l1b); r_kv("p2", l2a); r_kv("p2_after", l2b); r_nl();
+    if (xr == 0 && r_ino("/rr/p1/e") == mi && r_holds("/rr/p1/e/c", 63, 900) == 1 && r_ino("/rr/p2/m") == 0 - 1 && r_ino("/rr/p1/e/..") == r_ino("/rr/p1") && l1b == l1a && l2b == l2a - 1) {
+        r_ok("RNREP-DIR-OVER-EMPTY-XDIR-OK");
+    } else { r_fail("DIR-OVER-EMPTY-XDIR", xr); }
+    return 0;
+}
+
+# ═══ L — flock#59 on an AO_DIRECTORY fd ═══
+# A forked child opens its OWN dir fd (the lock owner is the pid, not the fd — the #59 ABI row) and reports by exit code.
+fn l_child(want_rc, op, op2) {
+    var cfd = r_open("/rr", 0x800);
+    var c1 = r_flock(cfd, op);
+    var c2 = 0;
+    if (op2 != 0) { c2 = r_flock(cfd, op2); }
+    var code = 1;
+    if (cfd >= 0) { if (c1 == want_rc) { code = 0; } }
+    if (op2 != 0) { if (c2 != 0 - 1) { code = 1; } }            # op2, when given, must be refused
+    syscall(0, code, 0, 0, 0);
+    return 0;
+}
+fn ph_l() {
+    var dfd = r_open("/rr", 0x800);
+    var ex = r_flock(dfd, 2);                                     # LOCK_EX
+    var k1 = r_fork();
+    if (k1 == 0) { l_child(0 - 1, 6, 5); }                       # EX|NB refused, SH|NB refused
+    var w1 = r_wait(k1);
+    r_out("RNREP-L1"); r_kv("dfd", dfd); r_kv("ex", ex); r_kv("child", k1); r_kv("status", w1); r_nl();
+    if (dfd >= 0 && ex == 0 && k1 > 0 && w1 == 0) { r_ok("RNREP-FLOCK-DIR-EXCL-OK"); }
+    else { r_fail("FLOCK-DIR-EXCL", w1); }
+
+    var un = r_flock(dfd, 8);                                     # LOCK_UN
+    var k2 = r_fork();
+    if (k2 == 0) { l_child(0, 6, 0); }                           # EX|NB now taken (its exit releases it)
+    var w2 = r_wait(k2);
+    r_out("RNREP-L2"); r_kv("un", un); r_kv("status", w2); r_nl();
+    if (un == 0 && k2 > 0 && w2 == 0) { r_ok("RNREP-FLOCK-DIR-UNLOCK-OK"); }
+    else { r_fail("FLOCK-DIR-UNLOCK", w2); }
+
+    var sh = r_flock(dfd, 1);                                     # LOCK_SH
+    var k3 = r_fork();
+    if (k3 == 0) { l_child(0, 5, 6); }                           # SH|NB shares; EX|NB (a conversion) refused
+    var w3 = r_wait(k3);
+    r_out("RNREP-L3"); r_kv("sh", sh); r_kv("status", w3); r_nl();
+    if (sh == 0 && k3 > 0 && w3 == 0) { r_ok("RNREP-FLOCK-DIR-SHARED-OK"); }
+    else { r_fail("FLOCK-DIR-SHARED", w3); }
+
+    var ex2 = r_flock(dfd, 2);                                    # SH -> EX (no other holder now)
+    var cl = r_close(dfd);                                        # close#6 releases it
+    var k4 = r_fork();
+    if (k4 == 0) { l_child(0, 6, 0); }
+    var w4 = r_wait(k4);
+    r_out("RNREP-L4"); r_kv("ex", ex2); r_kv("close", cl); r_kv("status", w4); r_nl();
+    if (ex2 == 0 && cl == 0 && k4 > 0 && w4 == 0) { r_ok("RNREP-FLOCK-DIR-CLOSE-OK"); }
+    else { r_fail("FLOCK-DIR-CLOSE", w4); }
+
+    var ffd = r_open("/rr/x", 0);                                 # a file fd still locks
+    var fl = r_flock(ffd, 2);
+    var fu = r_flock(ffd, 8);
+    r_close(ffd);
+    if (ffd >= 0 && fl == 0 && fu == 0) { r_ok("RNREP-FLOCK-FILE-OK"); }
+    else { r_fail("FLOCK-FILE", fl); }
+    var cf = r_flock(1, 2);                                       # the console fd: still not lockable
+    if (cf == 0 - 1) { r_ok("RNREP-FLOCK-CONSOLE-REFUSED-OK"); }
+    else { r_fail("FLOCK-CONSOLE", cf); }
+    return 0;
+}
+
+fn main(): i64 {
+    r_out("RNREP-ALIVE"); r_nl();
+    ph_s();
+    ph_o();
+    ph_r();
+    ph_l();
+    r_sync();
+    r_out("RNREP-DONE"); r_kv("pass", R_PASS); r_kv("fail", R_FAIL); r_nl();
+    return 0;
+}
+
+fn _entry(): i64 { var rc = main(); syscall(0, rc, 0, 0, 0); return 0; }
+_entry();

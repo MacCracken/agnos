@@ -1,0 +1,17 @@
+[package]
+name = "epw"
+version = "0.1.0"
+description = "agnos 1.57.17 blocking epoll_wait#21 (issue 2026-10-31-tcp-send-keeps-one-segment-in-flight, fix 2): the EPW_TIMED timeout, op-3 SET watches on TCP conn / listener ids, EPOLLOUT woken by the ACK that clears the held segment, EPOLLIN by RX / a listener's child / FIN / RST, timerfd deadlines, signal wakes (signalfd, -4, blocked), 128 watches, bulk rates (#109 + EPOLLOUT vs #48 vs #109 + #44) and a bystander's echo beside a client that reads nothing. Seeded as /bin/agnsh AND /bin/epw by scripts/smoke/epoll-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.7.18"
+
+[build]
+entry = "epw.cyr"
+output = "build/epw"
+
+# AGNOS ONLY — build with `cyrius build --agnos epw.cyr <out>`.
+[deps]
+# The FULL closure, transitives included: string and args -> alloc; alloc -> atomic, fnptr, poison (6.6.18+).
+stdlib = ["syscalls", "string", "args", "alloc", "atomic", "fnptr", "poison"]

@@ -20,6 +20,189 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.17] — 2026-11-04 — repairs: ext2 rename-replace, a terminal's window size, closed-state RST, epoll that waits, the ZFS full lane
+
+The repair minor's consumer cut (operator, 2026-11-04: "include the other items filed in docs/development/issues/ as
+1.57.17"): the five open filings — two ext2 rename-replace consumers (hapi, descent), a terminal channel's window size
+(puka / darshana / bannermanor), and two TCP items (agora) — plus the 1.57.16 sweep's ZFS `full`-lane red. Five tracks,
+each in its own worktree, merged and read together. Operator rulings (2026-11-04): the TCP send issue takes **fix 2
+only** (a readiness wait; the send window stays a later item); the window size is **two `#97` ops** (no new syscall
+number); **`flock#59` on a directory fd** is included. No syscall number minted (the next free is **#112**). **Built,
+gated, NOT burned.**
+
+### Added — ext2 `rename#31` replaces an existing destination, crash-atomic; `flock#59` on a directory fd
+
+- **`rename#31` on ext2 REPLACES an existing destination** (issues `2026-10-28-ext2-rename-cannot-replace-an-existing-file`,
+  hapi, and `2026-11-02-ext2-rename-cannot-replace-loses-every-descent-save`, descent — every save after a character's
+  first was lost). ext2's metadata writes are synchronous and its journal is inert (`ext2_write_at_journaled` has no
+  callers), so the write ORDER is the crash safety; the commit point is one directory entry rewritten in place (Linux
+  `ext2_set_link`):
+  - file over file: source links +1 → commit → remove the source entry → source −1 → drop the victim's link (FreeBSD
+    `ufs_rename`'s order: a count may be high across a cut, never low);
+  - directory over an EMPTY directory (allowed): the old name first → commit → fix `..` → source parent −1 → victim to
+    0 links (e2fsck pass 2 keeps the first parent entry it meets, so a destination-first order lets a repair delete
+    the destination — measured);
+  - refused with −1 and nothing changed: a directory over a non-directory, a non-directory over a directory, a directory
+    over a non-empty directory, `.` / `..` as either name, a directory into its own subtree, a 33rd pending orphan. Two
+    names of one inode: 0, a no-op (POSIX).
+- **An inode an fd still holds is freed at its LAST close** (unlink#30, rmdir#10 and a replaced destination): links 0 and
+  dtime 0 on disk, an in-core orphan (32 slots; Linux ext2's evict model — no on-disk orphan list), reaped from
+  `vfs_close_inner` and process teardown; "held" is a scan of every fd table (`pipe_buf_referenced`'s rule).
+- **`flock#59` takes an `AO_DIRECTORY` fd**, keyed by the directory's inode as a file's is (Linux / BSD).
+- `EXT2_RNCUT_SELFTEST` (build flag) and `scripts/smoke/ext2-rename-replace-smoke.sh`: **21 crash-cut boots** (file over
+  file in one directory, across directories, directory over an empty directory; cuts 0–5 and the whole op), each held
+  to "the destination names the old inode or the new one, byte for byte" BEFORE and AFTER `e2fsck -fy` (`-fn` clean
+  after the repair; the new inode's link count never below its names), then `tests/rnrep` in ring 3 at `-smp 1` and
+  `-smp 4` (the staging pattern ×20, an open fd still reading the replaced file, the refusal matrix, flock on a
+  directory fd): **239 passed, 0 failed, 0 VOID**. EXT2_WRITE_SELFTEST's Wren arm (c) is now the replace, and a
+  refusal-matrix arm keeps the name "Wren refuse". Design + invariants:
+  [`docs/architecture/ext2-rename-replace-and-orphans.md`](docs/architecture/ext2-rename-replace-and-orphans.md).
+- Consumers, from scratch copies: descent's `SCENARIO=persist scripts/agnos-qemu-smoke.sh` **3/3 PASS** (no stranded
+  `.cyml.tmp`, fsck clean); hapi's `tests/agnos.tcyr` **100/100** with hapi's one-line `AO_DIRECTORY` lock-open fix (93/100
+  as hapi stands — its half, filed: `hapi/docs/development/issues/2026-11-04-agnos-rename-replaces-flock-takes-a-dir-fd.md`).
+
+### Added — a terminal channel carries its window size (`#97` ops 0x06 / 0x07)
+
+- **`CH_WINSZ_SET` = op 0x06 (caps bit 6, 0x40)**, `(fd, w)` with `w = (xpix<<48)|(ypix<<32)|(cols<<16)|rows`, cols /
+  rows 1..65535, from the emulator's OWN end (before or after `CH_ENDOW`, as TIOCSWINSZ on a master works before the
+  slave opens); the size lands on its terminal peer. 0, or −5 BADFD (not a channel fd; not the caller's own end; the
+  caller's end is the terminal; the peer is neither a terminal nor the caller's — a display client cannot size the
+  compositor's end), −6 ARG (cols or rows 0), −9 PEERGONE. **`CH_WINSZ_GET` = op 0x07 (caps bit 7, 0x80)**, `(fd, sel)`:
+  sel 0 → `(cols<<16)|rows` (winsize#60's packing), sel 1 → `(xpix<<16)|ypix` (0 when none was given); **−1 for any fd
+  that is not a usable terminal end** (display channel, inert copy, the emulator's end, non-channel, closed) or before
+  any SET — the ring-3 answer to "is this fd a terminal", as a failing TIOCGWINSZ is on Linux; any other sel −6.
+  `CH_OP_SUPPORTED` 0x3F → 0xFF. `winsize`#60 and `fd_kind`#111 unchanged.
+  (Issue `2026-10-30-a-terminal-channel-has-no-window-size`.)
+- **A CHANGED size posts SIGWINCH 28 to the terminal's watching holders only** — the 1.57.13 console rule (a bit-28
+  signalfd; watchers only), narrowed to processes whose own fd `chan_auth_as` authorizes for that end (the owner and its
+  PTY descendants; an inert inherited copy does not count). The whole word is compared, so a pixel-only change also
+  posts (Linux `tty_do_resize` compares the whole struct); an unchanged size is silent. Compare, store and post are one
+  `sched_lock` hold; GET is lock-free (one aligned word). A holder blocked in `epoll_wait`#21 is woken by the post
+  (`ep_sig_locked`, the merge's join of the two tracks).
+- `chan_auth(base)` is now `chan_auth_as(base, cur)` plus a wrapper for the current process (behaviour unchanged).
+  `scripts/smoke/pty-winsize-smoke.sh` (`tests/chan/ptyws` as `/bin/agnsh`, plain kernel, `-smp 1` + `-smp 4`): **42 passed, 0 failed** (21 per boot, `PTYW-DONE pass=15 fail=0`), including a holder
+  blocked in a 5 s `epoll_wait` on its signalfd woken by a resize in 995 µs (`-smp 1`) / 298 µs (`-smp 4`) — 5,000,956 µs,
+  its deadline, with the merge's `ep_sig_locked` call removed — and an unchanged-size SET leaving a 300 ms wait to run out.
+  cyrius peer (the `ChanOp` members, `sys_chan_winsz_set` / `sys_chan_winsz` / `sys_chan_winsz_px`): filed,
+  `cyrius/docs/development/issues/2026-11-04-agnos-chan-winsz-ops-peer.md`.
+
+### Added — `epoll_wait`#21 waits, and watches TCP connections and listeners with `EPOLLOUT`
+
+- **`epoll_wait(epfd, events, max | EPW_TIMED, timeout_ms)`**: `EPW_TIMED` = bit 32 of `max` (0x100000000); a4 is read
+  only with it (> 0 ms, clamped to 0x7FFFFFFF, never early; < 0 forever; 0 polls). Without the bit #21 is the old poll,
+  byte for byte (opt-in because a 3-arg call leaves a stale r10 in a4 — #55's precedent). Bits above 32 reserved (−1);
+  a timed call with max 0 → −1; the `max` clamp 16 → 128. Returns n ≥ 1, 0 on timeout, **−4** when a signal was posted
+  during the wait, nothing is ready and the signal is neither blocked by #17 nor SIGCONT, −1 for bad args; a signal a
+  watched signalfd covers returns that record instead; SIGKILL never returns; SIGSTOP / SIGCONT resume with the same
+  deadline. A canonical C9 wait ([`blocking-waits.md`](docs/architecture/blocking-waits.md) § epoll_wait, wait key
+  `WK_EPOLL`): one `net_poll` per pass, the scan, EINTR / deadline, arm (deadline = min(caller's, earliest timerfd)),
+  a side-effect-free re-scan, then sleep; lost-wakeup safe (an `ep_waiters` pid-mask gate set before the first scan).
+- **`epoll_ctl`#20 op 3 = SET**, `(epfd, 3, target, events)`: `EPOLLIN` 0x1, `EPOLLOUT` 0x4, `EPOLLRDHUP` 0x2000
+  (`EPOLLERR` 0x8 and `EPOLLHUP` 0x10 always reported); 0 deletes (−1 if nothing named the target); it upserts (replaces
+  every watch of the target). target = a VFS fd 0..31 (signalfd, timerfd, VFS_SOCK) or **`EP_TCP` (0x10000) | a TCP
+  connection / listener id 0..7** the caller owns — accepted connections and listeners (raw ids from #57) were not
+  epoll-able at all. The watch limit 8 → **128**. Readiness: `EPOLLOUT` = ESTABLISHED / CLOSE_WAIT with no held
+  segment; `EPOLLIN` = bytes queued or EOF; `EPOLLRDHUP` = CLOSE_WAIT; `IN|ERR|HUP` = the connection died while still the
+  caller's; a listener is `EPOLLIN` when #57 would return a connection (`tcp_accept_find_locked`, the predicate #57 uses).
+- Wake sources: the ACK that clears a held segment, data, FIN, RST, the retransmit timer's give-up (`ep_wake_tcp` after
+  `tcp_tab_lock`, `wq_wake_anybit` — only the touched slot's waiters), and every ordinary signal post (kill#16, SIGCONT,
+  SIGWINCH from the console and from a terminal channel, SIGCHLD).
+- **Measured** (`tests/epoll`, 512 KB, one process): at `-smp 4` (KVM) `#109` no-wait + an `EPOLLOUT` wait **4,363 KB/s**
+  against **135 KB/s** for the `#109` + `#44` yield shape agora uses today, and 7,682 KB/s for a blocking `#48`; a
+  bystander's worst steady-state echo 1 ms. (Issue `2026-10-31-tcp-send-keeps-one-segment-in-flight`, fix 2; the send
+  window — several segments in flight — stays a later item.) `scripts/smoke/epoll-smoke.sh`: **126 passed, 0 failed**
+  (63 at `-smp 1`, 63 at `-smp 4`): a 200 ms wait returns in 205–207 ms; a 1 s timerfd ends a 3 s wait at ~1.0 s;
+  signals −4 / the signalfd record / a blocked signal runs its full wait / SIGKILL of a BLOCKED waiter reaped in
+  < 2.2 ms; RX / FIN / RST wakes ~300 ms after the host acted. cyrius peer (constants, a 4-arg `sys_epoll_wait` that sets
+  `EPW_TIMED`, `sys_epoll_set`, the tagged-fd ↔ `EP_TCP` mapping): filed,
+  `cyrius/docs/development/issues/2026-11-04-agnos-epoll-timeout-epollout-tcp-ids-peer.md`.
+
+### Fixed — a segment for no connection gets a RST (RFC 9293 § 3.10.7.1 / .2)
+
+- **A TCP segment that matches no connection and is not itself a RST is answered with ONE RST** (issue
+  `2026-10-31-a-segment-for-no-connection-gets-no-rst`, agora): ACK on → `<SEQ=SEG.ACK><CTL=RST>`; ACK off →
+  `<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>`, SYN and FIN counting one each. `net_handle_tcp_locked`'s no-match branch:
+  a RST returns at once; no listener on the port → reset; a listener + ACK → reset (§ 3.10.7.2); a listener with neither
+  SYN nor ACK → drop; a pure SYN → the passive open, as before; a claim refused because of a LOOPBACK-class listener →
+  RST|ACK; a capacity refusal → a silent drop, as before. Linux `tcp_rcv_state_process` / FreeBSD `tcp_dropwithreset`
+  shapes; no reset to a source in 0/8, ≥ 224 or the subnet's directed broadcast (FreeBSD). Sent only behind the existing
+  destination gate (127/8 and net_ip — the 1.56.52 broadcast-amplifier fix stands), 54 B (never larger than its cause),
+  never in reply to a RST, from the segment's own addresses and ports into `net_pkt` with NO slot (`tcp_rst_noconn`, the
+  SYN-ACK path's lock chain `tcp_tab < net_tx < lo_q`). No rate limit (the reply is 1:1, so it amplifies nothing).
+- **Measured** (`scripts/smoke/tcp-rst-smoke.sh`, `-smp 1` and `-smp 4`, **18 / 18**): a connect through a hostfwd to a
+  guest port with no listener ends in **0.01 s** (86.04 s in the issue); a released 4-tuple's half-open peer is reset
+  5.0–5.5 s after its first send (SLIRP's zero-window persist probe — the held FIN slot advertises window 0). agora's
+  harness (agora 1.13.2, 8/8): `dropped: … (EOF)`, where it read `(no EOF)`. A #47 connect to a local port with no
+  listener, or to a LOOPBACK listener at net_ip, now returns −1 at once instead of after its 8 s ceiling.
+- **Fixed with it:** a SYN|RST to a listener no longer opens a child and draws a SYN-ACK.
+- TCP_ADDR_SELFTEST arms **R1–R8** (an ACK to an unused 4-tuple leaves exactly one RST with the right SEQ; a non-ACK
+  segment gets RST|ACK with ACK = SEG.SEQ + SEG.LEN; a RST, a broadcast and a foreign destination leave nothing; …) —
+  `sock-owner-smoke` **105/105**. TCP_SELFTEST mutes the reset for its fake-peer arms (`tcp_rst_mute`, present only in
+  TCP_SELFTEST images; `tcp-smoke` 66/66); TCP_ADDR_SELFTEST discards its fake clients' SYN-ACKs (`ta_lo_flush`).
+- **Two fixtures re-derived** — they used a closed LOCAL port as a peer that never answers, which the reset removes
+  ([`socket-ownership-and-loopback.md`](docs/architecture/socket-ownership-and-loopback.md) invariant 12: loopback can no
+  longer model a silent peer): `sock-wait` N6 (`SOCKW-DIAL-DEADLINE-LO` / `-IP`) and `lifecycle` NETBLOCKED now own the
+  whole 8-slot table — 2 listeners + 2 loopback pairs = 6 used, the free count MEASURED (`free == reserve + 1 == 2`,
+  `used + free == 8`, failing by name otherwise), so the dialler's SYN meets the passive reserve's silent drop and #47
+  blocks to its own deadline (8.00–8.01 s). `sock-wait` **70/70**, `lifecycle` **181/181** at `-smp 1` and `-smp 4`; each
+  reverted to the closed-port peer goes red (`DIAL-DEADLINE-LO exit=2`; `never_blocked v=8`).
+
+### Fixed — the ZFS write smoke's `full` / `full@pre` lanes no longer depend on the fixture build
+
+- The lanes passed or failed with the OpenZFS fixture BUILD: B5's fill stops at the first 128 KiB block that does not
+  fit, so it leaves −24,576 … +118,784 B of room across builds, and the rename after it was refused at the slop on
+  `r8-3daae94469aa` (the 1.57.16 sweep's row 8 red; the 1.57.14 kernel fails identically there). The op list now GIVES
+  BACK two records (`fill-5.bin` −262,144 B, a netfree truncation that commits at the slop), and the rename runs after
+  the rmdir's publish releases them: room 253,952 – 360,448 B on three builds against its 4,096 B charge, and below zero
+  on every build without the release, so the lane still proves k.125 (design **k.137**, with amendment notes on k.64 /
+  k.125 / § h B5 / § i.5 B11; [`zfs.md`](docs/architecture/zfs.md)). New: the writer's
+  `zfs-wtest: room after txg T: R B (room X - allocated Y, deferred Z)` line (`zfs_wt_room`, ZFS_WRITE_OPS only) and
+  `zfs-room-check.py --fit` (FIT: room − allocated ≥ the op's charge; RELEASE: the op would NOT fit without the named
+  free; WRITER: every room line equals the model replayed from the image) and the smoke's `--fit`. `full@pre` carries
+  `full`'s wants (it had none of the namespace ones), `--room` and `--fit`; `full`'s list 19 → 20 ops, 27 → 28 txgs.
+  Proven (`ZWS_LANES="full full@pre"`), both lanes green with OpenZFS verify 37/37 each on three builds (the cached
+  `r8-3daae94469aa`, a rebuild with cyrius 6.7.9's payload `r8-ba5c6ddb797f`, a second build of the current key); the
+  1.57.16 list is red on the first and green on the second. ZFS_WRITE_OPS image +560 B; the plain image unchanged.
+  (Issue `2026-11-04-zfs-write-full-lane-rename-depends-on-the-fixture-build`.)
+
+### Fixed — found along the way
+
+- **ext2 `unlink#30` / `rmdir#10` freed an inode an open fd still held**, so once the number was reused the old fd read
+  zeros or another file's bytes (measured: a new file took inode 18 and the old fd read its contents). Now freed at the
+  last close (above).
+- **ext2 `rename` of a `/d/.` source unlinked `d`'s own `.` entry.** `.` / `..` are refused as either name.
+
+### Gates
+
+- New sweep rows: `ext2-rename-replace-smoke`, `pty-winsize-smoke`, `epoll-smoke` (group `hostport`) and
+  `tcp-rst-smoke` (group `hostport`) — `grep -c '^run_gate "' scripts/sweep.sh` 74 → **78**. Widened: `ext2-write-smoke`
+  (Wren replace + its host check), `sock-owner-smoke` (TCP_ADDR_SELFTEST R1–R8), the ZFS write row (`--fit`).
+- `check.sh` 40 gates (none added). Each track ran its own smokes at `-smp 1` and `-smp 4`, `check.sh` (40/40 on each
+  track's tree), `KTEST=1 ktest.sh` (380 / 0, 13/13 boot self-tests) and `agnsh-smoke`, with mutation proofs. The
+  array-sizing gate (`no function-local array overruns`) caught three local-array overruns in the tracks' own new code
+  (`var cb[2]` for a 16-B block; a 1-B and an 8-B overrun) before the merge.
+- **Image** (merged tree, cyrius 6.7.18): plain **2,686,368 B** (+22,024 vs 1.57.16's 2,664,344: ext2 rename-replace +
+  orphans, the epoll wait, the RST builder, the window-size ops), LOAD end `0x39fc40`, **394,176 B** under gate 34's
+  `0x400000`; aarch64 640,480 B (+280), 0 placeholders.
+- **The merge's one join:** a terminal channel's SIGWINCH (T2's `chan_winch_post_locked`) set the pending bit without
+  T4's `ep_sig_locked`, so a holder blocked in `epoll_wait` slept through a resize to its own deadline; it now wakes it
+  and `chan_winsz_set` kicks the woken CPUs after its unlock (proven: `pty-winsize-smoke` above).
+
+### Closeout
+
+- **The full sweep, once, on the merged tree (cyrius 6.7.18, 2026-11-04/05):** `sweep.sh` **78/78** (`SWEEP_JOBS=4`,
+  wall **5,298 s**: the parallel phase 5,184 s, then the exclusive `tsc` 74 s and `kvm-net-boot` 38 s). **0 serial
+  retries, no KNOWN RED mark, no row re-run.** Row 1 `baseline check.sh`: `check.sh` **40/40** (the `syscall ABI` gate
+  green against the pin). The ZFS write row **5,179 s, 21/21 lanes, OpenZFS 12/12** — on `r8-3daae94469aa`, the very
+  fixture build whose `full` / `full@pre` lanes were red at 1.57.16. The four new rows: `tcp-rst` 63 s, `epoll` 62 s,
+  `pty-winsize` 46 s, `ext2-rename-replace` 322 s; the two re-derived fixtures' rows green (`sock-wait` 276 s,
+  `lifecycle` 474 s). Firmware VOIDs (`gnoboot: fail @ EBS`, the kernel never ran) were relaunched inside 15 rows, each
+  of which then passed. After the sweep: `test.sh --all` **8/8**. Before it: all 161 flag builds (0 refusals, 0 compiler
+  warnings), aarch64 0 placeholders.
+- `sweep.sh`'s worker copies now exclude `/.claude/` — the five tracks' worktrees (8.8 GB) would otherwise be copied into
+  every worker.
+- **Dead-code audit: waived** — the operator's standing rule *grow before refactor* (2026-10-11) stands.
+
 ## [1.57.16] — 2026-11-04 — the toolchain step: cyrius 6.7.18, kashi 1.3.0, rekha 1.1.2, klug 0.3.2
 
 The second toolchain cut of the step (1.57.15 took cyrius 6.7.9): the pin moves to **cyrius 6.7.18** and the siblings to
@@ -100,7 +283,17 @@ gated, NOT burned.**
 
 ### Closeout
 
-- S16-PENDING
+- **The full sweep, on cyrius 6.7.18 — STOPPED by the operator at ~2 h 0 min (2026-11-04, after 1.57.16 shipped):**
+  `sweep.sh` (`SWEEP_JOBS=4`) **71 of 74 rows PASS · 1 FAIL · 2 not run.** Row 1 `baseline check.sh`: `check.sh`
+  **40/40** — the `syscall ABI` gate green against the pinned lib, no KNOWN RED mark. **Row 8 (ZFS write) FAIL:** its
+  first attempt scored **19/21 lanes** (rw lanes verified by OpenZFS 10/12) — `full` and `full@pre` red on a `rename`
+  refused at the slop; its serial retry had passed 12 lanes when the row's 7,200 s ceiling ended it. **The red is not
+  the toolchain's:** the 1.57.14 kernel (cyrius 6.6.20, which passed this row 21/21) fails the `full` lane identically on
+  the same fixture — the sweep rebuilt every OpenZFS fixture pool (a new `zfsx` → a new cache key), and the lane's
+  margin at the slop depends on the fixture build
+  ([`issues/archived/2026-11-04-zfs-write-full-lane-rename-depends-on-the-fixture-build.md`](docs/development/issues/archived/2026-11-04-zfs-write-full-lane-rename-depends-on-the-fixture-build.md),
+  fixed at 1.57.17). The two exclusive rows (`tsc`, `kvm-net-boot`) were stopped before they finished. Firmware VOIDs
+  relaunched inside 13 rows. Before the sweep: the plain, aarch64 and all 160 flag builds, `agnsh-smoke` PASS.
 - **Dead-code audit: waived** — the operator's standing rule *grow before refactor* (2026-10-11) stands.
 
 ## [1.57.15] — 2026-11-04 — the toolchain step: cyrius 6.7.9, kashi 1.2.0, rekha 1.1.0, klug 0.3.0

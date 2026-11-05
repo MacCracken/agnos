@@ -26,18 +26,18 @@
 
 #ifdef ARCH_X86_64
 fn print_agnos_kernel_banner() {
-    kprintln("AGNOS kernel v1.57.16", 21);
+    kprintln("AGNOS kernel v1.57.17", 21);
 }
 #endif
 
 #ifdef ARCH_AARCH64
 fn print_agnos_kernel_banner() {
-    serial_println("AGNOS kernel v1.57.16 [aarch64]", 31);
+    serial_println("AGNOS kernel v1.57.17 [aarch64]", 31);
 }
 #endif
 
 fn print_agnos_shell_banner() {
-    kprintln("AGNOS shell v1.57.16 (type 'help')", 34);
+    kprintln("AGNOS shell v1.57.17 (type 'help')", 34);
 }
 
 # Program-body-safe version accessor. Returns a pointer to the NUL-terminated
@@ -47,7 +47,7 @@ fn print_agnos_shell_banner() {
 # Callers strlen() the result. Used by uname#34's release field
 # (core/syscall.cyr) and the TCP_LISTEN_SMOKE HTTP banner.
 fn agnos_version_str() {
-    return "1.57.16";
+    return "1.57.17";
 }
 
 # ⛔ 1.57.14 — no `var _AGNOS_VERSION = "…";` here any more. That gvar was the

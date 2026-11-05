@@ -25,6 +25,9 @@ output = "build/chantest"
 #                 neither of which the boot selftest can reach: region reachability from a SPAWNED
 #                 CLIENT'S CR3, and an INHERITED channel fd being inert in a real spawned child.
 #                 Build with `cyrius build --agnos chanx.cyr build/chanx`.
+#   ptyws.cyr     AGNOS ONLY (1.57.17) — a terminal channel's window size (#97 CH_WINSZ_SET / CH_WINSZ_GET) and
+#                 SIGWINCH to the terminal's watching holders; seeded as /bin/agnsh by scripts/smoke/pty-winsize-smoke.sh.
+#                 (ptyhost.cyr / ptyx.cyr are the ipc bite-9 PTY host and child, also AGNOS only.)
 [deps]
 # ⚠ 1.57.2: `result`, `atomic` and `fnptr` are pulled TRANSITIVELY (io -> result; alloc -> atomic, fnptr)
 # and `cyrius lib sync` copies only what is DECLARED — undeclared, they were vendored-by-accident and

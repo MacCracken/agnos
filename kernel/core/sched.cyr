@@ -1492,6 +1492,74 @@ fn wq_wake_m(key, msk) {
     kbd_irq_restore(ww_f);
     return ww_n;
 }
+# ⭐ 1.57.17 — wq_wake_anybit(cls, bits): wake every proc BLOCKED on a key of CLASS `cls` (the high byte) whose low bits
+# share ANY bit with `bits` — the "any overlap" match wq_wake_m's equality cannot express. epoll_wait#21's WK_EPOLL wait
+# carries the TCP slots it watches as a bit set (bits 0..7), so one TCP event wakes exactly the waiters that watch that
+# slot (Linux ep_poll_callback reaches only the epitems on THAT file's wait queue; FreeBSD KNOTE walks only the
+# object's knote list). `bits` must not reach the class byte. Same lock, IRQ-save and kick rules as wq_wake_m (the
+# woken mask is a LOCAL, kicked after the unlock and before the IF restore).
+fn wq_wake_anybit(wb_cls, wb_bits) {
+    var wb_f = kbd_irq_save();
+    sched_spin_lock();
+    var wb_n = 0;
+    var wb_m = 0;
+    var wb_i = 0;
+    while (wb_i < proc_count) {
+        var wb_k = load64(&proc_wait_key + wb_i * 8);
+        if ((wb_k & 0xFF00000000000000) == wb_cls) {
+            if ((wb_k & wb_bits) != 0) {
+                if (load64(&proc_table + wb_i * 176 + 8) == 6) {
+                    wq_wake_one_locked(wb_i, 1);       # WR_EVENT
+                    wb_n = wb_n + 1;
+                    wb_m = wb_m | (1 << wb_i);
+                }
+            }
+        }
+        wb_i = wb_i + 1;
+    }
+    sched_spin_unlock();
+    sched_kick_mask(wb_m, 0);
+    kbd_irq_restore(wb_f);
+    return wb_n;
+}
+
+# ⭐ 1.57.17 — THE epoll_wait#21 WAKE SOURCES (docs/architecture/blocking-waits.md § epoll_wait; the wait is ep_wait,
+# syscall.cyr). A blocking epoll_wait arms WK_EPOLL | <the TCP slots it watches> and is made READY by:
+#   a TCP event on a watched slot   ep_wake_tcp (net_handle_tcp after its unlock; tcp_retx_tick's exhaustion mask)
+#   a signal posted to the waiter   ep_sig_locked (every ordinary-signal post, under sched_lock)
+#   a timerfd it watches coming due its deadline (the earliest next_fire among the watches)
+#   a lifecycle kill / stop          wq_interrupt_locked (WR_SIGNAL, as every canonical wait)
+#   ep_waiters  pid bit set while that pid is inside a BLOCKING epoll_wait (lock or at entry, lock and at exit): the
+#               TCP gate only — a stale bit costs one empty wq_wake_anybit scan, never a missed wake.
+#   ep_signew   per pid: the signals POSTED to it since its blocking epoll_wait began (the waiter zeroes it at entry
+#               and tests it for the EINTR answer). No scrub at proc_alloc_slot: every wait zeroes it first.
+var ep_waiters = 0;
+var ep_signew[16];
+# TCP slots whose epoll readiness may have RISEN (data queued, a FIN or a RST, the held segment ACKed, a passive child
+# ESTABLISHED -> its LISTENER, retransmit exhaustion). Called AFTER tcp_unlock, whose xchg is a full fence: the
+# condition stores are visible before the gate load below. The waiter sets its ep_waiters bit (lock or, a full fence)
+# BEFORE its first scan, so either its scan sees the condition or this load sees its bit (the Dekker pair), and
+# wq_wake_anybit's sched_lock then orders against the waiter's arm (the canonical C9 proof).
+fn ep_wake_tcp(et_m) {
+    if (et_m == 0) { return 0; }
+    if (ep_waiters == 0) { return 0; }
+    return wq_wake_anybit(WK_EPOLL, et_m & 0xFF);
+}
+# Signal `sig` was just posted to `t` (its proc_signals bit is set). CALLER HOLDS sched_lock — every post site does:
+# kill#16's proc_sig_locked, SIGCONT's proc_cont_locked, console_winch_post (SIGWINCH), a terminal channel's SIGWINCH in
+# syscall.cyr chan_winch_post_locked (1.57.17 merge), SIGCHLD in proc_death_finish.
+# Records it for the EINTR test and, when t is BLOCKED in epoll_wait, makes it READY with WR_EVENT (an ordinary signal
+# is not a lifecycle interrupt: the wait re-scans — a watched signalfd now reports — and answers -4 only when nothing
+# is ready and the signal is not blocked by sigprocmask#17). 1 = woke t: the caller kicks t's CPU after its unlock.
+fn ep_sig_locked(t, sig) {
+    if (t < 0) { return 0; }
+    if (t >= 16) { return 0; }
+    atomic_or64(&ep_signew + t * 8, 1 << sig);
+    if (load64(&proc_table + t * 176 + 8) != 6) { return 0; }
+    if ((load64(&proc_wait_key + t * 8) & 0xFF00000000000000) != WK_EPOLL) { return 0; }
+    wq_wake_one_locked(t, 1);                          # WR_EVENT
+    return 1;
+}
 
 # Interrupt `p`'s wait (the lifecycle step's signal delivery): BLOCKED -> READY with WR_SIGNAL. 1 = it was
 # waiting, 0 = it was not. The _locked form is for a caller already holding sched_lock.
@@ -1647,6 +1715,7 @@ fn proc_cont_locked(t, lm) {
     lc_sp_set(t, 0);
     if (co_st == 5) { lc_st_set(t, 1); lm_or(lm, 8, t); lm_or(lm, 24, t); }
     atomic_or64(&proc_signals + t * 8, 1 << 18);                        # D3: 18 still sets its signalfd bit
+    if (ep_sig_locked(t, 18) == 1) { lm_or(lm, 8, t); }                 # 1.57.17: an epoll_wait#21 waiter re-scans
     return 0;
 }
 # A SIGKILL of a #37 waiter kills its foreground child (and that child's, while it waits too — chain <= 16).
@@ -1673,6 +1742,7 @@ fn proc_sig_locked(t, sig, lm, tree) {
     if (sig == SIG_STOP) { return proc_stop_locked(t, lm, tree); }
     if (sig == SIG_CONT) { return proc_cont_locked(t, lm); }
     atomic_or64(&proc_signals + t * 8, 1 << sig);                       # SIGTERM & co: a bit, no default action (D3)
+    if (ep_sig_locked(t, sig) == 1) { lm_or(lm, 8, t); }                # 1.57.17: ends an epoll_wait#21 (a signalfd, or -4)
     return 0;
 }
 
@@ -1695,8 +1765,9 @@ fn proc_sig_locked(t, sig, lm, tree) {
 # Posted through the existing atomic OR (D-4: vfs_read_signalfd clears one bit with `lock and`). sched_lock (the IF=0
 # innermost leaf, kbd_irq_save first like proc_signal_deliver) holds the liveness test against a death publish; the fd
 # tables are only READ (an 8-byte tag + an 8-byte mask per entry), so a racing close or open costs at most one stray or
-# one missed bit, never a fault. No wake: a pending bit wakes nobody (D3); a watcher polls its signalfd (epoll_wait#21
-# reports it readable). Returns how many processes got the bit (the TTY_SELFTEST knob prints it).
+# one missed bit, never a fault. A pending bit wakes nobody (D3) — except, since 1.57.17, a watcher BLOCKED in
+# epoll_wait#21 (ep_sig_locked: its re-scan reports the signalfd readable). Returns how many processes got the bit (the
+# TTY_SELFTEST knob prints it).
 fn proc_watches_sig(pid, sig) {
     var ws_t = vfs_fd_table_of(pid);
     var ws_fd = 0;
@@ -1711,6 +1782,7 @@ fn proc_watches_sig(pid, sig) {
 }
 fn console_winch_post() {
     var wp_n = 0;
+    var wp_k = 0;                                      # 1.57.17: the epoll_wait#21 waiters this post woke (kicked after the unlock)
     var wp_f = kbd_irq_save();
     sched_spin_lock();
     var wp_q = 0;
@@ -1719,6 +1791,7 @@ fn console_winch_post() {
             if (proc_is_user(wp_q) == 1) {
                 if (proc_watches_sig(wp_q, SIG_WINCH) == 1) {
                     atomic_or64(&proc_signals + wp_q * 8, 1 << SIG_WINCH);
+                    if (ep_sig_locked(wp_q, SIG_WINCH) == 1) { wp_k = wp_k | (1 << wp_q); }
                     wp_n = wp_n + 1;
                 }
             }
@@ -1726,6 +1799,7 @@ fn console_winch_post() {
         wp_q = wp_q + 1;
     }
     sched_spin_unlock();
+    sched_kick_mask(wp_k, 0);
     kbd_irq_restore(wp_f);
     return wp_n;
 }

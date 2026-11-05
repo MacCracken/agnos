@@ -1,7 +1,22 @@
 # 2026-10-28 — ext2 `rename#31` cannot replace an existing file, so ring 3 has no atomic way to rewrite one
 
-**Status:** 🟡 OPEN — the kernel already names the gap ("rename-replace is a follow-on bite",
-`kernel/core/ext2.cyr:3058-3061`); this file records the consumer it blocks.
+**Status:** ✅ RESOLVED in agnos **1.57.17** (track T1). Shipped: ext2 `rename#31` REPLACES an existing destination
+(`kernel/core/ext2.cyr` `ext2_rename_replace` + `ext2_dir_set_entry`), atomic with respect to a crash — the commit is
+ONE dirent rewritten in place to the new inode; a file's count is raised for the window and its old name removed
+after the commit, a directory's old name goes first (e2fsck pass 2 would otherwise clear the destination); the POSIX
+refusals (dir over non-dir, non-dir over dir, dir over a non-empty dir, `.`/`..`, into its own subtree) and the
+hard-link no-op. An fd open on the replaced (or unlinked, or rmdir'd) inode keeps it: in-core orphans freed at the last
+close (`ext2_inode_last_link` / `ext2_orphan_reap`, Linux ext2's evict model). And `flock#59` takes an `AO_DIRECTORY`
+fd (`kernel/core/syscall.cyr` #59, `vfs.cyr` close / teardown release). **Proven:** `scripts/smoke/ext2-rename-replace-smoke.sh`
+— 21 crash-cut boots (a file over a file in one dir / across dirs, a directory over an empty directory; cuts 0-5 + the
+whole op), each with the destination naming old-or-new before AND after `e2fsck -fy` and `e2fsck -fn` clean after;
+`tests/rnrep` ring 3 at `-smp 1` and `-smp 4` (20-generation staging loop, open-fd keeps the old bytes, the refusal
+matrix, dir-fd flock across processes), `e2fsck -fn` clean after; mutations M1-M4 each red. **hapi's own suite**
+(`tests/agnos.tcyr --agnos` booted as `/bin/agnsh` on the 1.57.17 kernel): 93/100 as hapi stands (manifest_write + fmt
+fail at the LOCK's open — hapi opens the directory `O_RDONLY`, the half this file assigns to hapi), **100/100** with
+`_hmw_lock` opening it `AO_DIRECTORY` — filed in the hapi repo as its issue `2026-11-04-agnos-rename-replaces-flock-takes-a-dir-fd`
+(with a note that its agnos `rename_noreplace` arm is check-then-act now that rename replaces).
+*(Was: 🟡 OPEN — the kernel already named the gap ("rename-replace is a follow-on bite", `kernel/core/ext2.cyr:3058-3061`).)*
 *(Filed from hapi **1.1.1**: its 2026-10-28 P(-1) audit, finding F-059, running hapi's agnos build on agnos 1.57.14
 booted in QEMU.)*
 **Checked against:** agnos **839e8d54** (1.57.14) — `ext2_rename` refuses when `ext2_dir_lookup(dst_parent,

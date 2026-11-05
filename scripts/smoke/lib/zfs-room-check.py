@@ -31,6 +31,21 @@
 #        log survives must agree with its plan line — the kernel's figures held to the image where the image still has
 #        them)
 # Exit 0 both hold · 1 one fails (named) · 2 unusable input
+#
+# --fit (agnos 1.57.17, design k.137): WHERE A NAMESPACE OP WAS ADMITTED NEAR THE SLOP, in the same model. The `full`
+# lane's rename after B5's fill passed or failed with the fixture build (the fill leaves anywhere in [-(one txg's
+# metadata), one block) of room, and OpenZFS's metadata allocation for identical content moves that by ~24 KB), so the
+# op list now GIVES BACK two records after the fill (a truncation: netfree) and admits the rename only after the
+# give-back's frees left the deferral window. This holds the construction to the space record:
+#   FIT      room(T - 1) - alloc(T - 1) >= B x COPIES   — the op admitted at txg T (its `begin txg=T` line: T - 1 the last
+#                                                         txg committed) had its charge left (zfs_wd_aroom's rule)
+#   RELEASE  U <= T - 3, and room(T - 1) - alloc(T - 1) - FREE(U) < B x COPIES — the give-back's txg U had left the window
+#                                                         [T - 2, T - 1] (k.125), and without its frees released the op
+#                                                         would NOT have fit: the release is what made the room
+#   WRITER   every `zfs-wtest: room after txg K: R B (room X - allocated Y, deferred Z)` line of LOG (core/zfs_write.cyr
+#            zfs_wt_room) == the model's state(K), R == X - Y, and one names K = T - 1 — the writer's own figures, not the
+#            host's guess, are what the op was admitted with
+# usage: zfs-room-check.py --fit START FINAL T B COPIES U [MSMAX] --log LOG
 import importlib.util, os, re, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -72,26 +87,24 @@ def plans_of(path):
     return out
 
 
-def main(argv):
-    log = None
-    if len(argv) >= 3 and argv[-2] == "--log":
-        log = argv[-1]
-        argv = argv[:-2]
-    if len(argv) not in (8, 9) or not all(os.path.isfile(a) for a in argv[1:3]) or (log and not os.path.isfile(log)):
-        print("usage: zfs-room-check.py START FINAL TF TL L B COPIES [MSMAX] [--log LOG]")
-        return 2
-    tf, tl, ln, blk, cp = (int(a) for a in argv[3:8])
-    msmax = int(argv[8]) if len(argv) == 9 else 0
+class Verdict(Exception):
+    """A verdict the model reached before any check: (exit code, the line to print)."""
+
+
+def model(start, final, log, msmax, tl):
+    """The space record START -> FINAL in the writer's rule (the header): (state, logs, t0, space, lg, synced) — state(t)
+    = (allocated, deferred, room) once txg t committed (t = T0: the mount), logs {txg: (ALLOC, FREE)} of every txg after
+    the mount (FINAL's logs; with LOG, the plan lines of the logs the writer destroyed, every surviving one held to its
+    plan line). tl: the last txg the caller reads. Raises Verdict."""
     wms = load("zfswms", "scripts/smoke/lib/zfs-wms-check.py")
     z = wms.load_lib()
     try:
-        sp = z.Pool(argv[1])
+        sp = z.Pool(start)
         t0, msh = sp.txg, sp.ms_shift
-        s_lines, f_lines = wms.replay(z, argv[1]), wms.replay(z, argv[2])
+        s_lines, f_lines = wms.replay(z, start), wms.replay(z, final)
         sms, _u, _l, _tz = sp.space_info(sp.mos())
     except (ValueError, KeyError, z.ToolError) as e:
-        print("room: unusable input: %s" % e)
-        return 2
+        raise Verdict(2, "room: unusable input: %s" % e)
     pool = [l for l in s_lines if l.startswith("zfs-wpool: ")][0]
     alloc0 = int(re.search(r" allocated=(\d+)", pool).group(1))
     slogs = logs_of(s_lines)
@@ -110,21 +123,15 @@ def main(argv):
         pl = plans_of(log)
         bad = [t for t in sorted(fl) if t > t0 and t in pl and pl[t] != fl[t]]
         if bad:
-            print("room: FAIL — txg %d's plan line (alloc, free) %s differs from its log space map on the image %s"
-                  % (bad[0], pl[bad[0]], fl[bad[0]]))
-            return 1
+            raise Verdict(1, "room: FAIL — txg %d's plan line (alloc, free) %s differs from its log space map on the image %s"
+                          % (bad[0], pl[bad[0]], fl[bad[0]]))
         # the ub-only commit (T0 + 1) has neither: it allocates and frees nothing
         gone = [t for t in range(t0 + 2, tl + 1) if t not in fl and t not in pl]
         if gone:
-            print("room: unusable input — txg(s) %s have neither a log on the image nor a plan line" % gone[:5])
-            return 2
+            raise Verdict(2, "room: unusable input — txg(s) %s have neither a log on the image nor a plan line" % gone[:5])
         for t in pl:
             if t > t0 and t not in fl:
                 fl[t] = pl[t]
-    missing = [t for t in range(tf, tl + 1) if t not in fl]
-    if missing:
-        print("room: FAIL — the final image has no log space map for the write's txg(s) %s" % missing[:5])
-        return 1
 
     alll = dict(slogs)
     alll.update(fl)
@@ -137,6 +144,31 @@ def main(argv):
         d = sum(f for u, (_a, f) in alll.items() if lo <= u <= t)
         room = min(space - slop(space, lg) - d, synced - d - MDRES)
         return a, d, room
+
+    return state, fl, t0, space, lg, synced
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "--fit":
+        return fit_main(argv)
+    log = None
+    if len(argv) >= 3 and argv[-2] == "--log":
+        log = argv[-1]
+        argv = argv[:-2]
+    if len(argv) not in (8, 9) or not all(os.path.isfile(a) for a in argv[1:3]) or (log and not os.path.isfile(log)):
+        print("usage: zfs-room-check.py START FINAL TF TL L B COPIES [MSMAX] [--log LOG]")
+        return 2
+    tf, tl, ln, blk, cp = (int(a) for a in argv[3:8])
+    msmax = int(argv[8]) if len(argv) == 9 else 0
+    try:
+        state, fl, t0, space, lg, synced = model(argv[1], argv[2], log, msmax, tl)
+    except Verdict as v:
+        print(v.args[1])
+        return v.args[0]
+    missing = [t for t in range(tf, tl + 1) if t not in fl]
+    if missing:
+        print("room: FAIL — the final image has no log space map for the write's txg(s) %s" % missing[:5])
+        return 1
 
     a0, d0, r0 = state(tf - 1)
     am, dm, rm = state(tl - 1)
@@ -158,6 +190,67 @@ def main(argv):
     print("room: %s — %d B in txgs %d..%d: at most the %d B its txgs had left as each opened (%d B at its start); %d B before its last txg (>= a block); then %d B left (< the refused block's %d B)"
           " — space %d, slop %d, synced %d, deferred %d -> %d, allocated %d -> %d"
           % (v, ln, tf, tl, upper, r0 - a0, rm - am, r1 - a1, blk, space, slop(space, lg), synced, d0, d1, a0, a1))
+    return 0 if not fails else 1
+
+
+ROOMLINE = re.compile(r"zfs-wtest: room after txg (\d+): (-?\d+) B \(room (-?\d+) - allocated (\d+), deferred (\d+)\)$")
+
+
+def fit_main(argv):
+    """--fit (the header): FIT, RELEASE and WRITER for the op admitted at txg T, against the give-back's txg U."""
+    log = None
+    if len(argv) >= 3 and argv[-2] == "--log":
+        log = argv[-1]
+        argv = argv[:-2]
+    if len(argv) not in (8, 9) or not log or not all(os.path.isfile(a) for a in (argv[2], argv[3], log)):
+        print("usage: zfs-room-check.py --fit START FINAL T B COPIES U [MSMAX] --log LOG")
+        return 2
+    t, blk, cp, u = (int(a) for a in argv[4:8])
+    msmax = int(argv[8]) if len(argv) == 9 else 0
+    need = blk * cp
+    try:
+        state, fl, t0, _space, _lg, _synced = model(argv[2], argv[3], log, msmax, t - 1)
+    except Verdict as v:
+        print(v.args[1])
+        return v.args[0]
+    if not t0 + 1 < u < t or u not in fl:
+        print("room: unusable input — the give-back's txg %d is not a committed txg between the mount (%d) and the op's %d"
+              % (u, t0, t))
+        return 2
+    a, d, room = state(t - 1)
+    left = room - a
+    fu = fl[u][1]
+    fails = []
+    if left < need:
+        fails.append("FIT: the op admitted at txg %d had %d B left (room %d - allocated %d, deferred %d), less than its "
+                     "%d B charge — the writer admitted it past the room" % (t, left, room, a, d, need))
+    if u > t - 3:
+        fails.append("RELEASE: the give-back's txg %d was still inside the deferral window [%d, %d] when txg %d was "
+                     "admitted — its frees were not back yet" % (u, t - 2, t - 1, t))
+    elif left - fu >= need:
+        fails.append("RELEASE: without the give-back's %d B (txg %d) released the op would still have had %d B — the "
+                     "release is not what made its room" % (fu, u, left - fu))
+    seen, wl = set(), []
+    with open(log, "rb") as fh:
+        for raw in fh.read().split(b"\n"):
+            m = ROOMLINE.search(raw.decode("ascii", "replace").strip("\r"))
+            if m:
+                wl.append(tuple(int(x) for x in m.groups()))
+    for k, r, x, y, z in wl:
+        sa, sd, sr = state(k)
+        seen.add(k)
+        if (r, x, y, z) != (sr - sa, sr, sa, sd):
+            fails.append("WRITER: the writer's room line after txg %d says %d B (room %d - allocated %d, deferred %d), the "
+                         "space record says %d B (room %d - allocated %d, deferred %d)" % (k, r, x, y, z, sr - sa, sr, sa, sd))
+    if t - 1 not in seen:
+        fails.append("WRITER: no `zfs-wtest: room after txg %d` line — the room the op was admitted with is not the "
+                     "writer's own figure" % (t - 1))
+    for f in fails:
+        print("room:   FAIL " + f)
+    v = "PASS" if not fails else "FAIL"
+    print("room: fit %s — the op of txg %d admitted with %d B left (room %d - allocated %d, deferred %d) for its %d B "
+          "charge; the give-back's %d B (txg %d) back by then, without them %d B; %d writer room line(s) held to the space "
+          "record" % (v, t, left, room, a, d, need, fu, u, left - fu, len(wl)))
     return 0 if not fails else 1
 
 

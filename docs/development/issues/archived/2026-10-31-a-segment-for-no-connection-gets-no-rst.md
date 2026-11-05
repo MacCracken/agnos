@@ -1,6 +1,33 @@
 # 2026-10-31 — A segment for a connection that does not exist gets no RST, so the peer never learns the connection is gone
 
-**Status:** 🟡 OPEN.
+**Status:** ✅ **RESOLVED in 1.57.17** (track T3, merged at 1.57.17). `kernel/core/net_tcp.cyr`:
+a new `tcp_rst_noconn` and `net_handle_tcp_locked`'s no-match path answer every segment that matches no connection and
+is not itself a RST with ONE RST, shaped per § 3.10.7.1 (ACK on `<SEQ=SEG.ACK><CTL=RST>`; ACK off
+`<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>`, SYN and FIN one each) — a SYN to a port with no listener, any segment for
+a 4-tuple agnos does not hold (a state-0 slot included), and § 3.10.7.2's LISTEN + ACK. A LISTEN segment with neither
+SYN nor ACK is dropped (§ 3.10.7.2); a SYN|RST no longer takes the passive open (it drew a SYN-ACK); a SYN a
+LOOPBACK-class listener refuses is reset (bind(127.0.0.1) semantics); a capacity refusal (table, SYN_RCVD cap, passive
+reserve) stays a silent drop. Only behind the destination gate (1.56.52 stands), never in reply to a RST, never to a
+source of 0/8, ≥ 224 or our subnet's directed broadcast, 54 B, no slot, sent under the SYN-ACK path's lock chain; no
+rate limit (1:1, never larger than its cause). **Proven:** TCP_ADDR_SELFTEST R1–R8 (`sock-owner-smoke.sh` boot A:
+SEQ/ACK/flags/ports/addresses/both sums of the queued reset, our own ingress accepting it, the wire path, the gate,
+the never-answer-a-RST cases, LISTEN, a dead slot, the LOOPBACK refusal, a loopback connect refused in one drain) and
+the new `scripts/smoke/tcp-rst-smoke.sh` through a QEMU hostfwd at -smp 1 and -smp 4: a connect to a guest port with
+no listener ends at once (**EOF after 0.01 s**, was 86.04 s); a half-open connection (the server's FIN_WAIT_2 slot
+released, the host still holding its end) is reset **5.0–5.5 s** after the host's first send — SLIRP's first segment
+is a zero-window probe on its 5 s persist timer, since the held FIN slot advertised window 0. agora's harness
+(agora 1.13.2, this tree's plain kernel): 8/8, `dropped: went quiet after 1927795 of the 12248600 B it asked for
+(EOF)` — `(no EOF)` before. Mutation proofs: no
+reset at all (the pre-fix shape) → R1/R1b/R1c/R2/R5–R8 FAIL and the smoke's closed port times out at 20 s, the
+half-open never learns; the FIN not counted in SEG.LEN → R2 FAIL (its two FIN cases only); the TCP checksum off by
+one → R1/R1b (our own ingress drops it), R2, R5–R8 FAIL and SLIRP ignores the reset (both smoke cases red). ⚠ The
+optional RST|ACK when the timer gives up a held FIN slot whose peer is alive was NOT done (it lives in
+`tcp_timer_scan_locked` and needs a "the peer ACKed" signal); the CLOSED-state reset covers agora's case once the peer
+sends. ⚠ `sock-wait-smoke` N6 and `lifecycle-smoke` NETBLOCKED used a closed LOCAL port as a peer that never answers
+— the behaviour this issue removes. Both now own the whole TCP table (two listeners + two loopback pairs = 6 of 8
+slots, the 2 free COUNTED and asserted against the table size and `TCP_PASSIVE_RESERVE`), so their dial's SYN meets
+the passive reserve's silent capacity drop (`sockw.cyr s_fullnet_up`, `lifex.cyr lx_fullnet_up`; sock-wait 70/70,
+lifecycle 181/181 at -smp 1 + -smp 4; reverting either to the closed-port peer is red again).
 *(Filed from agora **1.12.4**, from its `scripts/agnos-smoke.py` run of agora's agnos build on agnos 1.57.14 in QEMU
 (KVM, user networking). Both symptoms below were measured there; the cause is from reading the code.)*
 **Checked against:** agnos **bdc587d7** (1.57.14). In `kernel/core/net_tcp.cyr`, `net_handle_tcp_locked` returns 0

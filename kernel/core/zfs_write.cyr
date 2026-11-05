@@ -11037,7 +11037,30 @@ fn zfs_wt_b6(pool) {
 #              the metaslabs agnos allocates in are full (4 of wr's 15 have a space map; every txg defers ~0.27 MB for
 #              the boot): SHORT, refused by the write's predicate (ENOSPC, named) — never by a commit
 #   agnosfull  fill-5.bin extended by 4 MiB at ONE bitmap slot: SHORT at the slop (the in-flight predicate cuts the
-#              txgs, k.36), then 128 KiB more: REFUSED (ENOSPC)
+#              txgs, k.36), then 128 KiB more: REFUSED (ENOSPC) — then (1.57.17, design k.137) the GIVE-BACK: fill-5.bin
+#              truncated by two 128 KiB records (a free: netfree, as OpenZFS's dmu_free_long_range, so it commits at the
+#              slop), whose 256 KiB of user data return to the room once its txg + 2 is durable (k.125) — so the room
+#              B7's rename is admitted with is the list's construction, not what the fixture build's fill left over
+# The writer's room between two ops (1.57.17, design k.137): zfs_wroom less the pool's allocated bytes — what the next
+# user-data or namespace admission (zfs_wd_aroom) has before its own charge — as `zfs-wtest: room after txg T: R B (room
+# X - allocated Y, deferred Z)`. scripts/smoke/lib/zfs-room-check.py --fit holds every such line to OpenZFS's space
+# model replayed from the image (the writer's figures, not the host's guess).
+fn zfs_wt_room() {
+    if (zfs_rw != 1 || zfs_wmem == 0) { return 0; }
+    var x = zfs_wroom();
+    kprint("zfs-wtest: room after txg ", 26);
+    kprint_num(zfs_txg);
+    kprint(": ", 2);
+    kprint_num(x - zfs_w_alloc);
+    kprint(" B (room ", 9);
+    kprint_num(x);
+    kprint(" - allocated ", 13);
+    kprint_num(zfs_w_alloc);
+    kprint(", deferred ", 11);
+    kprint_num(zfs_w_defer);
+    kprintln(")", 1);
+    return 0;
+}
 fn zfs_wt_b5(pool) {
     if (memeq(pool, "agnos9", 7) == 1) {
         zfs_wt_w("/agnos9/dir20/e00", 3, 10, "b5/tiny", 1, 10);
@@ -11078,7 +11101,13 @@ fn zfs_wt_b5(pool) {
         zfs_wt_wb("/agnoswr/rs4k/r64k.bin", 8388608, 1048576, 250, "b5/exhaust", 0 - 2);
     } elif (memeq(pool, "agnosfull", 10) == 1) {
         var fr = zfs_wt_w("/agnosfull/fill-5.bin", 917504, 4194304, "b5/fill", 1, 0 - 2);
-        if (fr > 0) { zfs_wt_w("/agnosfull/fill-5.bin", 917504 + fr, 131072, "b5/fill", 1, 0 - 1); }
+        if (fr > 0) {
+            zfs_wt_w("/agnosfull/fill-5.bin", 917504 + fr, 131072, "b5/fill", 1, 0 - 1);
+            # (1.57.17, k.137) where the fill left the room: anywhere in [-(one txg's metadata), one block) — the fixture
+            # build's metadata allocation decides that, not the kernel — then the give-back, two records off the end
+            zfs_wt_room();
+            zfs_wt_t("/agnosfull/fill-5.bin", 917504 + fr - 262144, 0);
+        }
     }
     return 0;
 }
@@ -11304,7 +11333,8 @@ fn zfs_wt_fd(kind, a, b) {
 # rename after them refused, `no space: the pool is at its slop`, k.40), zfs_wt_b7 after them (agnos9's; agnostank's
 # unlinks of what B5 wrote — the truncation of gang/gang.bin to 1 MiB — which charge no space: a removal frees; and
 # agnosfull's, AFTER B5's fill took the pool to its slop: every txg before the fill deferred its frees for the boot (until B11's release, k.125), so
-# B7 ops there left the fill nothing — measured — and at the slop the removals still commit, the rename is refused):
+# B7 ops there left the fill nothing — measured — and at the slop the removals still commit; the rename was refused
+# there until B11, and commits since 1.57.17 only after B5's give-back came back, k.137):
 #   agnos9     D11: an fd across the unlink of b6/many/f03 and the create (r03) that reuses its number (first fit: a B6
 #              object, so no lower slot is free — measured: dir20/e06's 134 went to 24); unlink a B6 file
 #              (b6/many/f00), a FreeBSD file (dir20/e02), a B6 symlink (b6/link) — FreeBSD's `sym` stays: phase B's B-acl
@@ -11339,8 +11369,10 @@ fn zfs_wt_fd(kind, a, b) {
 #              blocks DEFERRED to free_bpobj with $FREE charged (design § e.2); unlink dnode/n00 (SA xattrs in a spill,
 #              a 2-slot dnode)
 #   agnosfull  (after B5's fill, at ONE bitmap slot) unlink b6/a.txt, rmdir b6e — netfree, as OpenZFS's zfs_remove /
-#              zfs_rmdir (dmu_tx_mark_netfree): they commit at the slop; REFUSED rename dir/s1.txt -> b6/s1.txt (`no
-#              space: the pool is at its slop` — a rename is not netfree)
+#              zfs_rmdir (dmu_tx_mark_netfree): they commit at the slop, and the rmdir's publish releases the frees of B5's
+#              give-back (two records); then rename dir/s1.txt -> b6/s1.txt — not netfree: its 512 B charge admitted with
+#              the room the give-back returned (k.137; refused at the slop until B11, and on a fixture build whose fill
+#              left less than a microzap block until 1.57.17)
 #   agnoslogs  unlink churn/c000-0 (a FreeBSD file on OpenZFS's many-logs pool), rmdir b6e
 # The lazy bound on a REAL object, in memory (B7, design k.10): a txg opened on path's dataset and the object's free
 # collected (zfs_wu_free) — it must answer "too big for one txg" with what it held at that point — then the txg
@@ -11478,8 +11510,12 @@ fn zfs_wt_b7(pool) {
     } elif (memeq(pool, "agnosfull", 10) == 1) {
         zfs_wt_u(0, "/agnosfull/b6/a.txt", 0, 0);
         zfs_wt_u(1, "/agnosfull/b6e", 0, 0);
-        # (B11, k.64 / k.125) at the slop after the fill: the frees of two txgs back are released at every commit, so the
-        # rename's one microzap growth fits — refused by name (`no space: the pool is at its slop`) until B11
+        # (1.57.17, k.137) the rmdir's publish released the frees of B5's give-back two txgs back (k.125), so the rename's
+        # one microzap growth (zfs_wd_space's 512 B) is admitted with two records less the fill's metadata overshoot —
+        # the room printed first and held to the space record (zfs-room-check.py --fit). B11's note credited the release
+        # alone: it fitted only where the fixture build's fill left a microzap block over (r8-3daae94469aa: -8,192 B,
+        # the rename refused at the slop — the 1.57.16 sweep's red)
+        zfs_wt_room();
         zfs_wt_u(2, "/agnosfull/dir/s1.txt", "/agnosfull/b6/s1.txt", 0);
     }
     return 0;

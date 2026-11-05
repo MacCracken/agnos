@@ -556,7 +556,7 @@ fn is_user_range(ptr, len) {
 #
 # ⚠ USE THIS AT EVERY SITE WHERE THE LENGTH IS count * stride WITH A RING-3 count. Three of the six
 # arithmetic-length call sites in this kernel were already safe because they clamp the count first
-# (epoll_wait#21 caps at 16, blit#39 at 8192x8192, snd_write#66 at 1048576) — and each of those
+# (epoll_wait#21 caps at EP_WATCH_MAX = 128 since 1.57.17 (16 before), blit#39 at 8192x8192, snd_write#66 at 1048576) — and each of those
 # carries a comment saying so. The three that were exploitable carried no such comment. A helper is
 # what makes the property structural instead of a thing each new arm has to remember.
 fn is_user_array(ptr, count, stride) {
@@ -836,6 +836,7 @@ fn proc_death_finish(pid, sig, via) {
     var fz_pp = proc_get_ppid(pid);
     var fz_orphan = 0;
     var fz_kick = 0;
+    var fz_epk = 0;                                # 1.57.17: an epoll_wait#21 parent this SIGCHLD woke (kicked below)
     var fz_zm = 1;
     while (fz_zm != 0) {
         var fz_f = kbd_irq_save();
@@ -871,6 +872,7 @@ fn proc_death_finish(pid, sig, via) {
             if (fz_orphan == 0) {
                 lc_st_set(pid, 0);                                        # a zombie for its live parent (or kmain's fg child)
                 atomic_or64(&proc_signals + fz_pp * 8, 1 << 17);          # SIGCHLD, only to a parent validated in THIS hold
+                if (ep_sig_locked(fz_pp, 17) == 1) { fz_epk = fz_epk | (1 << fz_pp); }   # 1.57.17: ends its epoll_wait#21
             } else {
                 lc_st_set(pid, 4);                                        # DYING while it reaps itself
                 if (fz_ih == 1) { fz_ow = fz_ow | (1 << pid); }           # 1.57.13: ... or while a process context reaps it
@@ -896,6 +898,7 @@ fn proc_death_finish(pid, sig, via) {
     # prev == cur fast path). Meaningful only on the self path; no fxsave (the dying XMM is garbage).
     var fz_cpu = pcpu_cpu();
     if (load64(&fpu_owner + fz_cpu * 8) == pid) { store64(&fpu_owner + fz_cpu * 8, 0 - 1); }
+    sched_kick_mask(fz_epk, 0);                    # 1.57.17: no lifecycle trace — fz_epk is a plain wake, not a continue
     if (fz_kick != 0) {
         sched_kick_mask(fz_kick, 0);
         var fz_k = 0;
@@ -6362,6 +6365,14 @@ var chan_end_oepoch[32];            # proc_epoch AT CLAIM — pid recycling is w
 # `endow_stdio` one-shot the arm code already guards ("a stale flag would silently turn the NEXT
 # unrelated spawn's stdio into a channel").
 var chan_end_pty[32];               # 1 = endowed in PTY mode; descendants of the owner may use it
+# ⭐ 1.57.17 — A TERMINAL'S WINDOW SIZE (issue 2026-10-30-a-terminal-channel-has-no-window-size). Per ENDPOINT, kept on
+# the TERMINAL's end (the PTY-mode endpoint the emulator endows), written only through its PEER — the emulator's own
+# end — by CH_WINSZ_SET, read by the terminal's holders by CH_WINSZ_GET. Linux keeps `struct winsize` in the tty
+# (TIOCSWINSZ on the master, TIOCGWINSZ on either side), FreeBSD in `struct tty` (tty_set_winsize). Here Linux's whole
+# struct is ONE qword: (xpix << 48) | (ypix << 32) | (cols << 16) | rows — the low half is `winsize`#60's packing, and
+# one aligned store publishes a consistent size to a reader on any CPU. 0 = NEVER SET (a set refuses cols 0 and rows 0,
+# so no set stores it). ⚠ It dies with the endpoint: zeroed wherever chan_end_pty is (mint, close, release).
+var chan_winsz[32];
 var chan_epoch[16];                 # per-CHANNEL generation, bumped at mint; fd-vs-channel staleness
 var chan_epoch_next = 1;
 var chan_w[32];                     # records ever written INTO this endpoint's inbox
@@ -6394,7 +6405,10 @@ fn chan_pty_descendant(owner, cur) {
     return chan_pty_desc_pure(owner, cur, &proc_ppid, &proc_ppid_epoch, &proc_epoch, proc_count);
 }
 
-fn chan_auth(base) {
+# 1.57.17: the authority test for an fd entry `base` held by process `cur` — chan_auth is it for the CALLER; the
+# CH_WINSZ_SET resize walk (chan_winch_post_locked) asks it for every other process, so "a holder of the terminal" is
+# exactly a process whose own fd this rule would authorize, never one holding an inert inherited copy.
+fn chan_auth_as(base, cur) {
     if (ktag(base) != VFS_CHAN) { return 0 - 1; }
     var e = kpayload(base, 0);
     if (e < 0) { return 0 - 1; }
@@ -6402,7 +6416,6 @@ fn chan_auth(base) {
     if (load64(&chan_end_open + e * 8) != 1) { return 0 - 1; }
     if (load64(&chan_epoch + (e >> 1) * 8) != kpayload(base, 1)) { return 0 - 1; }   # fd vs CHANNEL
     var owner = load64(&chan_end_owner + e * 8);
-    var cur = proc_current_get();
     # The owner's own claim — unchanged. pid vs PROCESS, the incarnation check bite 2 exists for.
     if (owner == cur) {
         if (load64(&chan_end_oepoch + e * 8) != proc_epoch_get(cur)) { return 0 - 1; }
@@ -6417,6 +6430,74 @@ fn chan_auth(base) {
     if (load64(&chan_end_oepoch + e * 8) != proc_epoch_get(owner)) { return 0 - 1; }
     if (chan_pty_descendant(owner, cur) != 1) { return 0 - 1; }
     return e;
+}
+fn chan_auth(base) { return chan_auth_as(base, proc_current_get()); }
+
+# ═══════════════ 1.57.17 — THE TERMINAL'S WINDOW SIZE: CH_WINSZ_SET / CH_WINSZ_GET (#97 ops 6 / 7) ═══════════════
+# Does process q HOLD endpoint e — an fd in its own table naming e that chan_auth_as authorizes for q (the owner, or a
+# PTY-descendant of the owner)? An inherited copy that is inert for q (the emulator's own copy of the end it endowed,
+# a stranger's) is not holding it. Read-only over q's table, like proc_watches_sig.
+fn chan_holds(q, e) {
+    var ht = vfs_fd_table_of(q);
+    var hfd = 0;
+    while (hfd < 32) {
+        var hb = ht + hfd * 32;
+        if (ktag(hb) == VFS_CHAN) {
+            if (kpayload(hb, 0) == e) {
+                if (chan_auth_as(hb, q) == e) { return 1; }
+            }
+        }
+        hfd = hfd + 1;
+    }
+    return 0;
+}
+# SIGWINCH (28) to every live user process that HOLDS terminal endpoint `te` AND watches bit 28 (a signalfd#18 whose
+# mask has it) — the console's rule from 1.57.13 (sched.cyr console_winch_post: watchers only, so a non-consumer is
+# never left a stale pending bit), narrowed to the terminal that changed. Linux tty_do_resize posts to the tty's
+# foreground process group; agnos has no process groups, and the terminal's holders are its owner and the owner's
+# descendants that hold it (chan_auth's PTY arm), so a watcher in ANOTHER terminal, or on the console, hears nothing.
+# Caller holds sched_lock (IRQ-saved) — the same liveness snapshot console_winch_post takes. Returns the mask of the
+# recipients it WOKE out of epoll_wait#21 (1.57.17 merge, as console_winch_post: ep_sig_locked per post), which the
+# caller kicks with sched_kick_mask after its unlock — without it a TUI blocked in epoll_wait on its bit-28 signalfd
+# would sleep through the resize until its own deadline.
+fn chan_winch_post_locked(te) {
+    var cw_k = 0;
+    var cw_q = 0;
+    while (cw_q < proc_count) {
+        if (lc_st(cw_q) != 0 && lc_dying_done(cw_q) == 0) {
+            if (proc_is_user(cw_q) == 1) {
+                if (proc_watches_sig(cw_q, SIG_WINCH) == 1) {
+                    if (chan_holds(cw_q, te) == 1) {
+                        atomic_or64(&proc_signals + cw_q * 8, 1 << SIG_WINCH);
+                        if (ep_sig_locked(cw_q, SIG_WINCH) == 1) { cw_k = cw_k | (1 << cw_q); }
+                    }
+                }
+            }
+        }
+        cw_q = cw_q + 1;
+    }
+    return cw_k;
+}
+# Store size word `w` on terminal endpoint `te` (the caller is te's peer's owner — checked at the op). The compare,
+# the store and the post are ONE sched_lock hold, so two setters on two CPUs (two threads of the emulator) each see
+# the other's value as "old": every change posts exactly once, and an unchanged size — the WHOLE word, pixels
+# included, as Linux tty_do_resize memcmp's the whole struct — posts nothing. The post needs te to BE a terminal: a
+# size set before CH_ENDOW (puka sizes the terminal before it spawns the shell, as TIOCSWINSZ on a Linux master works
+# before the slave is opened) is simply there when the child is born. -> 0, or -CH_E_PEERGONE when te is closed.
+fn chan_winsz_set(te, w) {
+    if (load64(&chan_end_open + te * 8) != 1) { return 0 - CH_E_PEERGONE; }
+    var zf = kbd_irq_save();
+    sched_spin_lock();
+    var zold = load64(&chan_winsz + te * 8);
+    var zk = 0;                                        # the epoll_wait#21 waiters the post woke (kicked after the unlock)
+    store64(&chan_winsz + te * 8, w);
+    if (zold != w) {
+        if (load64(&chan_end_pty + te * 8) == 1) { zk = chan_winch_post_locked(te); }
+    }
+    sched_spin_unlock();
+    sched_kick_mask(zk, 0);
+    kbd_irq_restore(zf);
+    return 0;
 }
 
 # ⛔ PEER LIVENESS IS DERIVED, NEVER STORED. A stored flag goes stale the moment the peer dies by a
@@ -6521,6 +6602,7 @@ fn chan_release_pid(pid) {
                     store64(&chan_end_owner + e * 8, 0);
                     store64(&chan_end_oepoch + e * 8, 0);
                     store64(&chan_end_pty + e * 8, 0);
+                    store64(&chan_winsz + e * 8, 0);     # 1.57.17: the window size dies with the endpoint
                     wq_wake(WK_CHAN | (e ^ 1));  # 1.57.8: the peer's blocked read sees PEER GONE (EOF)
                 }
             }
@@ -6536,6 +6618,9 @@ var CH_SEND   = 0x02;               # (fd, buf, len<=64) -> len / -CH_E_*
 var CH_RECV   = 0x03;               # (fd, buf, cap) -> len / -CH_E_WOULDBLOCK / -CH_E_PEERGONE
 var CH_CLOSE  = 0x04;               # (fd) -> 0
 var CH_ENDOW  = 0x05;               # (fd) -> fd; arm THIS endpoint for this process's next child (#43/#37/#3). fd -1 disarms.
+# 1.57.17 — the terminal's window size (see chan_winsz). Both read only a1/a2 (rsi/rdx), never a3 (the shared a4).
+var CH_WINSZ_SET = 0x06;            # (fd, (xpix<<48)|(ypix<<32)|(cols<<16)|rows) -> 0; fd = the caller's OWN, non-terminal end; sizes its PEER
+var CH_WINSZ_GET = 0x07;            # (fd, 0) -> (cols<<16)|rows · (fd, 1) -> (xpix<<16)|ypix · -1 = not a terminal, or never sized
 
 # ⭐ ENDOWMENT (bite 5) — the mechanism that lets a child be BORN holding a channel instead of dialling
 # for one. A parent arms an endpoint; the next child IT creates (#43, #37 or #3) is born owning it.
@@ -6719,7 +6804,7 @@ var CH_E_NOREGION = 4;              # the 2 MB region is absent or unreachable f
 # only safe way to read a mode out of it.
 var CH_ENDOW_STDIO = 1000;
 
-var CH_OP_SUPPORTED = 0x003F;       # bits 0-5 = CAPS/MINT/SEND/RECV/CLOSE/ENDOW. Reserved ops stay CLEAR.
+var CH_OP_SUPPORTED = 0x00FF;       # bits 0-7 = CAPS/MINT/SEND/RECV/CLOSE/ENDOW/WINSZ_SET/WINSZ_GET (0x3F until 1.57.17). Reserved ops stay CLEAR.
 
 # Reserve the region. Called once at boot, AFTER pmm_setup_directmap — the whole design rests on the
 # direct-map alias, so reserving before it exists would hand back a VA that means something else.
@@ -9788,6 +9873,237 @@ fn uptime_ms_now() {
     return timer_ticks * 10;
 }
 
+# ═══════════════ 1.57.17 — epoll: SET watches, EPOLLOUT, a BLOCKING epoll_wait#21 ═══════════════
+# Issue docs/development/issues/archived/2026-10-31-tcp-send-keeps-one-segment-in-flight.md, fix 2 (OPERATOR RULING 2026-11-04:
+# the readiness wait, not the send window). Invariants: docs/architecture/blocking-waits.md § epoll_wait; contract:
+# agnos-userland-abi.md #19-#21. The wake sources are sched.cyr's (ep_wake_tcp, ep_sig_locked); the TCP readiness is
+# net_tcp.cyr's tcp_ep_events.
+# The instance (a VFS_EPOLL fd): payload[0] = the watch count, [1] = the capacity (8 at #19; ONE growth to
+# EP_WATCH_MAX at the 9th watch), [2] = the list — 16-byte entries {u64 word0 = target | events << 32; u64 data}:
+#   target  0..31 = a VFS fd of the caller (signalfd / timerfd / VFS_SOCK) · EP_TCP | id = a TCP conn or listener id
+#           0..7 (the ids #47 / #56 / #57 return — ring-3 sockets are not VFS fds, #57's row says why)
+#   events  0 = a LEGACY op-1 entry: EPOLLIN, reported as mask 1 — exactly the 1.41-1.57.16 poll · EP_EV_SET | the
+#           EPOLLIN / EPOLLOUT / EPOLLRDHUP interest of an op-3 entry (EPOLLERR / EPOLLHUP are always reported)
+#   data    the target as given (reported in the event record, as the legacy entry always did)
+# ⚠ THE LIST IS NEVER FREED (as before): vfs_fd_inherit copies the fd entry, so a child that inherited the instance
+# names the SAME list, and a free on close would leave the other copy dangling — refcounting it needs the per-OFD
+# fd-table redesign (blocking-waits.md § flock). The growth leaves the old 128 B list to whoever still names it.
+var EP_WATCH_MAX = 128;           # 128 x 16 B = 2048 B, exactly the heap's 2048 class (was 8 x 16 B = 128 B)
+var EP_TCP = 0x10000;             # op-3 target tag: EP_TCP | a TCP conn / listener id 0..7
+var EP_EV_SET = 0x40000000;       # the events-field marker of an op-3 entry (never a Linux bit we report)
+var EPW_TIMED = 0x100000000;      # epoll_wait `max` bit 32: a4 is the timeout in ms (-1 forever, 0 poll)
+var EP_TMO_MAX_MS = 0x7FFFFFFF;   # Linux's int timeout ceiling (~24.8 days); the µs product cannot overflow
+var EP_NOINTR = 0x40000;          # 1 << 18: SIGCONT never ends a wait (a stop/continue resumes it — Linux ERESTARTNOHAND)
+
+fn ep_cap(cp_eb) {
+    var cp_c = kpayload(cp_eb, 1);
+    if (cp_c < 8) { return 8; }
+    return cp_c;
+}
+# Grow the instance's list 8 -> EP_WATCH_MAX (one step). 0 = grown, -1 = already at the limit or no memory.
+fn ep_grow(gr_eb) {
+    if (ep_cap(gr_eb) >= EP_WATCH_MAX) { return 0 - 1; }
+    var gr_nl = kmalloc(EP_WATCH_MAX * 16);
+    if (gr_nl == 0) { return 0 - 1; }
+    var gr_ol = kpayload(gr_eb, 2);
+    var gr_n = kpayload(gr_eb, 0) * 2;
+    var gr_i = 0;
+    while (gr_i < gr_n) { store64(gr_nl + gr_i * 8, load64(gr_ol + gr_i * 8)); gr_i = gr_i + 1; }
+    kpayload_set(gr_eb, 2, gr_nl);
+    kpayload_set(gr_eb, 1, EP_WATCH_MAX);
+    return 0;
+}
+# epoll_ctl#20 op 3 — SET: replace every watch of `cs_tg` (legacy ones included) with ONE entry whose interest is
+# `cs_ev` & (EPOLLIN | EPOLLOUT | EPOLLRDHUP); `cs_ev` == 0 DELETES (-1 when nothing named the target — Linux ENOENT).
+# A SET validates the target NOW: a VFS fd of a watchable type, or a TCP id the caller owns (tcp_auth — the #48/#49
+# rule); a DELETE does not (the conn it named may be gone). 0 / -1.
+fn ep_ctl_set(cs_eb, cs_tg, cs_ev) {
+    if (cs_tg < 0) { return 0 - 1; }
+    if (cs_ev != 0) {
+        if (cs_tg < 32) {
+            var cs_t = ktag(vfs_fd_table() + cs_tg * 32);
+            if (cs_t != VFS_SIGNALFD && cs_t != VFS_TIMERFD && cs_t != VFS_SOCK) { return 0 - 1; }
+        } elif (cs_tg >= EP_TCP && cs_tg < EP_TCP + 8) {         # an exact range: no high bit may reach word0
+            if (tcp_auth(cs_tg - EP_TCP) < 0) { return 0 - 1; }
+        } else {
+            return 0 - 1;
+        }
+    }
+    var cs_wl = kpayload(cs_eb, 2);
+    var cs_wc = kpayload(cs_eb, 0);
+    var cs_j = 0;
+    var cs_rm = 0;
+    var cs_i = 0;
+    while (cs_i < cs_wc) {
+        var cs_w0 = load64(cs_wl + cs_i * 16);
+        if ((cs_w0 & 0xFFFFFFFF) == cs_tg) {
+            cs_rm = cs_rm + 1;
+        } else {
+            if (cs_j != cs_i) {
+                store64(cs_wl + cs_j * 16, cs_w0);
+                store64(cs_wl + cs_j * 16 + 8, load64(cs_wl + cs_i * 16 + 8));
+            }
+            cs_j = cs_j + 1;
+        }
+        cs_i = cs_i + 1;
+    }
+    kpayload_set(cs_eb, 0, cs_j);
+    if (cs_ev == 0) {
+        if (cs_rm == 0) { return 0 - 1; }
+        return 0;
+    }
+    if (cs_j >= ep_cap(cs_eb)) {
+        if (ep_grow(cs_eb) != 0) { return 0 - 1; }
+        cs_wl = kpayload(cs_eb, 2);
+    }
+    var cs_in = cs_ev & (EPOLLIN | EPOLLOUT | EPOLLRDHUP);
+    store64(cs_wl + cs_j * 16, cs_tg | ((EP_EV_SET | cs_in) << 32));
+    store64(cs_wl + cs_j * 16 + 8, cs_tg);
+    kpayload_set(cs_eb, 0, cs_j + 1);
+    return 0;
+}
+# ONE pass over `sc_wc` watches at `sc_wl`. `sc_mode` 1: write up to `sc_max` ready records ({u32 mask; u64 data},
+# 12 B — user memory the arm validated; AC is set in syscall context, and after a wq_sleep the switch restored the
+# slot's CR3 and RFLAGS.AC) and return how many were written. `sc_mode` 0: the side-effect-free PROBE — the re-check
+# after the arm: 1 at the first ready watch, else 0; it writes nothing. `sc_out` (16 B, or 0): +0 the TCP slots the
+# watches name (the WK_EPOLL key bits), +8 the earliest not-yet-due timerfd deadline on sched_clock_us (0 = none).
+# Mode 1 also runs net_poll ONCE, at the first socket watch (the legacy scan's tcp_readable polled per socket watch);
+# the probe never does (nothing but loads and the readiness locks after an arm).
+fn ep_scan(sc_wl, sc_wc, sc_evp, sc_max, sc_out, sc_mode) {
+    var sc_poll = sc_mode;
+    var sc_n = 0;
+    var sc_bits = 0;
+    var sc_tdl = 0;
+    var sc_me = proc_current_get();
+    var sc_tab = vfs_fd_table();
+    var sc_i = 0;
+    while (sc_i < sc_wc) {
+        var sc_w0 = load64(sc_wl + sc_i * 16);
+        var sc_tg = sc_w0 & 0xFFFFFFFF;
+        var sc_ev = (sc_w0 >> 32) & 0xFFFFFFFF;
+        var sc_r = 0;
+        if (sc_tg < 32) {
+            var sc_b = sc_tab + sc_tg * 32;
+            var sc_t = ktag(sc_b);
+            if (sc_t == VFS_SIGNALFD) {
+                if ((load64(&proc_signals + sc_me * 8) & kpayload(sc_b, 2)) != 0) { sc_r = EPOLLIN; }
+            } elif (sc_t == VFS_TIMERFD) {
+                var sc_nf = kpayload(sc_b, 1);
+                if (timer_ticks >= sc_nf) {
+                    sc_r = EPOLLIN;
+                } else {
+                    var sc_d = sched_clock_us() + (sc_nf - timer_ticks) * 10000;
+                    if (sc_tdl == 0 || sc_d < sc_tdl) { sc_tdl = sc_d; }
+                }
+            } elif (sc_t == VFS_SOCK) {                   # 1.49.5 socket fd (kernel-created; ring 3 holds raw ids)
+                var sc_c = kpayload(sc_b, 0);
+                if (sc_c >= 0 && sc_c < 8) {
+                    sc_bits = sc_bits | (1 << sc_c);
+                    if (sc_poll == 1) { net_poll(); sc_poll = 0; }
+                    var sc_o = tcp_fd_owner(sc_c);           # 1.57.7 S5: owner (or kernel-owned) only
+                    if (sc_o >= 0) { sc_r = tcp_ep_events(sc_c, sc_o); }
+                }
+            }
+        } elif ((sc_tg & 0xFFFFFF00) == EP_TCP) {
+            var sc_id = sc_tg & 0xFF;
+            if (sc_id < 8) {
+                sc_bits = sc_bits | (1 << sc_id);
+                if (sc_poll == 1) { net_poll(); sc_poll = 0; }
+                sc_r = tcp_ep_events(sc_id, tcp_caller_tag());
+            }
+        }
+        var sc_rep = 0;
+        if (sc_ev == 0) {
+            if ((sc_r & EPOLLIN) != 0) { sc_rep = 1; }    # LEGACY: readable -> mask 1, as the poll always answered
+        } else {
+            sc_rep = (sc_r & sc_ev & (EPOLLIN | EPOLLOUT | EPOLLRDHUP)) | (sc_r & (EPOLLERR | EPOLLHUP));
+        }
+        if (sc_rep != 0) {
+            if (sc_mode == 0) { return 1; }
+            if (sc_n < sc_max) {
+                store32(sc_evp + sc_n * 12, sc_rep);
+                store64(sc_evp + sc_n * 12 + 4, load64(sc_wl + sc_i * 16 + 8));
+                sc_n = sc_n + 1;
+            }
+        }
+        sc_i = sc_i + 1;
+    }
+    if (sc_out != 0) {
+        store64(sc_out, sc_bits);
+        store64(sc_out + 8, sc_tdl);
+    }
+    return sc_n;
+}
+# 1 when a signal POSTED to `si_p` during its wait should end it with -4: not blocked by sigprocmask#17, not SIGCONT.
+fn ep_sig_intr(si_p) {
+    var si_m = load64(&ep_signew + si_p * 8) & (0 - 1 - load64(&proc_sigmask + si_p * 8)) & (0 - 1 - EP_NOINTR);
+    if (si_m != 0) { return 1; }
+    return 0;
+}
+# ⭐ epoll_wait#21's body. `wt_tmo`: 0 = the POLL (one pass — the legacy call, and every context that cannot block);
+# > 0 = wait up to that many ms (clamped to EP_TMO_MAX_MS; the deadline is computed ONCE, here — the #47/#109 rule —
+# never early, expiring at the first tick at or after it); < 0 = no deadline. Returns n >= 1 records, 0 (timeout /
+# nothing ready), -4 (a signal was posted during the wait, nothing is ready and the signal is neither blocked nor
+# SIGCONT — Linux's -EINTR value; agnos has no handlers, so the bit stays pending for a signalfd), -1 only on a
+# lifecycle ABORT (a SIGKILL: B1 ends the process; it never reaches ring 3).
+# THE CANONICAL C9 WAIT: pass = net_poll + scan (writes the records) -> done | EINTR | deadline -> arm WK_EPOLL | the
+# TCP slots watched, deadline min(caller's, the earliest timerfd) -> the PROBE re-check (side-effect free) + the
+# EINTR and deadline re-checks -> cancel | sleep -> next pass. IF=0 across arm..sleep|cancel (one kbd_irq_save, the
+# tcp_block shape, R1); nothing per-CPU is kept across the wait (R4: every cell is a local or re-derived from the fd).
+# A STOP parks inside wq_signal_point and the loop re-arms with the SAME absolute deadline.
+fn ep_wait(wt_eb, wt_evp, wt_max, wt_tmo) {
+    var wt_out[16];                                     # function-local: 16 BYTES (+0 TCP slot bits, +8 timerfd deadline)
+    var wt_me = proc_current_get();
+    var wt_dl = 0;
+    if (wt_tmo > 0) {
+        if (wt_tmo > EP_TMO_MAX_MS) { wt_tmo = EP_TMO_MAX_MS; }
+        wt_dl = wq_deadline_after_us(wt_tmo * 1000);
+    }
+    var wt_blk = 0;
+    if (wt_tmo != 0) { wt_blk = wq_can_block(); }
+    if (wt_blk == 1) {
+        atomic_and64(&ep_signew + wt_me * 8, 0);        # only signals posted from here on end the wait
+        atomic_or64(&ep_waiters, 1 << wt_me);           # the TCP gate (ep_wake_tcp) — BEFORE the first scan
+    }
+    var wt_r = 0;
+    while (1) {
+        var wt_n = ep_scan(kpayload(wt_eb, 2), kpayload(wt_eb, 0), wt_evp, wt_max, &wt_out, 1);
+        if (wt_n != 0) { wt_r = wt_n; break; }
+        if (wt_blk == 0) { wt_r = 0; break; }
+        if (ep_sig_intr(wt_me) == 1) { wt_r = 0 - 4; break; }
+        if (wt_dl != 0 && sched_clock_us() >= wt_dl) { wt_r = 0; break; }
+        var wt_sdl = wt_dl;
+        var wt_tdl = load64(&wt_out + 8);
+        if (wt_tdl != 0) {
+            if (wt_sdl == 0 || wt_tdl < wt_sdl) { wt_sdl = wt_tdl; }
+        }
+        var wt_f = kbd_irq_save();
+        var wt_a = wq_arm(WK_EPOLL | (load64(&wt_out) & 0xFF), wt_sdl);
+        if (wt_a == 2) { kbd_irq_restore(wt_f); wt_r = 0; break; }
+        if (wt_a == 1) {
+            kbd_irq_restore(wt_f);
+            if (wq_signal_point() == 1) { wt_r = 0 - 1; break; }
+            continue;
+        }
+        var wt_go = 0;                                  # the RE-CHECK after the arm (the whole point)
+        if (ep_scan(kpayload(wt_eb, 2), kpayload(wt_eb, 0), 0, 0, 0, 0) != 0) { wt_go = 1; }
+        if (ep_sig_intr(wt_me) == 1) { wt_go = 1; }
+        if (wt_sdl != 0 && sched_clock_us() >= wt_sdl) { wt_go = 1; }
+        if (wt_go == 1) {
+            wq_cancel();
+            kbd_irq_restore(wt_f);
+            continue;
+        }
+        var wt_w = wq_sleep();
+        kbd_irq_restore(wt_f);
+        if (wt_w == WR_SIGNAL) {
+            if (wq_signal_point() == 1) { wt_r = 0 - 1; break; }
+        }
+    }
+    if (wt_blk == 1) { atomic_and64(&ep_waiters, 0 - 1 - (1 << wt_me)); }
+    return wt_r;
+}
+
 fn ksyscall(num, arg1, arg2, arg3) {
     # Stack-canary backstop: snapshot at entry, re-checked before returning on the
     # syscalls that do the most pointer/buffer work (the 1.41.3 FS group + pipe/
@@ -10199,15 +10515,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # 1.41.5: allocate the watch list BEFORE claiming the slot — on OOM the
         # slot stays VFS_FREE (vfs_alloc doesn't mark it) so nothing leaks and we
         # never hand back an epoll fd with a NULL watch list.
+        # 1.57.17: 8 entries here (the legacy footprint); ep_grow takes it to EP_WATCH_MAX at the 9th watch.
         var wl = kmalloc(128);
         if (wl == 0) { return 0 - 1; }
         ktag_set(ebase, VFS_EPOLL);
         kpayload_set(ebase, 0, 0);              # watch count
+        kpayload_set(ebase, 1, 8);              # 1.57.17: capacity
         kpayload_set(ebase, 2, wl);             # watch list ptr
         return efd;
     }
     if (num == 20) {
-        # epoll_ctl(epfd=arg1, op=arg2, fd=arg3)
+        # epoll_ctl(epfd=arg1, op=arg2, target=arg3, events=a4 — read for op 3 only)
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
         var ebase = vfs_fd_table() + arg1 * 32;
@@ -10222,29 +10540,49 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (wl == 0) { return 0 - 1; }
         var wc = kpayload(ebase, 0);
         if (arg2 == 1) {
-            # Max 8 watches (128 bytes / 16 bytes per watch)
-            if (wc >= 8) { return 0 - 1; }
+            # LEGACY ADD — unchanged but for the limit: a VFS fd, EPOLLIN, duplicates allowed. Max EP_WATCH_MAX (1.57.17;
+            # was 8 — 128 bytes / 16 bytes per watch).
             # 1.41.5: the watched fd is later used as vfs_fd_table() + wfd*32 in
             # epoll_wait — bound it to a real fd slot so it can't index OOB.
             if (arg3 < 0) { return 0 - 1; }
             if (arg3 >= 32) { return 0 - 1; }
+            if (wc >= ep_cap(ebase)) {
+                if (ep_grow(ebase) != 0) { return 0 - 1; }
+                wl = kpayload(ebase, 2);
+            }
             store64(wl + wc * 16, arg3);
             store64(wl + wc * 16 + 8, arg3);
             kpayload_set(ebase, 0, wc + 1);
         }
         if (arg2 == 2) {
-            # EPOLL_CTL_DEL — current impl clears ALL watches (not just arg3).
+            # EPOLL_CTL_DEL — current impl clears ALL watches (not just arg3). (1.57.17: op 3 with a4 = 0 deletes one.)
             kpayload_set(ebase, 0, 0);
+        }
+        if (arg2 == 3) {
+            # ⭐ 1.57.17 — SET: target = a VFS fd 0..31 or EP_TCP | a TCP conn / listener id; a4 = the EpollEv interest
+            # (EPOLLIN 1 | EPOLLOUT 4 | EPOLLRDHUP 0x2000; ERR/HUP always), 0 = delete. Upsert: one entry per target.
+            return ep_ctl_set(ebase, arg3, ksyscall_a4_get());
         }
         return 0;
     }
     if (num == 21) {
-        # epoll_wait(epfd=arg1, events=arg2, max=arg3)
+        # epoll_wait(epfd=arg1, events=arg2, max=arg3 [| EPW_TIMED], timeout_ms=a4 — read only under EPW_TIMED)
+        # ⭐ 1.57.17 — A REAL WAIT (ep_wait above). `max` bit 32 (EPW_TIMED) says a4 is the timeout: > 0 ms, -1 (any
+        # negative) forever, 0 a poll. WITHOUT the bit the call is the 1.41-1.57.16 POLL, byte for byte: a 3-argument
+        # syscall(21, ...) leaves a4 = a stale r10, so the timeout cannot be read unconditionally (#55's frozen-arity
+        # note) — the opt-in is a flag folded into an existing argument, Linux's SOCK_NONBLOCK-in-`type` precedent.
         # Security: validate fd bounds and userspace pointer
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
         if (arg3 < 0) { return 0 - 1; }
-        if (arg3 > 16) { arg3 = 16; }
+        var ew_tmo = 0;
+        if ((arg3 >> 32) != 0) {
+            if ((arg3 >> 32) != 1) { return 0 - 1; }   # bits above 32 are reserved
+            ew_tmo = ksyscall_a4_get();
+            arg3 = arg3 & 0xFFFFFFFF;
+            if (arg3 == 0) { return 0 - 1; }             # a timed wait needs room for one record (Linux EINVAL)
+        }
+        if (arg3 > EP_WATCH_MAX) { arg3 = EP_WATCH_MAX; }   # 1.57.17: was 16
         # 1.41.5: validate the events buffer for the bytes actually written (each
         # event record is 12 bytes, up to arg3 of them) — not a single ptr.
         if (is_user_range(arg2, arg3 * 12) == 0) { return 0 - 1; }
@@ -10253,59 +10591,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # foreign fd's payload — wl used as a base address gives arbitrary
         # kernel reads and wc (e.g. a file's pos) an attacker-driven loop count.
         if (ktag(ebase) != VFS_EPOLL) { return 0 - 1; }
-        var wl = kpayload(ebase, 2);
-        var wc = kpayload(ebase, 0);
-        var found = 0;
-        for (var wi = 0; wi < wc; wi = wi + 1) {
-            var wfd = load64(wl + wi * 16);
-            var wdata = load64(wl + wi * 16 + 8);
-            var rdy = 0;
-            # 1.41.5: defense-in-depth — only consult a watched fd that indexes a
-            # real slot (epoll_ctl now bounds it at insert time as well).
-            if (wfd >= 0) {
-                if (wfd < 32) {
-                    var wbase = vfs_fd_table() + wfd * 32;
-                    var wtype = ktag(wbase);
-                    if (wtype == VFS_SIGNALFD) {
-                        var smask = kpayload(wbase, 2);
-                        var spend = load64(&proc_signals + proc_current_get() * 8);
-                        if ((spend & smask) != 0) { rdy = 1; }
-                    }
-                    if (wtype == VFS_TIMERFD) {
-                        if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
-                    }
-                    if (wtype == VFS_SOCK) {        # 1.49.5 socket readiness -> EPOLLIN when readable
-                        if (tcp_fd_owner(kpayload(wbase, 0)) >= 0) {       # 1.57.7 S5: owner (or kernel-owned) only
-                            if (tcp_readable(kpayload(wbase, 0)) == 1) { rdy = 1; }
-                        }
-                    }
-                }
-            }
-            if (rdy == 1) {
-                if (found < arg3) {
-                    store32(arg2 + found * 12, 1);
-                    store64(arg2 + found * 12 + 4, wdata);
-                    found = found + 1;
-                }
-            }
-        }
-        # ⛔ 1.56.40 (channel-band bite 0) — A BARE `arch_wait()` LIVED HERE AND COULD HANG THE BOX.
-        # `arch_wait()` is `hlt` with NO `sti` (`arch/x86_64/io.cyr:143`), and every syscall handler runs
-        # **IF=0** (SYSCALL SFMASK). A `hlt` with interrupts masked is not a nap — no timer tick, no IRQ,
-        # nothing can retire it. The CPU stops there permanently.
-        #
-        # It was reached on the ordinary `found == 0` path, i.e. whenever a watch had not fired yet — so
-        # an `epoll_wait` on an unexpired timerfd or an unsignalled signalfd wedged the machine. The
-        # design note that proposed keeping it argued no consumer could reach this path; that was false,
-        # it is the normal not-ready return.
-        #
-        # The fix is to delete it and fall through. `epoll_wait` here is a **poll**, not a sleep: it
-        # returns `found == 0` and ring 3 loops (the ABI row says so since 1.57.7).
-        # ⭐ 1.57.7: the scheduler arc this used to name — a real BLOCKED state, a sched_next that skips it, a ready
-        # edge — now EXISTS (Path 2: wq_arm / wq_sleep / wq_wake, docs/architecture/blocking-waits.md), and waitpid#4
-        # (WAIT_BLOCK) and flock#59 block for real. A blocking epoll_wait still needs a wake from every watched fd type
-        # (timerfd, signalfd, sockets, pipes) — its own design item; until then it stays a poll, never a `hlt`.
-        return found;
+        # ⛔ 1.56.40 (channel-band bite 0) — A BARE `arch_wait()` LIVED HERE AND COULD HANG THE BOX: `hlt` with NO `sti`
+        # in an IF=0 syscall handler, reached on the ordinary nothing-ready path (an unexpired timerfd, an unsignalled
+        # signalfd). It was deleted and the call became a poll. ⭐ 1.57.17: the wait it stood in for now exists — a
+        # wq wait (ep_wait: wq_arm / wq_sleep, woken by every watched type's event), never a `hlt`.
+        return ep_wait(ebase, arg2, arg3, ew_tmo);
     }
     if (num == 22) {
         # timerfd_create
@@ -10698,6 +10988,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 var ee = ea + z;
                 store64(&chan_end_open + ee * 8, 1);
                 store64(&chan_end_pty + ee * 8, 0);      # fresh endpoint: not a terminal until endowed as one
+                store64(&chan_winsz + ee * 8, 0);        # 1.57.17: and never sized — a recycled slot keeps no stale size
                 store64(&chan_end_owner + ee * 8, me);
                 store64(&chan_end_oepoch + ee * 8, mye);
                 store64(&chan_w + ee * 8, 0);
@@ -10799,12 +11090,60 @@ fn ksyscall(num, arg1, arg2, arg3) {
             if (endow_arm_get(proc_current_get()) == ce) { endow_disarm(proc_current_get()); }
             store64(&chan_end_open + ce * 8, 0);
             store64(&chan_end_pty + ce * 8, 0);
+            store64(&chan_winsz + ce * 8, 0);            # 1.57.17: the window size dies with the endpoint
             store64(&chan_end_owner + ce * 8, 0);
             store64(&chan_end_oepoch + ce * 8, 0);
             wq_wake(WK_CHAN | (ce ^ 1));         # 1.57.8: the peer's blocked read sees PEER GONE (EOF)
             vfs_close(arg2);
             stack_canary_check(canary);
             return 0;
+        }
+        # ⭐ 1.57.17 — WINSZ_SET(fd, w): the EMULATOR sizes the terminal it endowed (or is about to endow). `fd` is the
+        # caller's OWN end — strict ownership, as CH_ENDOW requires, because chan_auth also answers yes to a PTY
+        # descendant — and NOT itself a terminal: the program inside a terminal holds the PTY-mode end and does not
+        # size its own window (Linux lets either side TIOCSWINSZ; here only the emulator knows the window, so only its
+        # end may). The size lands on the PEER, which must be a TERMINAL (a PTY-mode end) or an end the caller still
+        # owns (sized before CH_ENDOW hands it out) — never a DISPLAY client's end, nor the compositor's end seen from
+        # a display client. w = (xpix<<48)|(ypix<<32)|(cols<<16)|rows; the low half alone (`winsize`#60's packing)
+        # leaves the pixel size 0 = unknown, as Linux's ws_xpixel 0. cols and rows 1..65535 (0 would read back as
+        # "never set"). -> 0 · -CH_E_BADFD (not a channel fd; not the caller's own end; a terminal end; a peer that is
+        # neither a terminal nor the caller's) · -CH_E_ARG (cols or rows 0) · -CH_E_PEERGONE (the peer is closed).
+        if (arg1 == CH_WINSZ_SET) {
+            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var zse = chan_auth(vfs_fd_table() + arg2 * 32);
+            if (zse < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var zme = proc_current_get();
+            if (load64(&chan_end_owner + zse * 8) != zme) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            if (load64(&chan_end_pty + zse * 8) != 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var zpe = zse ^ 1;
+            if (load64(&chan_end_open + zpe * 8) != 1) { stack_canary_check(canary); return 0 - CH_E_PEERGONE; }
+            if (load64(&chan_end_pty + zpe * 8) != 1) {
+                if (load64(&chan_end_owner + zpe * 8) != zme) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+                if (load64(&chan_end_oepoch + zpe * 8) != proc_epoch_get(zme)) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            }
+            if (((arg3 >> 16) & 0xFFFF) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            if ((arg3 & 0xFFFF) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            var zsr = chan_winsz_set(zpe, arg3);
+            stack_canary_check(canary);
+            return zsr;
+        }
+        # ⭐ 1.57.17 — WINSZ_GET(fd, sel): the window of the terminal `fd` is — sel 0 -> (cols<<16)|rows (`winsize`#60's
+        # packing), sel 1 -> (xpix<<16)|ypix (0 when the emulator gave none). -1 when `fd` is not a terminal end the
+        # caller may use (a closed or non-channel fd, an inert inherited copy, a DISPLAY channel, the emulator's own
+        # end) or when no size was ever set: ring 3's "is this fd a terminal?" for an `fd_kind`#111 5, as a failing
+        # TIOCGWINSZ is on Linux. Any other sel -> -CH_E_ARG (an exact selector, never a guess). Lock-free: one load of
+        # the one-qword size.
+        if (arg1 == CH_WINSZ_GET) {
+            if (arg3 != 0) { if (arg3 != 1) { stack_canary_check(canary); return 0 - CH_E_ARG; } }
+            var zge = chan_fd_endpoint(arg2);
+            if (zge < 0) { stack_canary_check(canary); return 0 - 1; }
+            if (load64(&chan_end_pty + zge * 8) != 1) { stack_canary_check(canary); return 0 - 1; }
+            var zgw = load64(&chan_winsz + zge * 8);
+            if (zgw == 0) { stack_canary_check(canary); return 0 - 1; }
+            stack_canary_check(canary);
+            if (arg3 == 1) { return (zgw >> 32) & 0xFFFFFFFF; }
+            return zgw & 0xFFFFFFFF;
         }
         stack_canary_check(canary);
         return 0 - CH_E_BADOP;
@@ -12373,7 +12712,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
         var fl_base = vfs_fd_table() + arg1 * 32;
-        if (ktag(fl_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
+        # ⭐ 1.57.17 — OR AN ext2 DIRECTORY fd (open AO_DIRECTORY): Linux and the BSDs lock a directory exactly as a file,
+        # per inode, and "one writer per directory" is the lock a writer that REPLACES a file by rename needs — locking
+        # the file by path would lock whichever inode the name held when it opened (hapi's manifest writer, issue
+        # 2026-10-28-ext2-rename-cannot-replace-an-existing-file). VFS_EXT2_DIR payload[2] is the dir inode, the same
+        # key space as a file's; close#6 and the exit paths release it like a file's (vfs.cyr).
+        var fl_t = ktag(fl_base);
+        if (fl_t != VFS_EXT2_FILE && fl_t != VFS_EXT2_DIR) { stack_canary_check(canary); return 0 - 1; }
         var fl_ino = kpayload(fl_base, 2);
         if (fl_ino == 0) { stack_canary_check(canary); return 0 - 1; }
         var fl_me = proc_current_get();

@@ -348,8 +348,10 @@ for w5 in "W5 mkdir" "W5 rmdir round-trip"; do
 done
 
 # Wrename: rename / mv (1.33.3 bite 1) — file rename, cross-parent dir
-# move (".." repoint + parent link-count shift), and dst-exists refusal.
-for wr in "Wren file" "Wren xdir" "Wren refuse"; do
+# move (".." repoint + parent link-count shift); 1.57.17: a file renamed OVER
+# an existing one (the replaced inode freed), and the refusals that stay
+# (file over dir, dir over file, dir over a non-empty dir, ".").
+for wr in "Wren file" "Wren xdir" "Wren replace" "Wren refuse"; do
     if strings "$LOG" | grep -q "ext2w: $wr OK"; then
         echo "  PASS: $wr"
     else
@@ -507,6 +509,14 @@ if debugfs -R "stat /rnsrc.txt" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; t
     echo "  FAIL: /rnsrc.txt still present (old name not removed)"; rc=1
 else
     echo "  PASS: /rnsrc.txt absent on disk (old name removed)"
+fi
+# 1.57.17 rename-replace: /rnx.txt ("RX") was renamed OVER /rny.txt ("RY").
+rny=$(debugfs -R "cat /rny.txt" "$WORK/part-post.img" 2>/dev/null)
+[ "$rny" = "RX" ] && echo "  PASS: /rny.txt = \"RX\" on disk (rename replaced it with rnx's inode)" || { echo "  FAIL: /rny.txt='$rny' (want RX — the replacing file's bytes)"; rc=1; }
+if debugfs -R "stat /rnx.txt" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  FAIL: /rnx.txt still present (the replacing name was not removed)"; rc=1
+else
+    echo "  PASS: /rnx.txt absent on disk (the replacing name moved)"
 fi
 rnptype=$(debugfs -R "stat /rnp/rnd" "$WORK/part-post.img" 2>/dev/null | grep -oE "Type: [a-z]+" | head -1 | awk '{print $2}')
 [ "$rnptype" = "directory" ] && echo "  PASS: /rnp/rnd is a directory on disk (cross-parent dir move persisted)" || { echo "  FAIL: /rnp/rnd type='$rnptype' (want directory)"; rc=1; }

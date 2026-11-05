@@ -1,0 +1,465 @@
+# epw — the RING-3 half of agnos 1.57.17's blocking epoll_wait#21 (issue
+# docs/development/issues/archived/2026-10-31-tcp-send-keeps-one-segment-in-flight.md, fix 2: a readiness wait for sockets).
+#
+# Seeded as /bin/agnsh (the driver, launched by kybernet on a PLAIN kernel) AND /bin/epw (the signal phases' children,
+# selected by argv). The host half is scripts/smoke/epoll-smoke.sh's helper, keyed on the -ARM / -GO markers below.
+# Raw `syscall(N, a1, a2, a3, a4)` with explicit zeros: #21's timeout is a4, read only under EPW_TIMED (max bit 32).
+# Phases (each prints one result line; the smoke gates them):
+#   CAP  128 legacy op-1 watches accepted, the 129th refused; the legacy poll ignores a junk a4; 128 records come back
+#        (legacy and timed); op-3 SET refusals; SET replaces the 128 legacy entries with ONE; DEL; bad max / bits.
+#   TMO  a 200 ms wait with nothing ready returns 0 in [200, 300) ms; timeout 0 is a poll; a timerfd due in 1 s ends
+#        a 3 s wait at ~1 s (its deadline is the only wake).
+#   K1-K4 (children) a signal ends a wait: unblocked + unwatched -> -4; a watched signalfd -> 1 record; a signal
+#        blocked by sigprocmask#17 does NOT end it; SIGKILL ends a waiter seen BLOCKED (#99 state 6: it parked).
+#   L1/R1/O1/H1/H2 (host peer) a listener's child wakes EPOLLIN; RX wakes EPOLLIN; EPOLLOUT is at once with nothing
+#        held; the peer's FIN wakes EPOLLIN|EPOLLRDHUP; a peer reset wakes EPOLLERR|EPOLLHUP with no interest bit.
+#   B1/B2/B3 a 512 KB send: #109 no-wait + an EPOLLOUT wait per segment / #48 blocking / #109 + #44 (agora 1.13.2).
+#   S1   ONE process: a client A that never reads (#109 no-wait while EPOLLOUT says so) beside an echo client B.
+# The driver ALWAYS ends `EPW-DONE` and exits 0 (a non-zero exit drops kybernet into the emergency shell).
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var ev[192];            # 1536 B: 128 event records x 12 B
+var pat[512];           # 4096 B: the bulk pattern (i * 7 + 3) & 0xFF — period 256, so any 4096-aligned slice repeats it
+var rxb[256];           # 2048 B: receive buffer
+var bout[128];          # 1024 B: S1's pending echo bytes for B
+var sigm[1];            # 8 B: a signal mask cell (#17 / #18)
+var tspec[4];           # 32 B: timerfd_settime's {interval_sec; _; initial_sec}
+var ip_line[64];        # 512 B: #43 command lines
+var plist[128];         # 1024 B: #99 records (16 x 64 B)
+
+var EPW_TIMED = 0x100000000;    # #21 max bit 32: a4 is the timeout (ms)
+var EP_TCP = 0x10000;           # #20 op-3 target: EP_TCP | a TCP conn / listener id
+var EPOLLIN = 1;
+var EPOLLPRI = 2;               # not a bit agnos reports: an op-3 interest of "nothing" (ERR / HUP only)
+var EPOLLOUT = 4;
+var EPOLLERR = 8;
+var EPOLLHUP = 16;
+var EPOLLRDHUP = 0x2000;
+var BULK = 524288;              # bytes per B phase
+var NET_IP = 0;
+
+# Output is LINE-BUFFERED and each line is ONE write(1): the children print beside the driver.
+var o_lb[32];           # 256 B: the current output line
+var O_LN = 0;
+fn o_flush() { if (O_LN > 0) { syscall(1, 1, &o_lb, O_LN, 0); } O_LN = 0; return 0; }
+fn o_putc(ch) {
+    if (O_LN >= 250) { o_flush(); }
+    store8(&o_lb + O_LN, ch);
+    O_LN = O_LN + 1;
+    if (ch == 10) { o_flush(); }
+    return 0;
+}
+fn o_out(s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { o_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn o_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { o_putc(45); n = 0 - n; }
+    if (n == 0) { o_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; o_putc(load8(&b + i)); }
+    return 0;
+}
+fn o_kv(k, v) { o_out(" "); o_out(k); o_out("="); o_num(v); return 0; }
+fn o_nl() { o_out("\n"); return 0; }
+fn s_eq(a, b) {
+    var i = 0;
+    while (1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn us() { return syscall(95, 0, 0, 0, 0); }                       # uptime_us#95
+fn ms() { return syscall(40, 0, 0, 0, 0); }                       # uptime_ms#40
+fn sleep(m) { return syscall(41, m, 0, 0, 0); }                   # sleep_ms#41
+fn getpid() { return syscall(2, 0, 0, 0, 0); }
+fn ep_new() { return syscall(19, 0, 0, 0, 0); }
+fn ep_set(ep, tg, evm) { return syscall(20, ep, 3, tg, evm); }    # op 3 SET (evm 0 = DEL)
+fn ep_wait(ep, mx, tmo) { return syscall(21, ep, &ev, mx | EPW_TIMED, tmo); }
+fn ev_mask(i) { return load32(&ev + i * 12); }
+fn ev_data(i) { return load64(&ev + i * 12 + 4); }
+fn sfd_new(mask) { store64(&sigm, mask); return syscall(18, 0 - 1, &sigm, 0, 0); }
+fn sig_block(mask) { store64(&sigm, mask); return syscall(17, 0, &sigm, 0, 0); }
+fn tfd_new_sec(sec) {
+    var t = syscall(22, 0, 0, 0, 0);
+    store64(&tspec, 0); store64(&tspec + 8, 0); store64(&tspec + 16, sec); store64(&tspec + 24, 0);
+    if (t >= 0) { syscall(23, t, 0, &tspec, 0); }
+    return t;
+}
+fn t_recv(c, b, n) { return syscall(49, c, b, n, 0); }
+fn t_close(c) { return syscall(50, c, 0, 0, 0); }
+fn t_accept(l) { return syscall(57, l, 0, 0, 0); }
+fn reap(pid) { return syscall(4, 0x100 | pid, 0, 0, 0); }        # waitpid WAIT_BLOCK
+# #99: the state of `pid`, or -1 when it is not listed.
+fn pstate(pid) {
+    var n = syscall(99, &plist, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        if (load64(&plist + i * 64) == pid) { return load64(&plist + i * 64 + 8); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn spawn_role(role) {
+    var s = "/bin/epw ";
+    var o = 0;
+    var i = 0;
+    while (load8(s + i) != 0) { store8(&ip_line + o, load8(s + i)); o = o + 1; i = i + 1; }
+    i = 0;
+    while (load8(role + i) != 0) { store8(&ip_line + o, load8(role + i)); o = o + 1; i = i + 1; }
+    store8(&ip_line + o, 0);
+    return syscall(43, &ip_line, o, 0, 0);
+}
+
+# ── CAP: the watch limit, the legacy poll, op-3 SET / DEL and the refusals ──
+fn ph_cap() {
+    var ep = ep_new();
+    var s = sfd_new(1 << 10);
+    var added = 0;
+    var i = 0;
+    while (i < 128) { if (syscall(20, ep, 1, s, 0) == 0) { added = added + 1; } i = i + 1; }
+    var refused = 0;
+    if (syscall(20, ep, 1, s, 0) != 0) { refused = 1; }
+    var t0 = us();
+    var r0 = syscall(21, ep, &ev, 128, 5000);                      # LEGACY (no EPW_TIMED): a junk a4 must be ignored
+    var d0 = us() - t0;
+    sig_block(1 << 10);
+    syscall(16, getpid(), 10, 0, 0);                               # a pending bit 10 (D3: no action)
+    var r1 = syscall(21, ep, &ev, 128, 0);                         # legacy: every one of the 128 entries
+    var m1 = ev_mask(127);
+    var r2 = ep_wait(ep, 128, 1000);                               # timed: the same
+    syscall(5, s, &rxb, 8, 1);                                     # consume bit 10
+    var f1 = ep_set(ep, 0, EPOLLIN);                               # fd 0 is the console: not a watchable type
+    var f2 = ep_set(ep, 31, EPOLLIN);                              # a free fd
+    var f3 = ep_set(ep, EP_TCP | 7, EPOLLIN);                      # a TCP id the caller does not own
+    var f4 = ep_set(ep, 0x20000, EPOLLIN);                         # not a target encoding
+    var f5 = ep_set(ep, 29, 0);                                    # DEL of an unwatched target
+    var g1 = ep_set(ep, s, EPOLLIN);                               # SET replaces all 128 legacy entries with ONE
+    syscall(16, getpid(), 10, 0, 0);
+    var r3 = ep_wait(ep, 128, 1000);
+    var m3 = ev_mask(0);
+    var d3 = ev_data(0);
+    syscall(5, s, &rxb, 8, 1);
+    var g2 = ep_set(ep, s, 0);                                     # DEL
+    var g3 = ep_set(ep, s, 0);                                     # DEL again: -1
+    var r4 = ep_wait(ep, 4, 0);                                    # an empty instance polls 0
+    var b1 = syscall(21, ep, &ev, EPW_TIMED, 100);                 # a timed wait with max 0: -1
+    var b2 = syscall(21, ep, &ev, 0x200000004, 100);               # a reserved bit (33): -1
+    o_out("EPW-CAP"); o_kv("added", added); o_kv("refused", refused); o_kv("r0", r0); o_kv("d0us", d0);
+    o_kv("r1", r1); o_kv("m1", m1); o_kv("r2", r2); o_nl();
+    o_out("EPW-SET"); o_kv("f1", f1); o_kv("f2", f2); o_kv("f3", f3); o_kv("f4", f4); o_kv("f5", f5);
+    o_kv("g1", g1); o_kv("r3", r3); o_kv("m3", m3); o_kv("d3ok", d3 == s); o_kv("g2", g2); o_kv("g3", g3);
+    o_kv("r4", r4); o_kv("b1", b1); o_kv("b2", b2); o_nl();
+    if (added == 128 && refused == 1 && r0 == 0 && d0 < 50000 && r1 == 128 && m1 == 1 && r2 == 128) {
+        o_out("EPW-CAP-OK\n");
+    }
+    if (f1 == (0 - 1) && f2 == (0 - 1) && f3 == (0 - 1) && f4 == (0 - 1) && f5 == (0 - 1) && g1 == 0 && r3 == 1
+        && m3 == EPOLLIN && d3 == s && g2 == 0 && g3 == (0 - 1) && r4 == 0 && b1 == (0 - 1) && b2 == (0 - 1)) {
+        o_out("EPW-SET-OK\n");
+    }
+    syscall(6, s, 0, 0, 0);
+    syscall(6, ep, 0, 0, 0);
+    return 0;
+}
+
+# ── TMO: the timeout, the poll, a timerfd deadline ──
+fn ph_tmo() {
+    var ep = ep_new();
+    var s = sfd_new(1 << 11);                                      # never posted: nothing is ever ready
+    ep_set(ep, s, EPOLLIN);
+    var t0 = us();
+    var r = ep_wait(ep, 4, 200);
+    var d = us() - t0;
+    o_out("EPW-TMO"); o_kv("rc", r); o_kv("us", d); o_nl();
+    var t1 = us();
+    var r2 = ep_wait(ep, 4, 0);
+    var d2 = us() - t1;
+    o_out("EPW-POLL"); o_kv("rc", r2); o_kv("us", d2); o_nl();
+    var tf = tfd_new_sec(1);
+    var g = ep_set(ep, tf, EPOLLIN);
+    var t2 = us();
+    var r3 = ep_wait(ep, 4, 3000);
+    var d3 = us() - t2;
+    o_out("EPW-TFD"); o_kv("set", g); o_kv("rc", r3); o_kv("tfdok", ev_data(0) == tf); o_kv("us", d3); o_nl();
+    syscall(6, tf, 0, 0, 0);
+    syscall(6, s, 0, 0, 0);
+    syscall(6, ep, 0, 0, 0);
+    return 0;
+}
+
+# ── K1-K4: a signal and a waiter (the child side) ──
+fn role_k(kind) {
+    var ep = ep_new();
+    var s = 0 - 1;
+    if (kind == 2) { sig_block(1 << 10); s = sfd_new(1 << 10); }
+    else { s = sfd_new(1 << 11); }
+    if (kind == 3) { sig_block(1 << 14); }
+    ep_set(ep, s, EPOLLIN);
+    var tmo = 3000;
+    if (kind == 2) { tmo = 5000; }
+    if (kind == 3) { tmo = 600; }
+    if (kind == 4) { tmo = 0 - 1; }
+    var t0 = us();
+    var r = ep_wait(ep, 4, tmo);
+    var d = us() - t0;
+    o_out("EPW-K"); o_num(kind); o_kv("rc", r); o_kv("dataok", ev_data(0) == s); o_kv("us", d); o_nl();
+    return 0;
+}
+# The parent: spawn, wait until the child is BLOCKED (#99 state 6), send `sig`, reap.
+fn ph_k(kind, sig) {
+    var role = "k1";
+    if (kind == 2) { role = "k2"; }
+    if (kind == 3) { role = "k3"; }
+    if (kind == 4) { role = "k4"; }
+    var pid = spawn_role(role);
+    if (pid < 0) { o_out("EPW-FAIL k-spawn"); o_kv("kind", kind); o_kv("rc", pid); o_nl(); return 0; }
+    var t0 = ms();
+    var st = 0 - 1;
+    while (ms() - t0 < 10000) {
+        st = pstate(pid);
+        if (st == 6) { break; }
+        sleep(2);
+    }
+    var t1 = us();
+    syscall(16, pid, sig, 0, 0);
+    var rs = reap(pid);
+    var dt = us() - t1;
+    o_out("EPW-KP"); o_num(kind); o_kv("blocked", st == 6); o_kv("status", rs); o_kv("reap_us", dt); o_nl();
+    return 0;
+}
+
+# ── the network phases (a host peer on the hostfwd'd 8090) ──
+# Accept one connection through a listener EPOLLIN wait (10 s cap); the listener watch is dropped again. -1 = none.
+fn acc_wait(lid, ep) {
+    ep_set(ep, EP_TCP | lid, EPOLLIN);
+    var r = ep_wait(ep, 8, 10000);
+    ep_set(ep, EP_TCP | lid, 0);
+    if (r < 1) { return 0 - 1; }
+    return t_accept(lid);
+}
+fn ph_bulk(lid, ep, mode) {
+    o_out("EPW-B"); o_num(mode); o_out("-GO\n");
+    var c = acc_wait(lid, ep);
+    if (c < 0) { o_out("EPW-FAIL bulk-accept"); o_kv("mode", mode); o_nl(); return 0; }
+    ep_set(ep, EP_TCP | c, EPOLLOUT);
+    var off = 0;
+    var calls = 0;
+    var waits = 0;
+    var tmo = 0;
+    var t0 = us();
+    while (off < BULK) {
+        if (us() - t0 > 90000000) { break; }
+        var p = &pat + (off & 4095);
+        var n = 4096 - (off & 4095);
+        if (n > BULK - off) { n = BULK - off; }
+        var r = 0;
+        if (mode == 2) { r = syscall(48, c, p, n, 0); }            # #48: blocks until every byte is ACKed
+        else { r = syscall(109, c, p, n, 0 - 1); }                 # #109, a negative ceiling: no wait at all
+        calls = calls + 1;
+        if (r < 0) { break; }
+        off = off + r;
+        if (off >= BULK) { break; }
+        if (mode == 1) {
+            var tw = us();
+            var w = ep_wait(ep, 4, 2000);                          # EPOLLOUT: the held segment was ACKed
+            waits = waits + 1;
+            # A lost ACK wake shows as a wait that ran to its 2 s deadline (its re-scan then finds the ACK: rc 1, not 0)
+            # — counted SLOW, and five of them end the phase (red in ~10 s, not 90).
+            if (us() - tw >= 1000000) { tmo = tmo + 1; if (tmo >= 5) { break; } }
+            if (w < 0) { break; }
+        }
+        if (mode == 3) { if (r == 0) { syscall(44, 0, 0, 0, 0); waits = waits + 1; } }
+    }
+    if (mode != 2) { ep_wait(ep, 4, 2000); }                       # the last segment's ACK, before the close
+    var d = us() - t0;
+    ep_set(ep, EP_TCP | c, 0);
+    t_close(c);
+    o_out("EPW-B"); o_num(mode); o_kv("bytes", off); o_kv("calls", calls); o_kv("waits", waits); o_kv("slow", tmo);
+    o_kv("us", d); o_nl();
+    return 0;
+}
+fn ph_s1(lid, ep) {
+    o_out("EPW-S1-GO\n");
+    var a = acc_wait(lid, ep);
+    if (a < 0) { o_out("EPW-FAIL s1-accept-a\n"); return 0; }
+    ep_set(ep, EP_TCP | a, EPOLLIN);
+    ep_wait(ep, 8, 10000);
+    t_recv(a, &rxb, 16);                                           # its role byte
+    ep_set(ep, EP_TCP | a, 0);
+    o_out("EPW-S1-GOT-A\n");
+    var b = acc_wait(lid, ep);
+    if (b < 0) { o_out("EPW-FAIL s1-accept-b\n"); t_close(a); return 0; }
+    ep_set(ep, EP_TCP | a, EPOLLOUT);
+    ep_set(ep, EP_TCP | b, EPOLLIN);
+    var bint = EPOLLIN;
+    var aoff = 0;
+    var bpend = 0;
+    var echoed = 0;
+    var waits = 0;
+    var t0 = us();
+    var a_last = t0;
+    var a_stall = 0;
+    var done = 0;
+    while (done == 0) {
+        if (us() - t0 > 30000000) { break; }
+        var n = ep_wait(ep, 8, 1000);
+        waits = waits + 1;
+        if (n < 0) { break; }
+        var a_w = 0;
+        var k = 0;
+        while (k < n) {
+            var dk = ev_data(k);
+            var mk = ev_mask(k);
+            if (dk == (EP_TCP | a)) { if ((mk & EPOLLOUT) != 0) { a_w = 1; } }
+            if (dk == (EP_TCP | b)) {
+                if ((mk & (EPOLLIN | EPOLLERR | EPOLLHUP)) != 0) {
+                    var room = 1024 - bpend;
+                    if (room > 512) { room = 512; }
+                    var r = t_recv(b, &bout + bpend, room);
+                    if (r > 0) {
+                        var q = 0;
+                        while (q < r) { if (load8(&bout + bpend + q) == 81) { done = 1; } q = q + 1; }   # 'Q'
+                        bpend = bpend + r;
+                    }
+                    if (r < 0) { done = 1; }
+                }
+            }
+            k = k + 1;
+        }
+        if (a_w == 1) {
+            var now = us();
+            if (now - a_last > a_stall) { a_stall = now - a_last; }
+            a_last = now;
+            var ra = syscall(109, a, &pat + (aoff & 4095), 4096 - (aoff & 4095), 0 - 1);
+            if (ra > 0) { aoff = aoff + ra; }
+        }
+        if (bpend > 0) {
+            var rb = syscall(109, b, &bout, bpend, 0 - 1);
+            if (rb > 0) {
+                var j = 0;
+                while (j < bpend - rb) { store8(&bout + j, load8(&bout + rb + j)); j = j + 1; }
+                bpend = bpend - rb;
+                echoed = echoed + rb;
+            }
+        }
+        var want = EPOLLIN;
+        if (bpend > 0) { want = EPOLLIN | EPOLLOUT; }
+        if (want != bint) { ep_set(ep, EP_TCP | b, want); bint = want; }
+    }
+    var tend = us();
+    if (tend - a_last > a_stall) { a_stall = tend - a_last; }
+    ep_set(ep, EP_TCP | a, 0);
+    ep_set(ep, EP_TCP | b, 0);
+    t_close(b);
+    t_close(a);
+    o_out("EPW-S1"); o_kv("waits", waits); o_kv("a_bytes", aoff); o_kv("a_stall_ms", a_stall / 1000);
+    o_kv("echoed", echoed); o_kv("us", tend - t0); o_kv("done", done); o_nl();
+    return 0;
+}
+fn ph_net() {
+    var lid = syscall(56, 8090, 0, 0, 0);
+    if (lid < 0) { o_out("EPW-FAIL listen\n"); return 0; }
+    var ep = ep_new();
+    # L1 — a listener's child wakes EPOLLIN
+    var g = ep_set(ep, EP_TCP | lid, EPOLLIN);
+    var t0 = us();                                                 # BEFORE the marker: a console write can take ~0.2 s
+    o_out("EPW-L1-ARM\n");
+    var r = ep_wait(ep, 8, 10000);
+    var d = us() - t0;
+    var m = ev_mask(0);
+    var dok = ev_data(0) == (EP_TCP | lid);
+    var c = t_accept(lid);
+    o_out("EPW-L1"); o_kv("set", g); o_kv("rc", r); o_kv("ev", m); o_kv("dataok", dok); o_kv("us", d); o_kv("c", c); o_nl();
+    ep_set(ep, EP_TCP | lid, 0);
+    if (c < 0) { o_out("EPW-FAIL L1 accept\n"); t_close(lid); return 0; }
+    # R1 — RX wakes EPOLLIN
+    ep_set(ep, EP_TCP | c, EPOLLIN);
+    t0 = us();
+    o_out("EPW-R1-ARM\n");
+    r = ep_wait(ep, 8, 10000);
+    d = us() - t0;
+    m = ev_mask(0);
+    var nr = t_recv(c, &rxb, 100);
+    o_out("EPW-R1"); o_kv("rc", r); o_kv("ev", m); o_kv("n", nr); o_kv("us", d); o_nl();
+    # O1 — nothing held: EPOLLOUT at once
+    ep_set(ep, EP_TCP | c, EPOLLOUT);
+    t0 = us();
+    r = ep_wait(ep, 8, 1000);
+    d = us() - t0;
+    o_out("EPW-O1"); o_kv("rc", r); o_kv("ev", ev_mask(0)); o_kv("us", d); o_nl();
+    # H1 — the peer's FIN wakes EPOLLIN | EPOLLRDHUP
+    ep_set(ep, EP_TCP | c, EPOLLIN | EPOLLRDHUP);
+    t0 = us();
+    o_out("EPW-H1-ARM\n");
+    r = ep_wait(ep, 8, 10000);
+    d = us() - t0;
+    m = ev_mask(0);
+    var ne = t_recv(c, &rxb, 100);
+    o_out("EPW-H1"); o_kv("rc", r); o_kv("ev", m); o_kv("eof", ne); o_kv("us", d); o_nl();
+    ep_set(ep, EP_TCP | c, 0);
+    t_close(c);
+    # H2 — a peer reset wakes EPOLLERR | EPOLLHUP with an interest of nothing (EPOLLPRI is not an agnos bit)
+    o_out("EPW-H2-ACC\n");
+    var c2 = acc_wait(lid, ep);
+    if (c2 >= 0) {
+        ep_set(ep, EP_TCP | c2, EPOLLPRI);
+        t0 = us();
+        o_out("EPW-H2-ARM\n");
+        r = ep_wait(ep, 8, 10000);
+        d = us() - t0;
+        o_out("EPW-H2"); o_kv("rc", r); o_kv("ev", ev_mask(0)); o_kv("us", d); o_nl();
+        ep_set(ep, EP_TCP | c2, 0);
+        t_close(c2);
+    } else {
+        o_out("EPW-FAIL H2 accept\n");
+    }
+    ph_bulk(lid, ep, 1);
+    ph_bulk(lid, ep, 2);
+    ph_bulk(lid, ep, 3);
+    ph_s1(lid, ep);
+    syscall(6, ep, 0, 0, 0);
+    t_close(lid);
+    return 0;
+}
+
+fn driver() {
+    var i = 0;
+    while (i < 4096) { store8(&pat + i, (i * 7 + 3) & 0xFF); i = i + 1; }
+    NET_IP = syscall(61, 0, 0, 0, 0);
+    o_out("EPW-START"); o_kv("netip", NET_IP); o_kv("us", us()); o_nl();
+    ph_cap();
+    ph_tmo();
+    ph_k(1, 12);
+    ph_k(2, 10);
+    ph_k(3, 14);
+    ph_k(4, 9);
+    if (NET_IP != 0) { ph_net(); } else { o_out("EPW-NONET\n"); }
+    o_out("EPW-DONE\n");
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) {
+        var role = argv(1);
+        if (s_eq(role, "k1") == 1) { return role_k(1); }
+        if (s_eq(role, "k2") == 1) { return role_k(2); }
+        if (s_eq(role, "k3") == 1) { return role_k(3); }
+        if (s_eq(role, "k4") == 1) { return role_k(4); }
+        o_out("EPW-BAD-ROLE\n");
+        return 98;
+    }
+    # ⛔ Only /bin/agnsh (kybernet's launch) is the driver; a child with no role must not re-run it.
+    if (s_eq(argv(0), "/bin/agnsh") == 0) { o_out("EPW-NO-ROLE\n"); return 99; }
+    return driver();
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

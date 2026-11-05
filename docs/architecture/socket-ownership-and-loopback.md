@@ -53,7 +53,9 @@ slot's boot-pool buffer.
    a NIC-less box (net_ip 0) has loopback TCP.
 9. **LOOPBACK class = bind(127.0.0.1).** `#56` class 1 sets `TCP_FLAG_LO_ONLY`; the claim refuses a passive child
    whose SYN was not addressed to 127/8 (a local dial to net_ip included) — enforced ONCE, in the claim, in the same
-   hold as the listener lookup. Such a SYN can only originate on this host (invariant 8).
+   hold as the listener lookup. Such a SYN can only originate on this host (invariant 8). Since 1.57.17 the refusal
+   is answered RST|ACK (invariant 12: nobody listens at THAT address — Linux resets a SYN to a socket bound
+   elsewhere), so a local dial to net_ip is refused at once instead of waiting out #47's 8 s ceiling.
 10. **Local address (+168).** Active: `net_src_for(dst)` at the claim; passive child: the SYN's destination; LISTEN:
     0. `tcp_send_pkt_seq` sources every segment from it, so a dial to 127.0.0.2 is answered FROM 127.0.0.2 (the
     route alone would say 127.0.0.1 and the reply would never match). **The demux keys on it too** (1.57.7 ENDFIX,
@@ -63,6 +65,20 @@ slot's boot-pool buffer.
 11. **UDP.** Listener buffers come from a boot pool (`udp_pool_init`, never freed); owner fields as TCP; `#53/#54`
     refuse a non-owner; `#52` refuses a source port bound by ANOTHER owner, kernel ports included (EADDRINUSE), and
     returns the frame length on the wire and the loopback path alike.
+12. **A segment that matches no connection draws ONE RST** (1.57.17, `tcp_rst_noconn`; RFC 9293 § 3.10.7.1 / .2;
+    issue `2026-10-31-a-segment-for-no-connection-gets-no-rst`). No conn (a state-0 slot never matches) and not a
+    RST: no listener on the port → ACK on `<SEQ=SEG.ACK><CTL=RST>`, ACK off `<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>`
+    (SYN and FIN one each); a listener → an ACK-bearing segment is reset, a SYN takes the passive open, anything else
+    is dropped; a LOOPBACK-class refusal (invariant 9) is reset; a CAPACITY refusal (table, SYN_RCVD cap, passive
+    reserve) stays a silent drop — the peer's SYN retransmit is the backlog. A RST is never answered, and a SYN|RST
+    no longer opens a child. Only behind the destination gate (invariant 8), never to a source of 0/8, ≥ 224 or our
+    subnet's directed broadcast, 54 B (never larger than its cause), no slot, no rate limit (1:1, amplifies nothing).
+    ⛔ **Loopback can no longer model a SILENT peer.** Every 127/8 and `net_ip` 4-tuple belongs to this host, so a dial
+    to a closed local port is refused at once and a fake slot's looped output is answered with a RST that resets the
+    slot. A test that needs a peer which never answers cannot use a closed local port: TCP_SELFTEST raises
+    `tcp_rst_mute` (a TCP_SELFTEST-image-only hook) around its fake-peer arms, and TCP_ADDR_SELFTEST discards
+    (`ta_lo_flush`) rather than delivers its fake clients' SYN-ACKs. Gates: TCP_ADDR_SELFTEST R1–R8
+    (`sock-owner-smoke.sh` boot A) and `tcp-rst-smoke.sh` (from the host, through SLIRP).
 
 ## sock_peer#106
 

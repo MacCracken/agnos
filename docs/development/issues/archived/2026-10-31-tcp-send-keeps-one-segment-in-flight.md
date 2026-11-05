@@ -1,6 +1,33 @@
 # 2026-10-31 — TCP send keeps one segment in flight, and ring 3 cannot wait for "writable", so a server that must not block is RTT-bound
 
-**Status:** 🟡 OPEN.
+**Status:** ✅ **RESOLVED in 1.57.17 — fix 2 only, the readiness wait (OPERATOR RULING 2026-11-04).** ⏳ **Fix 1, the
+send window, is NOT done and stays a later item**: the kernel still keeps one segment in flight, so a non-blocking
+sender still pays one round trip per segment — it now WAITS for it instead of polling.
+What shipped (ABI rows #19-#21; invariants `docs/architecture/blocking-waits.md` § epoll_wait):
+- **`epoll_wait`#21 blocks** when `max` carries **`EPW_TIMED`** (bit 32, `0x100000000`): a4 = timeout ms (> 0 bounded,
+  < 0 forever, 0 poll); without the bit it is the old poll byte for byte (a 3-argument call's a4 is a stale r10). A
+  canonical C9 wq wait (`ep_wait`, syscall.cyr) on `WK_EPOLL | <TCP slot bits>`, woken by `wq_wake_anybit` from the TCP
+  demux (`tcp_demux_epm`: bytes queued, FIN, RST, **the ACK that clears the held segment**, a listener's child
+  ESTABLISHED) and retransmit exhaustion; by every ordinary-signal post (`ep_sig_locked`: kill#16, SIGCONT, SIGWINCH,
+  SIGCHLD) — **-4** (Linux's -EINTR value) when nothing is ready and the signal is not blocked; by a watched timerfd's
+  deadline; and by the lifecycle (SIGKILL / SIGSTOP). #21's number kept; no new syscall.
+- **`epoll_ctl`#20 op 3 = SET** (a4 = `EPOLLIN` 0x1 · **`EPOLLOUT` 0x4** · `EPOLLRDHUP` 0x2000; ERR/HUP always; 0 =
+  delete) on a VFS fd or **`EP_TCP` (0x10000) `| id`** — the raw conn / listener ids ring 3 holds (they were not
+  watchable at all before: #57 returns a conn id, not a VFS fd). **EPOLLOUT = no held segment**; a listener is
+  readable when #57 would return a conn. **128 watches** per instance (was 8); `max` ≤ 128 (was 16).
+- ⚠ The TCP table is **8 slots** (listeners included), so agora's "64 clients" cannot exist on agnos today whatever
+  the watch limit — a separate item.
+Proven by `scripts/smoke/epoll-smoke.sh` (`tests/epoll/epw.cyr`), **126/126** at `-smp 1` (TCG) and `-smp 4` (KVM):
+the 200 ms timeout returns 0 in 205-207 ms; RX / a listener's child / FIN / RST / a signalfd's signal / an unblocked
+signal (-4) / a timerfd each end a wait; a blocked signal does not; SIGKILL reaps a waiter seen BLOCKED (state 6).
+**Rates (512 KB, the issue's measurement):** `-smp 4` KVM — **#109 no-wait + one EPOLLOUT wait per segment 4,363 KB/s**,
+`#48` blocking 7,682, `#109` + `#44` (agora 1.13.2's shape) 135; `-smp 1` TCG — 3,533 / 3,786 / 4,478. **Bystander**
+(one process, a client that never reads beside an echo client): worst steady-state echo **≤ 1 ms** (median 0.5 ms;
+the first echo, which carries the guest's console write, 122-192 ms), 1,264 waits in ~3.8 s. Mutations, each red
+alone at `-smp 4`: the ACK/FIN/RST epoll wake dropped (B1 stalls: 5 waits run to their 2 s deadline; H1/H2 at their
+10 s timeouts); the data-queued bit dropped (R1 at its 10 s timeout; the bystander gets 21 echoes, worst 994 ms);
+`ep_sig_locked` never waking (K1 / K2 at their 3 s / 5 s timeouts). cyrius peer filed:
+`cyrius/docs/development/issues/2026-11-04-agnos-epoll-timeout-epollout-tcp-ids-peer.md`. agora still needs to switch.
 *(Filed from agora **1.13.2**: measured with its `scripts/agnos-smoke.py` on agnos 1.57.14 in QEMU, KVM, user
 networking. agora has taken what it can on its side; the rest is below.)*
 **Checked against:** agnos **bdc587d7** (1.57.14).

@@ -273,6 +273,7 @@ var WK_TCP = 0x0700000000000000;
 var WK_ICMP = 0x0800000000000000;
 var WK_PIPE = 0x0900000000000000;       # 1.57.8: | the pipe buffer (pipe_key, vfs.cyr) — a blocking pipe read#5; 1.57.9: | 1 (pipe_wkey) — a blocking write#1
 var WK_CHAN = 0x0A00000000000000;       # 1.57.8: | the reading endpoint — a blocking channel read#5
+var WK_EPOLL = 0x0B00000000000000;      # 1.57.17: a blocking epoll_wait#21; the low 8 bits = the TCP slots it watches (wq_wake_anybit)
 var WK_TEST = 0x7F00000000000000;
 var WR_NONE = 0;
 var WR_EVENT = 1;

@@ -2782,15 +2782,156 @@ fn ext2_create(dir_ino, name, name_len) {
     return ino;
 }
 
+# === In-core orphans: an inode whose last NAME is gone while an fd still holds it (1.57.17) ===
+#
+# POSIX unlink(2): "If one or more processes have the file open when the last link is removed, the link shall be
+# removed before unlink() returns, but the removal of the file contents shall be postponed until all references to the
+# file are closed." rename(2) over an existing name drops the replaced file's link the same way. ⛔ Until 1.57.17 every
+# last-link path here (ext2_unlink, ext2_rmdir) freed the inode and its blocks AT ONCE, open fd or not: the fd went on
+# reading the block pointers ext2_truncate_zero had cleared (zeros), a write through it allocated blocks to a FREE
+# inode, and the next create took the number back (first fit) — so a stale fd read and wrote ANOTHER file. Nothing
+# reached it in practice only because nothing could rename over a name (the staging pattern's whole point is that a
+# reader keeps the old file).
+# ⭐ PRIOR ART — Linux ext2: ext2_unlink / ext2_rename only drop i_nlink (inode_dec_link_count); the inode is written
+# with links 0 and i_dtime 0, and ext2_evict_inode frees it (ext2_delete_inode writes i_dtime, then ext2_free_inode) at
+# the LAST iput. ext2 keeps no on-disk orphan list: a crash with such a file open leaves an allocated links-0 inode that
+# e2fsck frees ("Deleted inode N has zero dtime" + bitmap differences) — fsck-repairable, like every other cut of this
+# driver (prior-art doc § 3). ext3/ext4 add the on-disk list (s_last_orphan, the chain threaded through i_dtime,
+# ext4_orphan_add) so the cleanup is silent; FreeBSD UFS defers the same way (ufs_inactive at the last vrele). Not built.
+# THE HOLDERS ARE FD SLOTS. agnos has no in-core inode cache and no open-file description (vfs_fd_inherit COPIES an fd
+# entry into a child's table), so "held" is answered by SCANNING every fd table for a VFS_EXT2_FILE / VFS_EXT2_DIR that
+# names the inode — vfs.cyr's pipe_buf_referenced rule, for the same reason: a count would have to be kept in step by
+# every inherit, fork, redirect and scrub site. The reap (ext2_orphan_reap) runs after an ext2 fd slot is cleared
+# (vfs_close_inner) and after a table is destroyed (proc_destroy_fd_table_held), and frees EVERY pending orphan no slot
+# names — so one whose last slot went by a path that clears without closing (a #43 CLEANFD scrub) is freed at the next
+# close anywhere instead of leaking. All of it under fs_lock, like every other ext2 path.
+# ⚠ 32 pending orphans at most: a last-link removal that would need a 33rd is REFUSED (-1) before anything changes
+# (ext2_orphan_room) — never freed under its holder.
+var ext2_orph_ino[32];   # pending inode numbers (0 = a free slot)
+var ext2_orph_dir[32];   # 1 when the inode is a directory (ext2_free_inode's is_dir)
+var ext2_orph_n = 0;     # live entries — the close path's fast exit
+
+# Does the fd slot at `b` name ext2 inode `ino`? 1 / 0.
+fn ext2_fd_names(b, ino) {
+    var ft = ktag(b);
+    if (ft == VFS_EXT2_FILE) { if (kpayload(b, 2) == ino) { return 1; } }
+    if (ft == VFS_EXT2_DIR)  { if (kpayload(b, 2) == ino) { return 1; } }
+    return 0;
+}
+
+# Is `ino` held by ANY fd slot on the box — the global table (proc 0, kthreads) and every per-process one? 1 / 0.
+# A dead-but-unreaped process's table counts: it is destroyed at its reap, which reaps the orphan then.
+fn ext2_ino_held(ino) {
+    var hg = 0;
+    while (hg < 32) {
+        if (ext2_fd_names(&vfs_table + hg * 32, ino) == 1) { return 1; }
+        hg = hg + 1;
+    }
+    var hp = 0;
+    while (hp < 16) {
+        var ht = proc_fd_base_get(hp);
+        if (ht != 0) {
+            if (ht != &vfs_table) {
+                var hf = 0;
+                while (hf < 32) {
+                    if (ext2_fd_names(ht + hf * 32, ino) == 1) { return 1; }
+                    hf = hf + 1;
+                }
+            }
+        }
+        hp = hp + 1;
+    }
+    return 0;
+}
+
+# May the last link of `ino` go now? 1 when nothing holds it (it will be freed at once) or a pending slot is free (it
+# will wait there); 0 only when it is held AND 32 orphans are still pending after a reap. ⚠ Clobbers ext2_inode_buf
+# (the reap) — every caller re-fetches after it.
+fn ext2_orphan_room(ino) {
+    if (ext2_ino_held(ino) == 0) { return 1; }
+    if (ext2_orph_n < 32) { return 1; }
+    ext2_orphan_reap();
+    if (ext2_orph_n < 32) { return 1; }
+    return 0;
+}
+
+fn ext2_orphan_add(ino, is_dir) {
+    var i = 0;
+    while (i < 32) {
+        if (load64(&ext2_orph_ino + i * 8) == 0) {
+            store64(&ext2_orph_ino + i * 8, ino);
+            store64(&ext2_orph_dir + i * 8, is_dir);
+            ext2_orph_n = ext2_orph_n + 1;
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# Free the links-0 inode `ino`, which ext2_inode_buf holds: i_dtime, then its blocks, then its bitmap bit (doc § 3's
+# free order; the dtime sentinel is explained at ext2_unlink). Returns 0 / -1.
+fn ext2_inode_free_now(ino, is_dir) {
+    ext2_store32_le(&ext2_inode_buf, 20, 1748000000);   # i_dtime: a timestamp, never an orphan-chain pointer
+    if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    ext2_truncate_zero(ino);
+    ext2_free_inode(ino, is_dir);
+    return 0;
+}
+
+# The LAST NAME of `ino` is gone: ext2_inode_buf holds it with links_count already 0, not yet written. Free it now —
+# or, when an fd anywhere still holds it, write it with links 0 and i_dtime 0 (Linux ext2's unlinked-but-open inode)
+# and leave the free to ext2_orphan_reap at the last close. Returns 0 / -1.
+fn ext2_inode_last_link(ino, is_dir) {
+    if (ext2_ino_held(ino) == 1) {
+        if (ext2_orphan_add(ino, is_dir) != 0) {
+            # Unreachable: every caller took ext2_orphan_room in the same fs_lock hold. A leak e2fsck reclaims is the
+            # safe failure; freeing it under its holder is the defect this table exists to stop.
+            kprintln("ext2: orphan table full - inode leaked until fsck", 49);
+        }
+        return ext2_put_inode(ino, &ext2_inode_buf);
+    }
+    return ext2_inode_free_now(ino, is_dir);
+}
+
+# Free every pending orphan no fd slot names any longer. Caller holds fs_lock, with no ext2 op in flight on this CPU
+# (the callers are close and fd-table teardown). Fast exit when none is pending.
+fn ext2_orphan_reap() {
+    if (ext2_orph_n == 0) { return 0; }
+    if (ext2_write_ok == 0) { return 0; }
+    var i = 0;
+    while (i < 32) {
+        var oi = load64(&ext2_orph_ino + i * 8);
+        if (oi != 0) {
+            if (ext2_ino_held(oi) == 0) {
+                store64(&ext2_orph_ino + i * 8, 0);
+                ext2_orph_n = ext2_orph_n - 1;
+                if (ext2_get_inode(oi, &ext2_inode_buf) == 0) {
+                    # belt: a links-0 inode has no name, so nothing can have relinked it (link#32 takes a PATH)
+                    if (ext2_inode_links_count(&ext2_inode_buf) == 0) {
+                        ext2_inode_free_now(oi, load64(&ext2_orph_dir + i * 8));
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Unlink a regular file `name` from `dir_ino`: remove dirent, dec links,
-# and (at 0) free the file's blocks + inode. Refuses directories (rmdir is
-# W5). Returns 0 / -1. Order (doc § 3): dirent-remove → links-- → free.
+# and (at 0) free the file's blocks + inode — or, while an fd still holds it,
+# at its last close (1.57.17, the in-core orphans above). Refuses directories
+# (rmdir is W5). Returns 0 / -1. Order (doc § 3): dirent-remove → links-- → free.
 fn ext2_unlink(dir_ino, name, name_len) {
     if (ext2_write_ok == 0) { return 0 - 1; }
     var ino = ext2_dir_lookup(dir_ino, name, name_len);
     if (ino <= 0) { return 0 - 1; }
     if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
     if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x4000) { return 0 - 1; }   # dir → rmdir
+    # 1.57.17: a last link an fd still holds waits in an orphan slot, taken BEFORE the name goes so a refusal changes
+    # nothing (ext2_orphan_room — it clobbers ext2_inode_buf; the inode is re-fetched below).
+    if (ext2_inode_links_count(&ext2_inode_buf) <= 1) { if (ext2_orphan_room(ino) == 0) { return 0 - 1; } }
 
     if (ext2_dir_remove(dir_ino, name, name_len) != 0) { return 0 - 1; }
 
@@ -2816,13 +2957,11 @@ fn ext2_unlink(dir_ino, name, name_len) {
         # (2025-ish); e2fsck checks dtime!=0 + plausibility, not the value.
         # (truncate_zero below re-reads/re-writes the inode but leaves
         # i_dtime untouched, so it survives.)
-        ext2_store32_le(&ext2_inode_buf, 20, 1748000000);
+        # ⭐ 1.57.17: the store, the truncate and the free are ext2_inode_free_now's, reached through
+        # ext2_inode_last_link, which defers all three while an fd still holds the inode.
+        return ext2_inode_last_link(ino, 0);
     }
     if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
-    if (links == 0) {
-        ext2_truncate_zero(ino);
-        ext2_free_inode(ino, 0);
-    }
     return 0;
 }
 
@@ -2932,6 +3071,7 @@ fn ext2_rmdir(parent_ino, name, name_len) {
     if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
     if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }  # not a dir
     if (ext2_dir_is_empty(ino) != 1) { return 0 - 1; }                            # non-empty / error
+    if (ext2_orphan_room(ino) == 0) { return 0 - 1; }                             # 1.57.17: see ext2_unlink
 
     # remove the parent's entry, then drop the parent's link (the ".." ref)
     if (ext2_dir_remove(parent_ino, name, name_len) != 0) { return 0 - 1; }
@@ -2939,17 +3079,14 @@ fn ext2_rmdir(parent_ino, name, name_len) {
     ext2_inode_set_links_count(&ext2_inode_buf, ext2_inode_links_count(&ext2_inode_buf) - 1);
     if (ext2_put_inode(parent_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
 
-    # free the dir: links 0 + dtime, truncate its block(s), free the inode
+    # free the dir: links 0 + dtime, truncate its block(s), free the inode (is_dir → bg_used_dirs--) — or, while an
+    # AO_DIRECTORY fd still holds it, all of that at its last close (1.57.17, ext2_inode_last_link)
     if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
     ext2_inode_set_links_count(&ext2_inode_buf, 0);
-    ext2_store32_le(&ext2_inode_buf, 20, 1748000000);    # i_dtime (see ext2_unlink)
-    if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
-    ext2_truncate_zero(ino);
-    ext2_free_inode(ino, 1);                             # is_dir → bg_used_dirs--
-    return 0;
+    return ext2_inode_last_link(ino, 1);
 }
 
-# === rename / mv (WRITE arc 1.33.3 — bite 1) =========================
+# === rename / mv (WRITE arc 1.33.3 — bite 1; REPLACE since 1.57.17) =====
 #
 # Move/rename `src_name` in `src_parent` to `dst_name` in `dst_parent`.
 # Pure recomposition of the W4 dirent insert/remove + inode link
@@ -2959,8 +3096,16 @@ fn ext2_rmdir(parent_ino, name, name_len) {
 # counts on a cross-parent move, then remove the OLD dirent last. e2fsck
 # Pass-3 (directory connectivity) + Pass-4 (link counts) are the oracle.
 #
-# Base-stage scope (documented limits, each e2fsck-safe):
-#   - refuses if `dst_name` already exists (rename-replace is a follow-on)
+# ⭐ 1.57.17 — OVER AN EXISTING NAME the destination is REPLACED (POSIX rename(2)), atomically with respect to a crash:
+# the commit is ONE dirent rewritten in place, and the write order around it is ext2_rename_replace's. Until 1.57.17
+# this refused ("rename-replace is a follow-on"), so the staging pattern every crash-safe writer uses (write x.tmp,
+# fsync, rename over x) could not work at all: hapi's manifest writer refused to run and descent kept only each
+# player's creation record (issues 2026-10-28-ext2-rename-cannot-replace-an-existing-file,
+# 2026-11-02-ext2-rename-cannot-replace-loses-every-descent-save).
+#
+# Scope (documented limits, each e2fsck-safe):
+#   - "." / ".." are refused as either name (POSIX EINVAL / EBUSY)
+#   - two names of ONE inode (hard links): 0, nothing done (POSIX)
 #   - refuses moving a directory into itself or one of its descendants
 #     (would orphan the subtree / create a `..` cycle e2fsck must cut)
 #   - linear dirs only (we never create htree-indexed dirs)
@@ -3036,8 +3181,195 @@ fn ext2_is_ancestor(maybe_ancestor, start_dir) {
     return 0 - 1;   # too deep — refuse rather than risk an undetected loop
 }
 
+# Is the name "." or ".."? 1 / 0.
+fn ext2_name_is_dot(name, nl) {
+    if (nl == 1) { if (load8(name) == 46) { return 1; } }
+    if (nl == 2) { if (load8(name) == 46) { if (load8(name + 1) == 46) { return 1; } } }
+    return 0;
+}
+
+# Rewrite the dirent `name` of `dir_ino` IN PLACE to (new_ino, ftype) — ONE block write: rename-replace's commit
+# point (Linux ext2_set_link). Re-stamps the leaf csum. Walks like ext2_dir_remove (every record gated on
+# ext2_dirent_valid, stopping before the csum tail). Returns 0, or -1 (not found / a bad record / I/O).
+fn ext2_dir_set_entry(dir_ino, name, name_len, new_ino, ftype) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }
+    var dir_size = ext2_inode_size_lo(&ext2_inode_buf);
+    var nblocks = dir_size / ext2_blocksize;
+    var dir_gen = ext2_load32_le(&ext2_inode_buf, 100);
+    var lb = 0;
+    while (lb < nblocks) {
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, lb);
+        if (phys == 0 - 1) { return 0 - 1; }
+        if (phys != 0) {
+            if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+            var off = 0;
+            var lim = ext2_dir_limit();
+            while (off < lim) {
+                var d = &ext2_dir_buf + off;
+                var e_ino = ext2_load32_le(d, 0);
+                var e_rl  = ext2_load16_le(d, 4);
+                var e_nl  = load8(d + 6);
+                if (ext2_dirent_valid(off, e_rl, e_nl) == 0) { return 0 - 1; }
+                if (e_ino != 0) {
+                    if (e_nl == name_len) {
+                        if (memeq(d + 8, name, name_len) == 1) {
+                            ext2_store32_le(&ext2_dir_buf, off, new_ino);   # 4 aligned bytes: never split by a sector
+                            store8(d + 7, ftype);
+                            if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
+                            if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+                            return 0;
+                        }
+                    }
+                }
+                off = off + e_rl;
+            }
+        }
+        lb = lb + 1;
+    }
+    return 0 - 1;   # not found
+}
+
+# The rename-replace crash-cut hook (1.57.17). A plain kernel's is empty; an EXT2_RNCUT_SELFTEST kernel halts the box
+# right after cut `step` — every write before it is on the platter (blk_write completes before returning) and none
+# after — so scripts/smoke/ext2-rename-replace-smoke.sh can read each cut on the host. The steps are
+# ext2_rename_replace's.
+#ifdef EXT2_RNCUT_SELFTEST
+var ext2_rncut_at = 0 - 1;          # the cut that halts (-1: none); set by ext2_rncut_selftest from /rncut
+fn ext2_rncut(step) {
+    if (step != ext2_rncut_at) { return 0; }
+    blk_flush_on(ext2_backend);      # the drive's volatile cache too: a cut is what the medium holds
+    kprint("rncut: HALT at cut ", 19);
+    kprintln_num_only(step);
+    arch_halt();
+    return 0;
+}
+#endif
+#ifndef EXT2_RNCUT_SELFTEST
+fn ext2_rncut(step) { return 0; }
+#endif
+
+# rename over an existing name (1.57.17). `dst_ino` is the destination name's inode (the VICTIM); src replaces it.
+#
+# ⭐ THE COMMIT IS ONE BLOCK WRITE — the destination dirent rewritten IN PLACE to src's inode number and file type
+# (ext2_dir_set_entry). The inode field is 4 aligned bytes, so no sector boundary splits it. Every write before the
+# commit leaves `dst_name` naming the victim; every write after it, src. No cut leaves the name naming nothing — the
+# property the staging pattern exists for. (Unlinking the victim and then moving src has a cut with NO name: the window
+# hapi and descent each refused to open in ring 3.)
+# ⭐ PRIOR ART. Linux ext2_rename (fs/ext2/namei.c): find the new entry, ext2_set_link() it to the old inode, drop the
+# victim's link (a directory: drop_nlink + inode_dec_link_count), ext2_delete_entry() the old name, then the moved
+# directory's ".." and the parents' counts. ext2 orders none of it — page-cache writes reach disk in any order, so
+# ext2's crash story is e2fsck. ext4_rename does the same steps in ONE jbd2 handle (atomic by the journal) and puts a
+# victim whose count reached 0 on the orphan list. Here every step is a write that completes before the next (prior-art
+# doc § 3), so the ORDER is the crash story, under the doc's rule: an inode's count is never too LOW for the names that
+# reference it (a later unlink would free it under a live name), only too high (a leak e2fsck reclaims).
+#
+# A FILE (src is not a directory; the victim must not be one — EISDIR):
+#   1. src links + 1        it is about to have two names
+#   2. * dst dirent -> src                                                        THE COMMIT
+#   3. src's old dirent removed
+#   4. src links - 1        its true count again
+#   5. the victim loses a link; at 0 it is freed — or, held by an open fd, at that fd's last close (ext2_inode_last_link)
+#   Cuts: 0-1 dst = OLD (at 1 src's count is one high); 2-4 dst = NEW (a file may have two names; its count is right or
+#   one high), the victim unattached until 5 (e2fsck -> /lost+found, its bytes intact); 5 = done, e2fsck-clean.
+# A DIRECTORY (the victim must be an EMPTY directory — ENOTDIR / ENOTEMPTY otherwise):
+#   1. src's old dirent removed FIRST
+#   2. * dst dirent -> src                                                        THE COMMIT
+#   3. crossing parents: src's ".." -> dst_parent
+#   4. src_parent links - 1   crossing: src's ".." left it; one parent: the victim's ".." (to it) is the one gone.
+#                             dst_parent's count is unchanged either way: src's ".." takes the victim's place.
+#   5. the victim: links -> 0 ("." and its name, both gone), freed now or at the last close of a dir fd holding it
+#   ⛔ WHY THE OLD NAME GOES FIRST FOR A DIRECTORY: a directory has ONE parent entry, and with two on disk e2fsck's pass
+#   2 keeps the FIRST it meets (in directory-block order) and CLEARS the other ("Entry ... is a link to directory ...")
+#   — so a repair could delete the DESTINATION entry and leave the name missing. With the old entry gone first, a cut
+#   at 1 leaves dst = the victim and src nameless (pass 3 reconnects it to /lost+found, subtree intact); a cut at 2-4
+#   leaves dst = src, at worst with a stale ".." (pass 3 fixes it).
+# Every refusal happens before the first write. Returns 0 / -1 (an I/O error after the commit leaves an
+# e2fsck-repairable image, as every multi-write op here does).
+fn ext2_rename_replace(src_parent, src_name, src_nl, src_ino, src_is_dir, ftype, dst_parent, dst_name, dst_nl, dst_ino) {
+    if (ext2_get_inode(dst_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var dst_is_dir = 0;
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x4000) { dst_is_dir = 1; }
+    var dst_links = ext2_inode_links_count(&ext2_inode_buf);
+    # POSIX (Linux vfs_rename -> may_delete): a directory only over a directory, a non-directory only over a
+    # non-directory — ENOTDIR / EISDIR.
+    if (src_is_dir != dst_is_dir) { return 0 - 1; }
+    if (dst_is_dir == 1) {
+        if (ext2_dir_is_empty(dst_ino) != 1) { return 0 - 1; }       # ENOTEMPTY (or a read error)
+    }
+    # The victim's free may have to wait for its last close: its slot is taken BEFORE the first write.
+    var dies = dst_is_dir;
+    if (dst_links <= 1) { dies = 1; }
+    if (dies == 1) { if (ext2_orphan_room(dst_ino) == 0) { return 0 - 1; } }
+    ext2_rncut(0);
+
+    if (src_is_dir == 1) {
+        # 1. the old name first (see the header)
+        if (ext2_dir_remove(src_parent, src_name, src_nl) != 0) { return 0 - 1; }
+        ext2_rncut(1);
+        # 2. * THE COMMIT
+        if (ext2_dir_set_entry(dst_parent, dst_name, dst_nl, src_ino, ftype) != 0) {
+            ext2_dir_insert(src_parent, src_name, src_nl, src_ino, ftype);   # nothing committed: the old name back
+            return 0 - 1;
+        }
+        ext2_rncut(2);
+        # 3. its ".." follows it
+        if (src_parent != dst_parent) {
+            if (ext2_dir_set_dotdot(src_ino, dst_parent) != 0) { return 0 - 1; }
+        }
+        ext2_rncut(3);
+        # 4. src_parent loses the ".." that no longer names it
+        if (ext2_get_inode(src_parent, &ext2_inode_buf) != 0) { return 0 - 1; }
+        ext2_inode_set_links_count(&ext2_inode_buf, ext2_inode_links_count(&ext2_inode_buf) - 1);
+        if (ext2_put_inode(src_parent, &ext2_inode_buf) != 0) { return 0 - 1; }
+        ext2_rncut(4);
+    } else {
+        # 1. two names are coming: say so first
+        if (ext2_get_inode(src_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+        var sl = ext2_inode_links_count(&ext2_inode_buf);
+        ext2_inode_set_links_count(&ext2_inode_buf, sl + 1);
+        if (ext2_put_inode(src_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+        ext2_rncut(1);
+        # 2. * THE COMMIT
+        if (ext2_dir_set_entry(dst_parent, dst_name, dst_nl, src_ino, ftype) != 0) {
+            if (ext2_get_inode(src_ino, &ext2_inode_buf) == 0) {      # nothing committed: the count back
+                ext2_inode_set_links_count(&ext2_inode_buf, sl);
+                ext2_put_inode(src_ino, &ext2_inode_buf);
+            }
+            return 0 - 1;
+        }
+        ext2_rncut(2);
+        # 3. the old name
+        if (ext2_dir_remove(src_parent, src_name, src_nl) != 0) { return 0 - 1; }
+        ext2_rncut(3);
+        # 4. one name again
+        if (ext2_get_inode(src_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+        ext2_inode_set_links_count(&ext2_inode_buf, sl);
+        if (ext2_put_inode(src_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+        ext2_rncut(4);
+    }
+
+    # 5. the victim loses its name (a directory both its links: "." and the entry)
+    if (ext2_get_inode(dst_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var dl = ext2_inode_links_count(&ext2_inode_buf) - 1;
+    if (dst_is_dir == 1) { dl = 0; }
+    if (dl < 0) { dl = 0; }
+    ext2_inode_set_links_count(&ext2_inode_buf, dl);
+    var vr = 0;
+    if (dl == 0) { vr = ext2_inode_last_link(dst_ino, dst_is_dir); }
+    else { vr = ext2_put_inode(dst_ino, &ext2_inode_buf); }
+    ext2_rncut(5);
+    return vr;
+}
+
 fn ext2_rename(src_parent, src_name, src_nl, dst_parent, dst_name, dst_nl) {
     if (ext2_write_ok == 0) { return 0 - 1; }
+    # 1.57.17 — "." and ".." are never a rename operand (POSIX EINVAL / EBUSY; Linux refuses both before vfs_rename).
+    # vfs_ext2_parent hands either through as a basename, and moving one would unlink a directory's self or parent
+    # entry.
+    if (ext2_name_is_dot(src_name, src_nl) == 1) { return 0 - 1; }
+    if (ext2_name_is_dot(dst_name, dst_nl) == 1) { return 0 - 1; }
 
     var src_ino = ext2_dir_lookup(src_parent, src_name, src_nl);
     if (src_ino <= 0) { return 0 - 1; }              # src must exist
@@ -3055,10 +3387,10 @@ fn ext2_rename(src_parent, src_name, src_nl, dst_parent, dst_name, dst_nl) {
         }
     }
 
-    # refuse if the destination name already exists — rename-replace is a
-    # follow-on bite; this keeps bite 1 e2fsck-trivially-clean.
     var dst_existing = ext2_dir_lookup(dst_parent, dst_name, dst_nl);
-    if (dst_existing != 0) { return 0 - 1; }         # >0 exists, <0 error
+    if (dst_existing < 0) { return 0 - 1; }          # a lookup error
+    # POSIX: old and new are two names of ONE file -> success, and nothing is done (Linux vfs_rename: source == target).
+    if (dst_existing == src_ino) { return 0; }
 
     var cross = 0;
     if (src_parent != dst_parent) { cross = 1; }
@@ -3069,6 +3401,11 @@ fn ext2_rename(src_parent, src_name, src_nl, dst_parent, dst_name, dst_nl) {
         if (cross == 1) {
             if (ext2_is_ancestor(src_ino, dst_parent) != 0) { return 0 - 1; }
         }
+    }
+
+    # 1.57.17 — over an existing name: REPLACE it (the ordered commit is ext2_rename_replace's)
+    if (dst_existing > 0) {
+        return ext2_rename_replace(src_parent, src_name, src_nl, src_ino, src_is_dir, ftype, dst_parent, dst_name, dst_nl, dst_existing);
     }
 
     # 1. add the new dirent FIRST (inode reachable by both names)
@@ -3091,6 +3428,44 @@ fn ext2_rename(src_parent, src_name, src_nl, dst_parent, dst_name, dst_nl) {
     if (ext2_dir_remove(src_parent, src_name, src_nl) != 0) { return 0 - 1; }
     return 0;
 }
+
+#ifdef EXT2_RNCUT_SELFTEST
+# 1.57.17 — the crash-cut driver (EXT2_RNCUT_SELFTEST=1; scripts/smoke/ext2-rename-replace-smoke.sh). The host seeds
+# /rncut = "<S><K>": S selects one rename-replace — F a file over a file in one directory (/cut/x.tmp -> /cut/x), X a
+# file over a file across directories (/cut/a/x -> /cut/b/x), D a directory over an EMPTY directory across parents
+# (/cut/a/s -> /cut/b/v) — and K the cut 0-5 after which ext2_rncut halts the box (9 = none: the whole op). The box
+# halts at the end either way, so nothing writes after the cut the host reads.
+fn ext2_rncut_selftest() {
+    if (ext2_write_ok == 0) { kprintln("rncut: SKIP (no writable ext2)", 30); return 0; }
+    var ci = ext2_path_lookup("/rncut", 6);
+    if (ci <= 0) { kprintln("rncut: SKIP (no /rncut)", 23); return 0; }
+    var cb[8];                                       # LOCAL arrays are N BYTES
+    if (ext2_read_at(ci, 0, &cb, 2) != 2) { kprintln("rncut: BAD /rncut", 17); return 0; }
+    var sc = load8(&cb);
+    ext2_rncut_at = load8(&cb + 1) - 48;
+    var r = 0 - 1;
+    if (sc == 70) {                                   # 'F'
+        var fp = ext2_path_lookup("/cut", 4);
+        if (fp > 0) { r = ext2_rename(fp, "x.tmp", 5, fp, "x", 1); }
+    }
+    if (sc == 88) {                                   # 'X'
+        var xa = ext2_path_lookup("/cut/a", 6);
+        var xb = ext2_path_lookup("/cut/b", 6);
+        if (xa > 0) { if (xb > 0) { r = ext2_rename(xa, "x", 1, xb, "x", 1); } }
+    }
+    if (sc == 68) {                                   # 'D'
+        var da = ext2_path_lookup("/cut/a", 6);
+        var db = ext2_path_lookup("/cut/b", 6);
+        if (da > 0) { if (db > 0) { r = ext2_rename(da, "s", 1, db, "v", 1); } }
+    }
+    kprint("rncut: DONE r=", 14);
+    kprintln_num_only(r);
+    blk_flush_on(ext2_backend);
+    kprintln("rncut: HALT after the op", 24);
+    arch_halt();
+    return 0;
+}
+#endif
 
 # === hardlink / ln (WRITE arc 1.33.3 — bite 2) =======================
 #
@@ -4196,13 +4571,47 @@ fn ext2_write_selftest() {
     if (wrx == 1) { kprintln("ext2w: Wren xdir OK", 19); }
     else          { kprintln("ext2w: Wren xdir MISMATCH", 25); }
 
-    # (c) refuse rename onto an existing name (rename-replace is a follow-on).
+    # (c) 1.57.17 — rename REPLACES an existing name (until 1.57.17 it refused, and this arm proved the refusal).
+    #     /rnx.txt ("RX") over /rny.txt ("RY"): /rny.txt is then rnx's inode with rnx's bytes and one link, /rnx.txt
+    #     is gone, and rny's old inode is freed (no fd holds it) — one more free inode than just before the rename.
+    #     /rny.txt kept for the host check.
+    var wrr = 1;
+    var rxi = ext2_create(2, "rnx.txt", 7);
+    var ryi = ext2_create(2, "rny.txt", 7);
+    if (rxi <= 0) { wrr = 0; }
+    if (ryi <= 0) { wrr = 0; }
+    if (rxi > 0) { ext2_write_at(rxi, 0, "RX", 2); }
+    if (ryi > 0) { ext2_write_at(ryi, 0, "RY", 2); }
+    var rfi_a = ext2_sb_free_inodes_count(&ext2_sb_buf);
+    if (ext2_rename(2, "rnx.txt", 7, 2, "rny.txt", 7) != 0) { wrr = 0; }
+    if (ext2_path_lookup("/rnx.txt", 8) != 0) { wrr = 0; }         # the old name is gone
+    if (ext2_path_lookup("/rny.txt", 8) != rxi) { wrr = 0; }       # the name is rnx's inode now
+    var rrb[8];                                                    # LOCAL arrays are N BYTES
+    store64(&rrb, 0);
+    if (rxi > 0) { ext2_read_at(rxi, 0, &rrb, 2); }
+    if (load8(&rrb) != 82) { wrr = 0; }                            # 'R'
+    if (load8(&rrb + 1) != 88) { wrr = 0; }                        # 'X' — rnx's bytes, not rny's 'Y'
+    if (rxi > 0) {
+        if (ext2_get_inode(rxi, &ext2_inode_buf) != 0) { wrr = 0; }
+        else { if (ext2_inode_links_count(&ext2_inode_buf) != 1) { wrr = 0; } }   # the window's +1 undone
+    }
+    if (ext2_sb_free_inodes_count(&ext2_sb_buf) != rfi_a + 1) { wrr = 0; }   # rny's old inode freed
+    if (wrr == 1) { kprintln("ext2w: Wren replace OK", 22); }
+    else          { kprintln("ext2w: Wren replace MISMATCH", 28); }
+
+    # (d) the refusals that stay (POSIX), each changing nothing: a file over a directory (EISDIR), a directory over a
+    #     file (ENOTDIR), a directory over a NON-empty one (ENOTEMPTY: /rnp holds rnd since (b)), "." as a name.
     var wre = 1;
-    if (ext2_create(2, "rnx.txt", 7) <= 0) { wre = 0; }
-    if (ext2_create(2, "rny.txt", 7) <= 0) { wre = 0; }
-    if (ext2_rename(2, "rnx.txt", 7, 2, "rny.txt", 7) == 0) { wre = 0; }   # must REFUSE
-    if (ext2_path_lookup("/rnx.txt", 8) <= 0) { wre = 0; }         # src untouched
-    if (ext2_path_lookup("/rny.txt", 8) <= 0) { wre = 0; }         # dst untouched
+    var rnpi = ext2_path_lookup("/rnp", 4);
+    if (ext2_rename(2, "rny.txt", 7, 2, "rnp", 3) == 0) { wre = 0; }      # file over dir
+    if (ext2_rename(2, "rnp", 3, 2, "rny.txt", 7) == 0) { wre = 0; }      # dir over file
+    if (ext2_rename(2, "w5keep", 6, 2, "rnp", 3) == 0) { wre = 0; }       # dir over a non-empty dir
+    if (rnpi > 0) { if (ext2_rename(rnpi, ".", 1, 2, "rndot", 5) == 0) { wre = 0; } }   # "." as the old name
+    if (ext2_path_lookup("/rny.txt", 8) != rxi) { wre = 0; }       # all untouched
+    if (ext2_path_lookup("/rnp", 4) != rnpi) { wre = 0; }
+    if (ext2_path_lookup("/rnp/rnd", 8) <= 0) { wre = 0; }
+    if (ext2_path_lookup("/w5keep", 7) <= 0) { wre = 0; }
+    if (ext2_path_lookup("/rndot", 6) != 0) { wre = 0; }
     if (wre == 1) { kprintln("ext2w: Wren refuse OK", 21); }
     else          { kprintln("ext2w: Wren refuse MISMATCH", 27); }
 

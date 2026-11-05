@@ -27,6 +27,12 @@
 #   A10 a non-owner's VFS_SOCK fd is inert                   A16 accept returns only listener-stamped children
 #   A8 sock_peer encoding + owner check                      U1 UDP stamp + udp_auth   U2 lo #52 frame length + take
 #   U3 #52 source-port rule                                  U4 udp_release_pid (pool kept, kernel port untouched)
+#   1.57.17 — the closed-state reset (issue 2026-10-31-a-segment-for-no-connection-gets-no-rst, RFC 9293 § 3.10.7):
+#   R1 an ACK to a 4-tuple nobody holds draws ONE RST <SEQ=SEG.ACK>   R1b it passes our ingress sum, draws nothing
+#   R1c the same from the wire (one reset, NIC-bound)        R2 ACK off: RST|ACK, ACK = SEG.SEQ+SEG.LEN (SYN/FIN 1 each)
+#   R3 a RST / RST|ACK / SYN|RST draws nothing, opens nothing  R4 broadcast / foreign dst, source 0 / directed bcast
+#   R5 LISTEN: ACK + SYN|ACK reset, bare FIN dropped, SYN opens  R6 a dead (state-0) slot's 4-tuple is reset
+#   R7 a LOOPBACK listener resets a SYN to net_ip            R8 loopback connect to a closed port refused in one drain
 # Exit 0 = every check of every boot PASSED; 1 = any FAIL; 2 = a boot never booted (firmware VOID).
 # Env: SOCK_SMP (default "1 4") selects the ring-3 boots; SOCK_KERNEL=<path> uses a prebuilt kernel for B/C and
 #      skips A and the image check (the falsification hook); QEMU_TRIES; QEMU_TIMEOUT (default 300).
@@ -82,7 +88,8 @@ if [ -z "${SOCK_KERNEL:-}" ]; then
             echo "  VOID: boot A never booted"; void=$((void + 1))
         else
             strings "$LOG" | grep -E "tcpaddr:|udpown:" | sed 's/^/    /'
-            for id in O0 A6 A9 A12 A12b A15 A13 A14 A7a A7c A7b A1 A2 A6c A6d A3a A3b A4 A5a A5b A5d A5c A2z A10 A16 A8 Z; do
+            for id in O0 A6 A9 A12 A12b A15 A13 A14 A7a A7c A7b A1 A2 A6c A6d A3a A3b A4 A5a A5b A5d A5c A2z A10 A16 A8 \
+                      R1 R1b R1c R2 R3 R4 R5 R6 R7 R8 Z; do
                 want "tcpaddr: $id OK" "[A] tcpaddr $id"
             done
             for id in U1 U2 U3 U4; do want "udpown: $id OK" "[A] udpown $id"; done

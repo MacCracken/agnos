@@ -610,7 +610,13 @@ The engine (§§ 9–16) stays policy-free; B11 is the layer that decides WHEN `
   resident metaslab, since OpenZFS at its slop may have reallocated their units. A free of txg T is allocatable from
   txg T + 3 — metaslab_sync_done's rotation — so whatever a txg's partial writes did, its three predecessors are whole:
   OpenZFS's safe rewind window. The read-back (`zfs_wt_rb`, re-running the mount's scan with the live window) holds the
-  release's accounting, bit by bit, after every op of the op list.
+  release's accounting, bit by bit, after every op of the op list. ⚠ What the release does NOT give a gate (design
+  k.137, 1.57.17): room after a fill. A fill to ENOSPC consumes every release as it comes, so the room it leaves is
+  anywhere in [−(one txg's metadata), one block) — where in that range is the fixture BUILD's metadata allocation, not
+  the writer's — and at the next op the frees still deferred are the two latest txgs' own. A gate that needs room after
+  a fill must free a known amount and admit its op only once that free's txg + 2 is durable; the `full` lane gives two
+  records back and holds the rename's admission to the space record (`zfs-room-check.py --fit`, against the writer's
+  own `room after txg` lines).
 - **The commit's hold is measured and windowed** (design k.126 (B11)): `kirqw_point` (io.cyr) between the commit's
   device commands and inside the NVMe / AHCI completion polls opens one-instruction interrupt windows on the
   committing CPU once the scheduler is live — never inside an interrupt handler (`apic_in_service`), never on USB
@@ -641,7 +647,8 @@ path); v28 + mirror-a + makefs refused and raidz-0 unmounted, all byte-identical
 dataset COWs, the host replay h6 and recount h7 per rw lane; since B5 the file-data ops — their F lines and the walk
 held to the expected manifest, h8 hole births — and OpenZFS's phase B against `zfs-expect.py`'s expected manifest; since
 the B5 review every plan line's `udata` ≤ `charged`, the written files' SA stamps (`zfs-sa-check.py`), a short write's
-length against the space record (`zfs-room-check.py`), h8's LSIZE / birth-txg rules, and phase C on a child dataset;
+length against the space record (`zfs-room-check.py`; since 1.57.17 also a namespace op's admission near the slop,
+`--fit`, design k.137), h8's LSIZE / birth-txg rules, and phase C on a child dataset;
 since B6 the create ops — their D / F / L lines held to the expected manifest, every new object and changed parent held
 to zfs_mknode's values and to a FreeBSD twin (`zfs-sa-check.py`), OpenZFS's own `stat(1)` of each (the verify's
 B-stat), and phase C appending to an agnos file and `rmdir`-ing an agnos directory; since B7 the unlink / rmdir / rename /

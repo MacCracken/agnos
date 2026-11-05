@@ -12,7 +12,10 @@
 #   N3  #48 blocked on a full window does not hold the CPU     SOCKW-SEND-YIELDS-{LO,IP} (spinner share >= 800 per mille)
 #   N4  D6 + one segment in flight at entry (10 s stall)       SOCKW-STALL-{LO,IP}, SOCKW-STALL-ONEFLIGHT-{LO,IP}
 #   N5  a reader stalled 55 s keeps its connection (persist)   SOCKW-PERSIST-OK
-#   N6  #47 to a silent port: deadline once, CPU given away    SOCKW-DIAL-DEADLINE-{LO,IP}, SOCKW-CONNECT-YIELDS-{LO,IP}
+#   N6  #47 to a silent peer: deadline once, CPU given away    SOCKW-DIAL-DEADLINE-{LO,IP}, SOCKW-CONNECT-YIELDS-{LO,IP}
+#       (1.57.17: a closed local port is refused with RST|ACK now, so the silent peer is a listener whose passive open
+#       the full TCP table refuses — sockw.cyr s_fullnet_up, which asserts the 8-slot table and the reserve of 1 and
+#       prints SOCKW-FULLNET used=6 free=2; a broken fixture prints SOCKW-FAIL FULLNET ..., denied below)
 #   N7  #55/#100: concurrent pingers, a silent host, the bound SOCKW-PING-CONCURRENT, -PING-SILENT-OK, -PING-YIELDS, -PING-BOUND
 #   N8  the wire: 16 KB to the host sink + 64 B echo RTTs      SOCKW-WIRE-OK + host HOST-SINK got=16384, SOCKW-WIRE-LAT-OK
 #   N9  the RST path: nine dials to a closed host port         SOCKW-DIAL-RST (each -1 <= 500 ms)

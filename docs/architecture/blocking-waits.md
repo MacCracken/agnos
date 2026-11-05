@@ -1,6 +1,6 @@
 # Blocking waits — the BLOCKED state and the wait/wake primitive (invariants)
 
-> **Last Updated**: 2026-09-26 (1.57.9 ENDFIX — the #108 handoff; pipeline fd hygiene. Before: 1.57.9 — `#44` is a quiet local yield again; the directed yield `sched_yield_to`#108
+> **Last Updated**: 2026-11-04 (1.57.17 — `epoll_wait`#21 blocks: § epoll_wait, `WK_EPOLL`, `wq_wake_anybit`, the signal-post wakes. Before: 1.57.9 ENDFIX — the #108 handoff; pipeline fd hygiene. Before that: 1.57.9 — `#44` is a quiet local yield again; the directed yield `sched_yield_to`#108
 > kicks only its named peer's CPU; pipe WRITES block too — `wr1_wait`, `pipe_wkey`, `pipe_lock`, PIPE_BUF 512, EPIPE. 1.57.8 — blocking pipe / channel reads, `WK_PIPE`/`WK_CHAN`, `wq_wake_m`, the `#44`
 > directed park kick (withdrawn 1.57.9). 1.57.7 — Path 2 step S3d, bites S3.6–S3.9: keep-current, the `#44`/`#14` park, the
 > halt protocol and `cpu_kickable`, the idle step, the 0xE1 reschedule kick, the keyboard's one-reader-per-line wait,
@@ -61,7 +61,7 @@ current on a CPU is state 2 with `on_cpu` == that CPU.
 
 Keys (high byte = class, low bits = object): `WK_SLEEP | pid`, `WK_FLOCK | inode`, `WK_CHILD | ppid`, `WK_KBD`,
 `WK_KBD_OWNER`, `WK_SND` (S3d), `WK_TCP | cid`, `WK_ICMP | pid` (S6), `WK_PIPE | buffer`, `WK_CHAN | endpoint`
-(1.57.8), `WK_TEST | n` (selftests). `wq_wake_m(key, msk)` wakes `(wait key & msk) == key` — `wq_wake` is msk −1; a
+(1.57.8), `WK_EPOLL | <TCP slot bits>` (1.57.17, below — the low 8 bits are the slots the wait watches, matched by `wq_wake_anybit`), `WK_TEST | n` (selftests). `wq_wake_m(key, msk)` wakes `(wait key & msk) == key` — `wq_wake` is msk −1; a
 CLASS wake (msk `0xFF00…`) serves a waker that can no longer name the objects (a pipe writer's death). Reasons: `WR_NONE`
 0, `WR_EVENT` 1, `WR_TIMEOUT` 2, `WR_SIGNAL` 3. The cells are pid-indexed arrays in proc.cyr (shared, because
 vfs.cyr names `WK_FLOCK` and `proc_alloc_slot` scrubs them): `proc_wait_key`, `proc_wait_deadline`,
@@ -543,3 +543,53 @@ own `net_poll` (the effect above) or by a drain racing the arm — left the send
 the loop top restarted D6 from there: up to 2 × `TCP_PROGRESS_US` (16 s) with no progress after the partial ACK
 (`tcp: d6part`; `tcp: dlpart` holds #109's clamp at that site). Busy wake latency is tick-bound (a waiter woken while its CPU runs a spinner waits for that
 CPU's next tick): measured, not changed (OQ-5; sock-wait-smoke N8 `busy_rtt64_med_us`).
+
+## epoll_wait (1.57.17)
+
+Issue `docs/development/issues/archived/2026-10-31-tcp-send-keeps-one-segment-in-flight.md`, fix 2 (OPERATOR RULING 2026-11-04:
+the readiness wait; the send window stays a later item). `epoll_wait`#21 with `EPW_TIMED` (bit 32 of `max`) is a
+canonical C9 wait (`ep_wait`, syscall.cyr); without the bit it is the old poll, byte for byte (ABI #19–#21).
+
+- **The pass.** `net_poll` once (at the first socket watch, as the legacy scan's `tcp_readable` did per watch) → the
+  scan writes the ready records → done | **-4** (a signal posted during the wait, unblocked, not SIGCONT) | the caller's
+  deadline → `wq_arm(WK_EPOLL | slots, min(deadline, the earliest timerfd next_fire))` → the **probe** (`ep_scan` mode 0:
+  the same readiness tests, no store, no `net_poll`) + the EINTR and deadline re-checks → `wq_cancel` | `wq_sleep` →
+  next pass. IF=0 across arm…sleep|cancel (one `kbd_irq_save`, the `tcp_block` shape); every cell is a local or
+  re-derived from the fd (R4). A level-triggered wait re-scans at its deadline, so a LOST wake still returns `rc 1`
+  there — **every wake gate must bound the elapsed time**, never only the return code (epoll-smoke does).
+- **The key.** `WK_EPOLL | bits`: bit `i` = the wait watches TCP slot `i` (an `EP_TCP | i` target or a VFS_SOCK whose
+  conn is `i`). `wq_wake_anybit(WK_EPOLL, m)` wakes every BLOCKED proc of that class whose bits overlap `m` — the "any
+  bit" match `wq_wake_m`'s equality cannot express. Linux `ep_poll_callback` likewise reaches only the epitems on the
+  woken file's wait queue; FreeBSD `KNOTE` only the object's knote list. A wait with no socket watch arms the bare class
+  and no TCP event matches it.
+- **The wakers, each AFTER its condition store.** TCP: `net_handle_tcp` collects `tcp_demux_epm` under `tcp_tab_lock`
+  (bytes queued; a passive child reaching ESTABLISHED sets its LISTENER's bit; every `tcp_demux_wake` event — the ACK
+  that clears the held segment (**EPOLLOUT**), a FIN, a RST — sets the touched slot's) and calls `ep_wake_tcp` after the
+  unlock; `tcp_retx_tick` adds the retransmit-exhaustion mask. **Gate:** `ep_waiters` (a pid bit set with `lock or`
+  BEFORE the waiter's first scan, cleared at exit) — read after `tcp_unlock`, whose `xchg` is a full fence: either the
+  waiter's scan (under `tcp_tab_lock`) saw the condition, or this load sees its bit (the Dekker pair); `sched_lock`
+  then orders the wake against the arm. A stale bit costs one empty scan. Signals: `ep_sig_locked(t, sig)` at every
+  ordinary-signal post — kill#16's `proc_sig_locked`, SIGCONT's `proc_cont_locked`, `console_winch_post`, SIGCHLD in
+  `proc_death_finish`, all under `sched_lock` — records the bit in `ep_signew[t]` (zeroed by the waiter at entry: only
+  posts DURING the wait count) and, when `t` is BLOCKED on `WK_EPOLL`, wakes it `WR_EVENT` (not `WR_SIGNAL`: an
+  ordinary signal is not a lifecycle interrupt); the poster kicks `t`'s CPU after its unlock (its `lm + 8` mask, or a
+  local). Timerfds: the deadline. Lifecycle: `wq_interrupt_locked` → `WR_SIGNAL` → `wq_signal_point` (ABORT −1, never
+  reaching ring 3; a STOP parks and the loop re-arms with the SAME deadline).
+- **EINTR.** -4 needs a POST during the wait (`ep_signew`), not merely a pending bit — under D3 a bit stays pending
+  until a signalfd read clears it, so "pending" would make every later wait return at once. A signal blocked by
+  `sigprocmask`#17 does not end the wait (it wakes it; the re-scan finds nothing and it re-arms); SIGCONT never does
+  (Linux restarts a stopped-and-continued wait — `ERESTARTNOHAND`). A WATCHED signalfd's signal is reported as its
+  record, which is how a Linux `signalfd` + `sigprocmask(SIG_BLOCK)` program already reads.
+- **EPOLLOUT = no held segment.** `tcp_ep_events` (net_tcp.cyr) answers it from `retx_flags == 0` in ESTABLISHED /
+  CLOSE_WAIT — exactly when `tcp_send_ex` commits without waiting (a zero window included: a 1-byte probe). With one
+  segment in flight a non-blocking sender waits one round trip per segment; the send window (the issue's fix 1) is what
+  would let EPOLLOUT mean "room in a send buffer" instead.
+- **Prior art.** Linux `ep_poll` (`fs/eventpoll.c`: the ready check, `__set_current_state(TASK_INTERRUPTIBLE)` BEFORE
+  the re-check, `schedule_hrtimeout_range`, `-EINTR` on a pending signal; `ep_poll_callback` from the file's wakeup),
+  `tcp_poll` (`EPOLLOUT` when `sk_stream_is_writeable`; `EPOLLHUP` / `EPOLLRDHUP` / `EPOLLERR` from `sk_shutdown` and
+  `sk_err`), and FreeBSD kqueue `EVFILT_WRITE` (`filt_sowrite`: writable when `sbspace(so_snd) >= lowat`; `KNOTE` from
+  `sowwakeup`).
+- **Gate:** `scripts/smoke/epoll-smoke.sh` (`tests/epoll/epw.cyr` as `/bin/agnsh`, `-smp 1` and `-smp 4`). Mutations:
+  the ACK/FIN/RST wake dropped from `net_handle_tcp` → every EPOLLOUT wait runs to its deadline (B1 stalls), H1/H2 at
+  their timeouts; the data-queued bit dropped → R1 at its timeout; `ep_sig_locked` never waking → K1/K2 at their
+  timeouts.

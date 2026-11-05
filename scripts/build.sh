@@ -406,6 +406,9 @@ else
         [ -n "$EXT2_WRITE_SELFTEST" ] && echo '#define EXT2_WRITE_SELFTEST'
         [ -n "$EXT2_EXTENT_WRITE_SELFTEST" ] && echo '#define EXT2_EXTENT_WRITE_SELFTEST'
         [ -n "$MULTICHUNK_SELFTEST" ] && echo '#define MULTICHUNK_SELFTEST'
+        # EXT2_RNCUT_SELFTEST=1 — 1.57.17: rename-replace crash cuts (ext2.cyr ext2_rncut_selftest): one rename over an
+        # existing name from the host-seeded /rncut, the box HALTED after the cut it names. scripts/smoke/ext2-rename-replace-smoke.sh.
+        [ -n "$EXT2_RNCUT_SELFTEST" ] && echo '#define EXT2_RNCUT_SELFTEST'
         [ -n "$EXEC_SELFTEST" ]      && echo '#define EXEC_SELFTEST'
         [ -n "$SYMLINK_SELFTEST" ]   && echo '#define SYMLINK_SELFTEST'
         [ -n "$CHAN_RING3_SELFTEST" ] && echo '#define CHAN_RING3_SELFTEST'

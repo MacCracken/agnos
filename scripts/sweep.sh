@@ -54,14 +54,14 @@ cd "$ROOT"
 # {%}/--joblog, pytest-xdist loadgroup, pytest-rerunfailures, Bazel `exclusive`, CTest RESOURCE_LOCK, kselftest
 # timeouts) are in docs/development/build.md "Arc sweep". The load-bearing rules:
 #   · ISOLATION: every row writes $ROOT/build/agnos (and tests/*/build helpers), so two rows can never share a tree.
-#     Worker K is an rsync of $ROOT (minus build/, .git, tmp/) at $ROOT/../.<tree>.sweep.<pid>.w<K> — a SIBLING,
+#     Worker K is an rsync of $ROOT (minus build/, .git, tmp/, .claude/) at $ROOT/../.<tree>.sweep.<pid>.w<K> — a SIBLING,
 #     so every `${X_ROOT:-$ROOT/../x}` sibling default (gnoboot, agnoshi, kashi, rekha, naad, cyrius-doom) still
 #     resolves; the absolute paths are also exported. The baseline build runs once in the main tree first, so a
 #     kashi/rekha clone-if-absent never races N ways.
 #   · GROUPS: run_gate's optional 4th argument is a group key; rows sharing a key run on ONE worker, in table order
 #     (xdist loadgroup). Keyless rows are singleton groups. Workers PULL the next group with an atomic
 #     `mkdir claim.<group>`, longest-first by the previous run's build/sweep-logs/durations.tsv.
-#     Keys: `hostport` (three rows — tcp-listen, tcp-inbound and, since 1.57.14, sandhi-async — that pick a host port
+#     Keys: `hostport` (five rows — tcp-listen, tcp-inbound, since 1.57.14 sandhi-async, since 1.57.17 epoll and tcp-rst — that pick a host port
 #     by bind(0) and release it before QEMU binds — a TOCTOU window), `naad` (the one row that writes a sibling repo's build dir), `waits` (three rows that build
 #     tests/waits: wait-ring3, wait-kbd, tty since 1.57.13), and `exclusive` — a row whose oracle is a ratio against wall time runs ALONE, serially, in the
 #     main tree after the parallel phase (Bazel `exclusive`; SWEEP_EXCLUSIVE=0 pools them instead).
@@ -623,10 +623,14 @@ run_gate "1.57.8 virtio-net under KVM boots at normal speed (-smp 1 + 4)" "" "kv
 # smokes existed and were never run by the sweep (D15); S4.1 gave them the banner-gated retry + the invariant deny.
 run_gate "1.57.7 TCP hermetic (ring/retx/mss/wnd + locks/lo-inplace/txslots/claim/gen/syncap/eof/halfclose + S6 net waits/graceful close; -smp 1 + -smp 4)" "TCP_SELFTEST=1" "tcp-smoke.sh"
 run_gate "1.57.7 loopback lo (UDP/ICMP/TCP/sockfd/epoll/close-wait)" "LOOPBACK_SELFTEST=1" "loopback-smoke.sh"
-# Group `hostport` (1.57.9 PSWEEP): tcp-listen, tcp-inbound and (1.57.14) sandhi-async below pick a host port with
-# bind(0) and CLOSE it before QEMU's hostfwd binds it — a TOCTOU window, so the three never run at the same time
+# Group `hostport` (1.57.9 PSWEEP): tcp-listen, tcp-inbound, (1.57.14) sandhi-async and (1.57.17) epoll + tcp-rst below pick a
+# host port with bind(0) and CLOSE it before QEMU's hostfwd binds it — a TOCTOU window, so the five never run at the same time
 # (CTest RESOURCE_LOCK).
 run_gate "1.57.7 tcp_listen accept-one (TCP_LISTEN_SMOKE)" "TCP_LISTEN_SMOKE=1" "tcp-listen-smoke.sh" "hostport"
+# ⭐ 1.57.17 — a segment for no connection is answered with ONE RST (RFC 9293 § 3.10.7.1 / .2; issue archived/2026-10-31-a-
+# segment-for-no-connection-gets-no-rst): a hostfwd connect to a guest port with no listener ends at once (86 s before), and a
+# released 4-tuple's half-open peer is reset. Same kernel flag as tcp-listen.
+run_gate "1.57.17 closed-state RST: a closed port refused at once, a released 4-tuple reset (hostfwd; -smp 1 + -smp 4)" "TCP_LISTEN_SMOKE=1" "tcp-rst-smoke.sh" "hostport"
 # 1.57.7 (S4) — inbound TCP served in interrupt context, #49 EOF after the peer's FIN, FIN-before-accept half-close,
 # and a cross-CPU loopback mix: tests/tcpin as /bin/agnsh on a PLAIN kernel, three GATED variants.
 run_gate "1.57.7 inbound TCP in interrupt context (+ #49 EOF, half-close; -smp 1 msix/vectors0 + -smp 4)" "" "tcp-inbound-smoke.sh" "hostport"
@@ -642,6 +646,10 @@ run_gate "1.57.7 sock/icmp waits block only the caller (ring 3; -smp 1 + -smp 4)
 # entry), a foreign conn id, and a host peer that stops reading. ~1 min per boot; no group (the host port is bound by
 # the smoke's own peer with SO_REUSEADDR, as sock-wait's sink is).
 run_gate "1.57.13 sock_send_dl#109 caller ceiling (local zero window + trickle + foreign id + a host peer that stops reading; -smp 1 + -smp 4)" "" "sock-send-dl-smoke.sh"
+# ⭐ 1.57.17 — epoll_wait#21 WAITS (EPW_TIMED, max bit 32) and watches TCP conns / listeners with EPOLLOUT (issue
+# archived/2026-10-31-tcp-send-keeps-one-segment-in-flight, fix 2): tests/epoll. Group `hostport`: it picks its host port
+# by bind(0), like tcp-inbound.
+run_gate "1.57.17 blocking epoll_wait#21 (EPW_TIMED, EPOLLOUT on the held-segment ACK, TCP ids, signals -4/signalfd/blocked/SIGKILL, 128 watches, B1/B2/B3 rates, bystander; -smp 1 + -smp 4)" "" "epoll-smoke.sh" "hostport"
 run_gate "ICMP echo (hermetic slots + wake; -smp 1 + -smp 4)" "ICMP_SELFTEST=1" "icmp-smoke.sh"
 # 1.57.7 — ADDED AFTER S6 BROKE IT UNSEEN. doom-smoke had no row, so S6 (the net waits) shipped with /bin/doom hung
 # forever in #47: its setu probe dials 127.0.0.1:7700, nobody answers, and a PRE-SCHEDULER caller (DOOM_SELFTEST
@@ -658,6 +666,11 @@ run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"   
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---
 run_gate "ext2 WRITE regression (W1-W5)"             "EXT2_WRITE_SELFTEST=1"                    "ext2-write-smoke.sh"
+# ⭐ 1.57.17 — ext2 rename#31 REPLACES an existing destination, crash-atomic (issues archived/2026-10-28-ext2-rename-cannot-
+# replace-an-existing-file and archived/2026-11-02-ext2-rename-cannot-replace-loses-every-descent-save): 21 EXT2_RNCUT_SELFTEST
+# crash cuts, each held to old-or-new before AND after e2fsck -fy, then tests/rnrep in ring 3 at -smp 1 and 4. Builds its
+# own flag and plain kernels and leaves a plain one.
+run_gate "1.57.17 ext2 rename-replace: 21 crash cuts (old-or-new before+after e2fsck -fy) + tests/rnrep ring 3 -smp 1/4 (staging x20, open fd keeps the replaced file, refusals, flock#59 on a dir fd)" "" "ext2-rename-replace-smoke.sh"
 # ⭐ 1.57.12 (ROOM review) — klug-spill-smoke had NO ROW since it shipped (1.56.10, H1), and since 1.57.12 it is the one
 # gate that reads the klug ring BYTE FOR BYTE after the ROOM moved it: the kernel spills the ring to /klug.txt on an
 # ext2 NVMe partition, the host reads it back with debugfs and compares it with the serial capture — the 8 KB early
@@ -788,6 +801,10 @@ run_gate "1.57.13 console mode #110 (NOECHO/FLUSH, dies with its holder) + fd_ki
 # #14) loops that do not name each other send <= 30 kicks per 300 ms and sleep >= 1 ms per call at -smp 4; #108's
 # refusals; EOF by close and by death; SIGKILL ends a reader blocked in a pipe wait (#99 state 6 -> 265).
 run_gate "1.57.8/1.57.9 blocking pipe/channel reads + blocking pipe writes, #108 directed yield, quiet #44 (-smp 1 + 4)" "" "ipc-wait-smoke.sh"
+# ⭐ 1.57.17 — a terminal channel's window size (#97 CH_WINSZ_SET 0x06 / CH_WINSZ_GET 0x07; issue archived/2026-10-30-a-terminal-
+# channel-has-no-window-size): tests/chan/ptyws as /bin/agnsh on the plain kernel — GET only on a terminal end, SIGWINCH only to
+# the terminal's watching holders, an unchanged size silent, and a holder blocked in epoll_wait#21 woken by the resize.
+run_gate "1.57.17 terminal channel window size: #97 CH_WINSZ_SET/GET, SIGWINCH to the terminal's watching holders only, wakes a blocked epoll_wait (-smp 1 + 4)" "" "pty-winsize-smoke.sh"
 # 1.57.9 ENDFIX (end review PIPEW-E1) — an agnsh PIPELINE whose consumer stops early (`grep . cert.pem | echo`, and a
 # stage 2 that fails to spawn) must return to the prompt now that a full pipe BLOCKS its writer. Drives the staged
 # agnsh (build/rootfs) by sendkey, one boot per case, -smp 1 + 4. ⛔ RED with the agnsh staged at 1.57.9: the shell
@@ -954,8 +971,10 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
         # The CURRENT tree, uncommitted and untracked files included; not build/ (each copy builds its own) EXCEPT
         # build/rootfs/, the staged agnos-fs (stage-agnsh.sh / stage-tools.sh) — the one build/ INPUT a row reads
         # (shutdown-smoke seeds from it; without it the row fails in every copy and "passes on serial retry");
-        # not .git (no row needs it — check.sh, which does, runs in the main tree), not the gitignored tmp/.
-        if ! rsync -a --delete --exclude=/.git --exclude=/tmp/ --include=/build/ --include='/build/rootfs/***' \
+        # not .git (no row needs it — check.sh, which does, runs in the main tree), not the gitignored tmp/, and not
+        # .claude/ (1.57.17: agent worktrees live in .claude/worktrees — 8.8 GB at the 1.57.17 merge, copied into EVERY
+        # worker before this exclude; no row reads them).
+        if ! rsync -a --delete --exclude=/.git --exclude=/tmp/ --exclude=/.claude/ --include=/build/ --include='/build/rootfs/***' \
                 --exclude='/build/*' "$ROOT/" "$c/"; then
             echo "sweep.sh: could not create worker copy $c" >&2; exit 1
         fi

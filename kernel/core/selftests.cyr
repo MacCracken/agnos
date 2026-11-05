@@ -1297,6 +1297,9 @@ fn tcpst_s6_arms() {
 # made under tcp_lock. Arms 5-12 follow (fns above); `tcp: selftest done` is always the LAST line.
 {
     net_tick_pause();                  # 1.57.7 (S6): no CPU's net_tick drains lo / retransmits under an arm (§2.2.3)
+    # 1.57.17: the fake slots' peers are SILENT peers (a loopback 4-tuple nobody holds now draws a RST — net_tcp.cyr
+    # tcp_rst_mute has the why); the mute is lowered again before the last line.
+    tcp_rst_mute = 1;
     var cid = tcp_slot_claim(2, 0xEEEE, 0xEEEE, 0, 0, 0, 0, 536, 0, net_ip);
     if (cid < 0) {
         kprintln("tcp: ring FAIL", 14);
@@ -1419,6 +1422,7 @@ fn tcpst_s6_arms() {
     tcpst_arm_eof();
     tcpst_arm_halfclose();
     tcpst_s6_arms();
+    tcp_rst_mute = 0;
     net_tick_resume();
     kprintln("tcp: selftest done", 18);
 }
