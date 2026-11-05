@@ -14,8 +14,8 @@ RIPs; CLAUDE.md, `scripts/check/image-layout-check.sh`). The LOAD image's `memsz
 flag build (`ZFS_SELFTEST ZFS_WRITE_SELFTEST ZFS_WRITE_OPS`) had **60,216 B** left and `RING3_SELFTEST` 63,664 B, while
 B8–B11 were estimated at ≈ 44 KB (up to 2× at the bites' measured overrun) with zstd to follow — and ~300 KB of `.bss`
 was arrays nothing touches until long after the physical allocator is up. `CYRIUS_DCE` is not available (cycc bug,
-filed: cyrius `issues/2026-10-10-agnos-kernel-dce-compaction-moves-data.md`, OPEN; from cyrius 6.6.20 — agnos's pin since
-1.57.14 — REVBE-01 declines compaction on a `kernel;` image, so `CYRIUS_DCE=1` NOP-fills and shrinks nothing). Operator standing rule (2026-10-11), **grow before refactor**: never trim, `#ifdef`-out or dead-code-audit code
+filed: cyrius `issues/archived/2026-10-10-agnos-kernel-dce-compaction-moves-data.md` — RESOLVED in cyrius 6.7.11, after agnos's 6.7.9 pin (1.57.15), so not yet usable here; from cyrius 6.6.20 — agnos's pin at
+1.57.14; 6.7.9 since 1.57.15 prints the same decline — REVBE-01 declines compaction on a `kernel;` image, so `CYRIUS_DCE=1` NOP-fills and shrinks nothing). Operator standing rule (2026-10-11), **grow before refactor**: never trim, `#ifdef`-out or dead-code-audit code
 to make room; MOVE things.
 
 ## Prior art

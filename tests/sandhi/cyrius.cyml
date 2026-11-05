@@ -5,7 +5,7 @@ description = "agnos 1.57.14 boot test of sandhi's cooperative server (sandhi_se
 license = "GPL-3.0-only"
 language = "cyrius"
 # Must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh).
-cyrius = "6.6.20"
+cyrius = "6.7.9"
 
 [build]
 entry = "sandhix.cyr"

@@ -16,8 +16,10 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.1.1 — matching ../kashi/VERSION and its 1.1.1 tag as of 2026-10-13 (agnos 1.57.14, with the cyrius 6.6.20 move; 1.1.0 at 1.57.12, 1.0.10 at 1.57.5, 1.0.8 at 1.57.4, 1.0.6 as of
-# 2026-08-28. Bump it as kashi cuts new 1.x releases. Affects ONLY the clone fallback: cyrius.cyml
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.2.0 — kashi's tag pinned to cyrius 6.7.9, as of 2026-11-04 (agnos 1.57.15, with the cyrius 6.7.9 move;
+# ../kashi itself is at 1.3.0 on cyrius 6.7.18, the NEXT step; src/font_data.cyr is BYTE-IDENTICAL from 1.1.1 to 1.2.0, so the image does not move with it;
+# 1.1.1 at 1.57.14, 1.1.0 at 1.57.12, 1.0.10 at 1.57.5, 1.0.8 at 1.57.4, 1.0.6 as of
+# 2026-08-28. Bump it as kashi cuts new 1.x releases — to the tag whose cyrius pin is agnos's. Affects ONLY the clone fallback: cyrius.cyml
 # declares `[deps.kashi] path`, and the path wins, so a box with the sibling checkout never reads
 # this value. That is exactly why it rots unnoticed.
 # ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — all three
@@ -56,7 +58,7 @@ dep_pin_sync() { # <name> <dir> <ref>
         || { echo "ERROR: could not move the $1 fallback clone at $2 to $3" >&2; exit 1; }
 }
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.1.1}"
+KASHI_REF="${KASHI_REF:-1.2.0}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Same guard as the rekha block below (2026-09-13): the fallback replaces an ABSENT sibling
     # only, never a checkout that happens to lack the file — see the note there.
@@ -77,15 +79,15 @@ dep_pin_sync kashi "$KASHI_DIR" "$KASHI_REF"
 # rekha freestanding default-face data (1.57.2 — the kernel-embedded TrueType face behind
 # /fonts, core/kfont.cyr). SAME contract as kashi above, mirrored line for line: sibling checkout
 # by default, clone the pinned tag when absent (override via REKHA_REF=<tag-or-branch>). Pinned at
-# 1.0.0 — matching ../rekha/VERSION and its 1.0.0 tag as of 2026-10-13 (agnos 1.57.14, the cyrius 6.6.20 move; fonts/face_data.cyr
-# is BYTE-IDENTICAL to 0.9.0's, so the kernel image does not move with it; 0.9.0 at 1.57.5, 0.3.9 at 1.57.4; 0.3.8 was the first
-# tag carrying fonts/face_data.cyr).
+# 1.1.0 — rekha's tag pinned to cyrius 6.7.9, as of 2026-11-04 (agnos 1.57.15, the cyrius 6.7.9 move; ../rekha itself is at
+# 1.1.2 on cyrius 6.7.18, the NEXT step; fonts/face_data.cyr is BYTE-IDENTICAL from 0.9.0 through 1.1.0, so the kernel image does
+# not move with it; 1.0.0 at 1.57.14, 0.9.0 at 1.57.5, 0.3.9 at 1.57.4; 0.3.8 was the first tag carrying fonts/face_data.cyr).
 # ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — the kashi
 # triple diverged three times before 1.56.51 for exactly this reason, and the same failure mode
 # applies here: `[deps.rekha] path` wins locally, so a stale default is invisible until a clean CI
 # checkout builds against a different face than the one that was tested.
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-REKHA_REF="${REKHA_REF:-1.0.0}"
+REKHA_REF="${REKHA_REF:-1.1.0}"
 if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
     # ⛔ NEVER rm -rf A GIT CHECKOUT (2026-09-13). The sentinel probed above is UNTRACKED in a rekha
     # working tree that has not committed fonts/ yet, so ordinary hygiene in the sibling — `git

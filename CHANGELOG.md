@@ -20,6 +20,80 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.15] — 2026-11-04 — the toolchain step: cyrius 6.7.9, kashi 1.2.0, rekha 1.1.0, klug 0.3.0
+
+A toolchain-only cut in the repair minor (operator ruling 2026-09-21: 1.57.x = arising-issue repairs): the pin moves
+into cyrius's 6.7.x language minor at **6.7.9** — the step every sibling took, each with a tag pinned to 6.7.9 before
+its 6.7.18 one (kashi 1.2.0, rekha 1.1.0, klug 0.3.0, gnoboot 0.8.0, agnoshi 2.1.0; their heads are on 6.7.18, the next
+step). No kernel source change but the version strings. No syscall minted (the next free is **#112**). **Built, gated,
+NOT burned.**
+
+### Changed — the toolchain: cyrius 6.6.20 → 6.7.9, kashi 1.2.0, rekha 1.1.0, klug 0.3.0
+
+- **All 25 manifests pin `cyrius = "6.7.9"`** (root + 24 `tests/*`; `toolchain-pin-check.sh`: `OK — 25 manifests, all
+  pin 6.7.9`). `roadmap.md`'s `Built with cyrius` trailer reads 6.7.9 (`version-bump.sh`).
+- **Siblings, the three tags pinned to 6.7.9:** `KASHI_REF` 1.1.1 → **1.2.0** and `REKHA_REF` 1.0.0 → **1.1.0** in
+  `build.sh` / `test.sh` / `bench.sh`; klug **0.3.0** (state.md only — agnos does not build klug). Both font-data files
+  are **byte-identical** across the moves (kashi `src/font_data.cyr` 1.1.1 = 1.2.0; rekha `fonts/face_data.cyr` 1.0.0 =
+  1.1.0), so neither moves a kernel byte. The live siblings are at kashi 1.3.0 / rekha 1.1.2 / klug 0.3.2 on 6.7.18; every
+  build below used `git archive <tag>` exports.
+- **Vendored stdlib: the closure is unchanged at 6.7.9.** Per `tests/<dir>` (24), `lib/` emptied before each command: a
+  fresh `cyrius lib sync` vendors every file `cyrius deps` resolves, plus every source-level `include "lib/…"` — equal
+  sets, except `tests/sandhi`'s `hashmap_fast.cyr` (sync copies it as a peer of `hashmap`, 67 vs 66) — and **472/472**
+  vendored files `cmp`-equal `~/.cyrius/versions/6.7.9/lib/`. No `[deps].stdlib` line had to change.
+- **Every `tests/<dir>` now carries a `cyrius.lock`.** From 6.7.x every resolve writes one (the vendored files' sha256 +
+  the pin), stdlib-only manifests included (cyrius 6.7.6: "resolved and locked by every resolve"). The 8 tracked locks
+  (`audio`, `chan`, `fault`, `fork`, `gpu`, `mountlist`, `telemetry`, `zfscodec`) are re-locked to 6.7.9; the other 16 dirs
+  have new, untracked ones. `.gitignore`'s tests/*/lib note said "no cyrius.lock is written for stdlib-only manifests" —
+  true through 6.6.x only; corrected.
+- **The 6.7.0 – 6.7.9 migration notes** (cyrius `docs/development/ecosystem-migration.md`), read against `kernel/` and
+  `tests/` (outside the vendored `lib/`): none of the shapes whose meaning changed silently is present — a lone `!`
+  (dropped by the lexer before 6.7.3), unary `-` / `~` on a constant before a literal operator (6.7.9), a narrow `*T`
+  dereference (6.7.8), and `trait` / `const` / `true` / `false` / `do` / `dyn` as names. The shapes refused loudly
+  (a stray module-scope `}`, a `for` step on an undeclared name, forward-call arity) would fail the build; the plain,
+  aarch64 and all 160 flag builds compile with 0 compiler warnings. The root manifest's path-only `[deps.kashi]` /
+  `[deps.rekha]` are not refused by 6.7.6's git-first resolve (a copy resolves: `3 deps resolved`); the kernel compiles
+  from `kernel/`, which has no manifest, so they stay documentation.
+
+### Measured — the 2x2 (the 1.57.14 tree × cyrius 6.6.20 / 6.7.9, old / new sibling tags)
+
+- **1.57.14 tree, cyrius 6.6.20, kashi 1.1.1 / rekha 1.0.0: 2,679,672 B, LOAD end `0x39e218`** — byte for byte the
+  1.57.14 image. The same tree on **6.7.9: 2,680,280 B, `0x39e478` (+608 B)** — `.text` 1,751,744 → **1,752,344 (+600)**,
+  `.bss` +8 (alignment padding before `.rodata`), `.rodata` unchanged. With kashi 1.2.0 / rekha 1.1.0: the identical
+  image (0 B). The 1.57.15 tree on 6.7.9: 3 bytes differ (the version digit in three banners). **All +608 B are the
+  compiler's.**
+- **The +600 B of `.text`, decoded** (`objdump` of both `.text` sections, operands normalised, sites named through
+  `CYRIUS_SYMS`): 120 inserted instructions, none removed or changed. 6.7.x decides per function, at its end, whether a
+  `return f(..)` may stay a tail call, so each such site carries a 5-byte forward `jmp`:
+  - **93 sites in 38 fns** keep the tail call; the `jmp` is patched to the next instruction (`e9 00 00 00 00`), directly
+    before the unchanged restore / `leave` / `jmp f` epilogue.
+  - **7 sites in 6 ZFS-writer fns that take a local's address** (`memcpy(&c, …)`: `zfs_wd_uacct` ×2, `zfs_wf_okbps`,
+    `zfs_wu_kbp`, `zfs_wz_urs`, `zfs_wl_ndva`, `zfs_wl_kill`) become ordinary calls (cyrius 6.7.7 / 6.7.9): the `jmp` goes
+    to a new `call zfs_wno` / `zfs_wnon`; `jmp epilogue` stub, and the old tail-call bytes stay behind it, unreachable.
+    Every one passes literals, so the result (−1, the reason in `zfs_wr_lit`) is unchanged.
+  - 93 + 20 `jmp`s and 7 `call`s, 5 B each: 600 B.
+- The compile's unreachable-fn note reads **209** (163,785 B), was 210: 6.7.9 reports `gpu_mpc_probe` reachable, whose
+  one call sits under `#ifdef SHADER_PROBE` (not defined in a plain build; `gpu_shader_state_probe`, in the same block,
+  stays dead). Analysis only: a `kernel;` image is never compacted, and the image carries every body either way.
+- **Headroom under gate 34's `0x400000`:** plain **400,264 B** (400,872 at 1.57.14). All 160 `build.sh` flag builds
+  (156 single flags — the 6 that need a prerequisite built with it, `HDMI_ATOM` / `SHADER_BLEND` — and 4 combos), each
+  through the placeholder, late-initializer and layout gates: 0 refusals, 0 compiler warnings, each 592–640 B tighter.
+  The binding `ZFS_SELFTEST ZFS_WRITE_SELFTEST ZFS_WRITE_OPS` **258,920 B** (259,560), still the tightest.
+- **aarch64:** 642,216 B (unchanged), 0 unresolved-call placeholders.
+
+### Not changed — carried
+
+- **The `syscall ABI` gate and sweep row 1's KNOWN RED mark.** cyrius carries `#109`–`#111` from **6.7.11** (agnos's
+  three filings resolved there, now under `cyrius/docs/development/issues/archived/`), after this pin. The gate reads the
+  sibling `../cyrius` first: on this box (6.7.18) "kernel 111 · abi-doc 111 · cyrius 111", GREEN; against the pinned 6.7.9
+  lib (CI, or no sibling) "cyrius 108", red on exactly the marked signature. The mark stays until the pin reaches
+  ≥ 6.7.11; a local sweep prints "the mark is STALE" until then.
+
+### Closeout
+
+- SWEEP-PENDING
+- **Dead-code audit: waived** — the operator's standing rule *grow before refactor* (2026-10-11) stands.
+
 ## [1.57.14] — 2026-10-13 — repairs: cyrius 6.6.20, ring-3 fault deaths reap out of the handler, one sibling and socket rule for every smoke
 
 The repair minor's second cut (operator ruling 2026-09-21: 1.57.x = arising-issue repairs). Three tracks — the toolchain

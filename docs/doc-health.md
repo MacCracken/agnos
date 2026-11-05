@@ -6,7 +6,20 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-10-13 (**1.57.14 closeout — the full sweep 73/74 (row 1 KNOWN RED by design), check.sh 39/40, test.sh --all 8/8; the release tallies filled**; see the 1.57.14 closeout block below). Before that: 2026-10-13 (**1.57.14 — the three repair tracks (pin, fault, hyg) merged and read together; the aarch64 release ruling recorded; two defects found along the way fixed**; see the 1.57.14 merge block below). Before that: 2026-10-13 (**1.57.13 closeout — the full sweep 72/73 (row 1 KNOWN RED by design), check.sh 38/39, test.sh --all 8/8; the release tallies filled**; see the 1.57.13 block below). Before that: 2026-10-13 (**1.57.13 — the five repair tracks merged and read together; the ABI bookkeeping for #109–#111; state / roadmap / CLAUDE.md / build.md reconciled**). Before that: 2026-10-13 (**1.57.13 track a64**). Before that: 2026-10-13 (**1.57.12 B12 gates — every flag build re-weighed, the § i.4 mutation table, the full sweep 71/71, k.134; the closeout tallies filled**; see the first 1.57.12 block below). Before that: 2026-10-13 (**1.57.12 closeout docs — B12: the ZFS write path written up for release; `architecture/zfs-read-only.md` → `architecture/zfs.md`**). Before that: 2026-10-13 (**the ZFS writer's B10 (log hygiene) and B11 (policy B, the deferral window, the crash cut), built in two parallel tracks, reviewed and merged**). Before that: 2026-10-12 (**the B8 / B9 / ROOM merge**). Before that: 2026-10-12 (**the B7 review: five findings fixed, and k.70, the free_bpobj budget its coverage found**). Before that: 2026-10-11 (**ZFS write bite B7 (unlink / rmdir / rename / link) and k.68, the space map histograms its gate found**). Previous: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**). Before that: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
+> **Last refresh**: 2026-11-04 (**1.57.15 — the cyrius 6.7.9 step: pin, sibling refs, test locks, the docs it touched**; see the 1.57.15 block below). Before that: 2026-10-13 (**1.57.14 closeout — the full sweep 73/74 (row 1 KNOWN RED by design), check.sh 39/40, test.sh --all 8/8; the release tallies filled**; see the 1.57.14 closeout block below). Before that: 2026-10-13 (**1.57.14 — the three repair tracks (pin, fault, hyg) merged and read together; the aarch64 release ruling recorded; two defects found along the way fixed**; see the 1.57.14 merge block below). Before that: 2026-10-13 (**1.57.13 closeout — the full sweep 72/73 (row 1 KNOWN RED by design), check.sh 38/39, test.sh --all 8/8; the release tallies filled**; see the 1.57.13 block below). Before that: 2026-10-13 (**1.57.13 — the five repair tracks merged and read together; the ABI bookkeeping for #109–#111; state / roadmap / CLAUDE.md / build.md reconciled**). Before that: 2026-10-13 (**1.57.13 track a64**). Before that: 2026-10-13 (**1.57.12 B12 gates — every flag build re-weighed, the § i.4 mutation table, the full sweep 71/71, k.134; the closeout tallies filled**; see the first 1.57.12 block below). Before that: 2026-10-13 (**1.57.12 closeout docs — B12: the ZFS write path written up for release; `architecture/zfs-read-only.md` → `architecture/zfs.md`**). Before that: 2026-10-13 (**the ZFS writer's B10 (log hygiene) and B11 (policy B, the deferral window, the crash cut), built in two parallel tracks, reviewed and merged**). Before that: 2026-10-12 (**the B8 / B9 / ROOM merge**). Before that: 2026-10-12 (**the B7 review: five findings fixed, and k.70, the free_bpobj budget its coverage found**). Before that: 2026-10-11 (**ZFS write bite B7 (unlink / rmdir / rename / link) and k.68, the space map histograms its gate found**). Previous: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**). Before that: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
+>
+>
+>
+> ### 1.57.15 (2026-11-04) — the toolchain step: cyrius 6.6.20 → 6.7.9, kashi 1.2.0, rekha 1.1.0, klug 0.3.0
+>
+> ✅ **`CHANGELOG.md` [1.57.15]** — new: the pin move, the sibling refs, the stdlib closure + lock record, the 6.7.x
+> migration census, the 2x2 attribution (+608 B, all compiler) and § Closeout. ✅ **`development/state.md`** — the head,
+> `build/agnos`, Cyrius pin and Bootloader rows (gnoboot read 0.7.1; the smokes boot `../gnoboot` v0.9.0). ✅
+> **`development/roadmap.md`** — the syscall line (the cyrius peers RESOLVED in 6.7.11, after this pin; pointers to cyrius's
+> `archived/`), § "Recorded by cyrius 6.7.6" closed DONE; trailer 6.7.9 (`version-bump.sh`). ✅ **`.gitignore`** — the
+> tests/*/lib note's "no cyrius.lock is written" corrected for 6.7.x. ✅ **`scripts/sweep.sh`** row 1 comment (the mark
+> stays until the pin reaches ≥ 6.7.11; cyrius pointers → `archived/`). ✅ **`scripts/build.sh`** kashi / rekha pin notes.
+> ✅ This file's 1.57.13 pointer to the cyrius filings → `archived/`.
 >
 >
 >
@@ -101,7 +114,7 @@ type: state
 > #### the merge (the tracks read together)
 >
 > ✅ **`development/roadmap.md`** — the allocation line: 0–111, next free #112, the ABI gate red BY DESIGN with the three
-> cyrius filings (`cyrius/docs/development/issues/2026-10-13-agnos-sys-{sock-send-dl-109,console-mode-110,fd-kind-111}-peer.md`);
+> cyrius filings (`cyrius/docs/development/issues/archived/2026-10-13-agnos-sys-{sock-send-dl-109,console-mode-110,fd-kind-111}-peer.md` — resolved in cyrius 6.7.11, after agnos 1.57.15's 6.7.9 pin);
 > the "VT-d queued invalidation" row SHIPPED (it was the VTD track's "left to the merge"). The aarch64 and `tcsetattr` rows
 > came from the a64 / tty tracks. ✅ **`development/state.md`** — Kernel head (1.57.13 repairs; 1.57.12 as previous head),
 > `build/agnos` on disk + every flag build re-weighed at the merge, the carried-rows bullet, **0 open issues** (five

@@ -466,11 +466,14 @@ sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 # flagged the mark stale.
 # ⭐ 1.57.13 — KNOWN RED BY DESIGN AGAIN, the 1.57.10 shape: the kernel mints #109 sock_send_dl, #110 console_mode and
 # #111 fd_kind, and the ABI gate reads "kernel 111 · abi-doc 111 · cyrius 108" until cyrius's SysNrAgnos peer carries
-# them — filed there: cyrius/docs/development/issues/2026-10-13-agnos-sys-sock-send-dl-109-peer.md,
-# cyrius/docs/development/issues/2026-10-13-agnos-sys-console-mode-110-peer.md and
-# cyrius/docs/development/issues/2026-10-13-agnos-sys-fd-kind-111-peer.md. The signature is that gate's two FAIL lines
+# them — filed there: cyrius/docs/development/issues/archived/2026-10-13-agnos-sys-sock-send-dl-109-peer.md,
+# cyrius/docs/development/issues/archived/2026-10-13-agnos-sys-console-mode-110-peer.md and
+# cyrius/docs/development/issues/archived/2026-10-13-agnos-sys-fd-kind-111-peer.md. The signature is that gate's two FAIL lines
 # and nothing else: any OTHER red gate inside check.sh is a new failure and gets the normal treatment. When the peer
 # lands the sweep prints "the mark is STALE" — drop it then, as 1.57.11 did.
+# ⚠ 1.57.15 — THE PEER LANDED IN cyrius 6.7.11, AFTER THE 6.7.9 PIN. The gate reads the sibling ../cyrius first, so on a
+# box whose ../cyrius is >= 6.7.11 it is GREEN and this run prints "the mark is STALE"; against the pinned 6.7.9 lib (CI,
+# or no sibling) it is still red on exactly this signature. The mark stays until the pin itself reaches >= 6.7.11.
 run_gate "baseline check.sh (build/test/version/size)" "" "CHECK" "" \
     "by design: the syscall ABI gate is red until cyrius's SysNrAgnos peer carries #109-#111 (filed in cyrius 2026-10-13)" \
     'syscall ABI \(kernel/doc/cyrius agree\)|syscall\(s\) the kernel implements are absent from cyrius'

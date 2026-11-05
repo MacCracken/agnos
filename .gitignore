@@ -110,6 +110,10 @@ tests/*/build/
 #     one. There is no build mode in which a committed snapshot is the thing that gets compiled.
 #   · no cyrius.lock is written for stdlib-only manifests (the lock covers `[deps.NAME]` git deps),
 #     so untracking lib/ strands nothing — confirmed, no lock appears after a tests/* build.
+#     ⚠ TRUE THROUGH 6.6.x ONLY (corrected 1.57.15): from cyrius 6.7.x every resolve (`cyrius deps`, `lib sync`, the
+#     resolve a `cyrius build` runs first) writes a cyrius.lock in EVERY tests/* dir — the vendored files' sha256 + the
+#     pin — stdlib-only manifests included. The lock is not ignored here: 8 dirs' locks were tracked at 6.6.20 and are
+#     re-locked at each pin move; the rest appear untracked after the first 6.7.x build. lib/ itself stays untracked.
 tests/*/lib/
 
 # Python bytecode from the scripts/harness/*.py boot harnesses. Untracked noise otherwise —

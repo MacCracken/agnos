@@ -39,7 +39,7 @@ dep_pin_sync() { # <name> <dir> <ref>
         || { echo "ERROR: could not move the $1 fallback clone at $2 to $3" >&2; exit 1; }
 }
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.1.1}"
+KASHI_REF="${KASHI_REF:-1.2.0}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout (2026-09-13) — see the rekha block in scripts/build.sh.
     if [ -d "$KASHI_DIR/.git" ]; then
@@ -61,7 +61,7 @@ dep_pin_sync kashi "$KASHI_DIR" "$KASHI_REF"
 # triple's drift history above is the warning, and a face verified by the smoke but built from a
 # different tag in CI is the exact silent failure it describes.
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-REKHA_REF="${REKHA_REF:-1.0.0}"
+REKHA_REF="${REKHA_REF:-1.1.0}"
 if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout — the untracked-sentinel hazard is written up at the same
     # block in scripts/build.sh; this guard MUST stay in step with build.sh's and bench.sh's.
@@ -188,7 +188,8 @@ exit(0)
     # if a real squeeze is ever wanted; the ceiling, not DCE, is the growth knob.)
     # ⛔ 1.57.14: CYRIUS_DCE IS NOT A SIZE LEVER FOR THIS KERNEL ON ANY PIN. Through cyrius 6.6.19 its compaction moved
     # .bss/.rodata out from under every patched address (the image died before its banner — filed by agnos 1.57.12,
-    # cyrius issues/2026-10-10-agnos-kernel-dce-compaction-moves-data.md, still OPEN); 6.6.20's REVBE-01 DECLINES
+    # cyrius issues/archived/2026-10-10-agnos-kernel-dce-compaction-moves-data.md — RESOLVED in cyrius 6.7.11, after the 1.57.15
+    # pin 6.7.9, which still declines); 6.6.20's REVBE-01 DECLINES
     # compaction on a `kernel;` image, so CYRIUS_DCE=1 now only NOP-fills the dead bodies and the image does not shrink
     # (the compile's own note says so). 210 unreachable fns / ~165 KB at 1.57.14.
     # The 1.55.x DISPLAY arc then closed on THAT one exactly as 1.45.10 did — the
