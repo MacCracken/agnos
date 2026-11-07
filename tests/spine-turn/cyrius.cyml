@@ -1,0 +1,17 @@
+[package]
+name = "spine-turn"
+version = "0.1.0"
+description = "the launcher of scripts/smoke/spine-turn-smoke.sh: a real agentic turn on agnos, through hoosh and daimon"
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.7.18"
+
+[build]
+entry = "launcher.cyr"
+output = "build/launcher"
+
+# AGNOS ONLY — build with `cyrius build --agnos launcher.cyr <out>`.
+[deps]
+# The FULL closure, transitives included: string -> alloc; alloc -> atomic, fnptr, poison (6.6.18+).
+stdlib = ["syscalls", "string", "alloc", "atomic", "fnptr", "poison"]

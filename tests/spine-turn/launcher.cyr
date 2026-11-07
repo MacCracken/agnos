@@ -1,0 +1,82 @@
+# spine-turn launcher — the ring-3 half of scripts/smoke/spine-turn-smoke.sh.
+#
+# Seeded as /bin/agnsh, so kybernet runs it on a PLAIN kernel, time-sliced, where agnsh and every consumer run
+# (scripts/smoke/lib/ring3-seed.sh says why). It starts the two services the way a system would, as background
+# processes, then drives thoth through three one-shot turns and prints one `TURN n exit c` line for each. It waits
+# with pause#14, never sleep_ms#41, which holds the CPU from the processes it is waiting for.
+#
+# The services get a port probe, not a fixed wait: a boot's speed depends on KVM or TCG and on how much the console
+# is carrying. A service that never listens costs the probe's deadline, and the turn then fails on its own terms.
+
+var HOOSH_PORT = 8088;
+var DAIMON_PORT = 8090;
+var LOOPBACK = 0x7F000001;
+var PROBE_MS = 60000;
+var TURN_MS = 60000;
+
+fn _put(s) { syscall(SYS_WRITE, 1, s, strlen(s)); return 0; }
+fn _put_int(n) {
+    var b[24];
+    var i = 23;
+    var neg = 0;
+    if (n < 0) { neg = 1; n = 0 - n; }
+    store8(&b + i, 0);
+    if (n == 0) { i = i - 1; store8(&b + i, 48); }
+    while (n > 0) { i = i - 1; store8(&b + i, 48 + (n % 10)); n = n / 10; }
+    if (neg == 1) { i = i - 1; store8(&b + i, 45); }
+    return _put(&b + i);
+}
+# The clock in ms: uptime_us#95, or uptime_ms#40 when the kernel refused to calibrate the TSC (#95 is then -1).
+fn _now_ms() {
+    var us = sys_uptime_us();
+    if (us >= 0) { return us / 1000; }
+    return sys_uptime_ms();
+}
+fn _wait_ms(ms) {
+    var t0 = _now_ms();
+    while ((_now_ms() - t0) < ms) { sys_pause(); }
+    return 0;
+}
+# The exit code of child `pid`, or -2 if it is still running after `ms`.
+fn _wait_exit(pid, ms) {
+    var t0 = _now_ms();
+    while ((_now_ms() - t0) < ms) {
+        var r = syscall(SYS_WAITPID, pid);
+        if (r != (0 - 2)) { return r; }
+        sys_pause();
+    }
+    return 0 - 2;
+}
+fn _start(line) {
+    var pid = sys_spawn_path(line, strlen(line));
+    _put("SPINE started "); _put(line); _put(" as pid "); _put_int(pid); _put("\n");
+    return pid;
+}
+# 1 when something listens on the port, within PROBE_MS. Connecting is all it does: the close is the whole request.
+fn _listening(port) {
+    var t0 = _now_ms();
+    while ((_now_ms() - t0) < PROBE_MS) {
+        var c = sys_sock_connect(LOOPBACK, port, 0);
+        if (c >= 0) { sys_sock_close(c); return 1; }
+        _wait_ms(100);
+    }
+    return 0;
+}
+fn _turn(n, line) {
+    var pid = _start(line);
+    var code = 0 - 1;
+    if (pid >= 0) { code = _wait_exit(pid, TURN_MS); }
+    _put("TURN "); _put_int(n); _put(" exit "); _put_int(code); _put("\n");
+    return code;
+}
+
+_put("SPINE start\n");
+_start("/bin/hoosh serve -c /etc/hoosh.cyml");
+if (_listening(HOOSH_PORT) == 0) { _put("SPINE hoosh never listened\n"); }
+_start("/bin/daimon serve 8090 --data-dir /d");
+if (_listening(DAIMON_PORT) == 0) { _put("SPINE daimon never listened\n"); }
+_turn(1, "/bin/thoth -p hello");
+_turn(2, "/bin/thoth -p call:libro_verify");
+_turn(3, "/bin/thoth --json -p hello");
+_put("SPINE-TURN DONE\n");
+syscall(SYS_EXIT, 0);
