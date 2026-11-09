@@ -11347,6 +11347,8 @@ fn gpu_pan_arm() {
     var z = 0;
     while (z < tall) { store64(gpu_pan_phys + z, 0); z = z + 8; }
     # Seed the visible screenful with what is on the console right now, so the flip does not blank the log.
+    # 1.57.18: the console's cursor bar comes off first, or the copy would carry it into the new buffer as a ghost.
+    fb_cursor_undraw();
     var src = fb_draw_base();
     if (src != 0) {
         var q = 0;
@@ -11369,6 +11371,8 @@ fn gpu_scanout_redirect() {
     if (gpu_display_surf == 0) { return 0; }
     if (gpu_blit_arm() != 1) { return 0; }
     # 1. Seed gpu_bb_a with the console content painted so far (so the redirect doesn't blank the boot log).
+    # 1.57.18: the console's cursor bar comes off first, or the copy would carry it into the new buffer as a ghost.
+    fb_cursor_undraw();
     var src = fb_fb_phys();
     var bytes = fb_pitch() * fb_height();
     var q = 0;

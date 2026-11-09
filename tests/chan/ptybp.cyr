@@ -1,0 +1,857 @@
+# ptybp — agnos 1.57.18: BACK-PRESSURE on a terminal channel (write#1 on a `#97` PTY-mode endpoint, or on the emulator's
+# end of one), epoll_wait#21 watching `#97` channel endpoints, and sock_connect#47's caller deadline (SC_TIMED).
+# Issues 2026-11-06-a-channel-write-drops-the-oldest-record-and-nobody-is-told and 2026-11-06-no-readiness-wait-on-one-fd
+# (thoth 0.55.x).
+#
+# AGNOS ONLY — `cyrius build --agnos ptybp.cyr build/ptybp`. Seeded as /bin/agnsh by scripts/smoke/pty-backpressure-smoke.sh
+# (the driver AND every child role: this same program spawned by spawn_path#43 as "/bin/agnsh <role> <args>"). The driver
+# plays the EMULATOR: it mints a channel, endows one end in PTY mode (CH_ENDOW a4 = 1000) and spawns the program that
+# lives in the terminal. One `PTYB-OK <phase> ...` / `PTYB-FAIL <phase> ...` line per phase, then `PTYB-DONE pass=N
+# fail=M` and `PTYB-EXIT 0` (it ALWAYS exits 0: a non-zero exit drops kybernet into the emergency shell).
+#   big             the issue's `thoth -p big:20000` shape: the program in the terminal writes 20,000 bytes in ONE write#1
+#                   (a4 0) and exits; the host sleeps 200 ms (the child must be BLOCKED, #99 state 6), then reads slowly
+#                   (2 ms per 16 records) until EOF. Every byte must arrive, in order (pattern i % 251); the write returned
+#                   20000; the drain takes < 350 ms (each drain of a full inbox WAKES the writer — no 100 ms backstop
+#                   rounds). (1.57.17: 4,037 bytes arrived and the writer saw 20000.)
+#   nb-emulator     a4 != 0 from the EMULATOR's end into the terminal's empty inbox: 5000 -> 4096 (64 records), then
+#                   10 -> 0 (nothing fits — the pipe's convention); after the terminal's owner exits, -1 (NB and blocking).
+#   nb-terminal     a4 != 0 from INSIDE the terminal into the emulator's empty inbox: 5000 -> 4096, then 10 -> 0; the host
+#                   then reads exactly 4096 bytes in order.
+#   death-none      the inbox full, a blocking write of 100 waits; the reader (the terminal's owner) exits ~30 ms later:
+#                   the write returns -1 (nothing taken) in < 90 ms (before the 100 ms backstop — the death must WAKE it).
+#   death-partial   63 records queued, a blocking write of 200 takes one record (64) and waits; the reader exits: 64, < 90 ms.
+#   kill            a writer BLOCKED (state 6) on a full inbox: kill(9) ends it, WAIT_BLOCK 265 in < 50 ms.
+#   stop-cont       a writer BLOCKED on a full inbox is STOPPED (19 -> state 5); a full drain does not resume it (no record
+#                   arrives while it is stopped); SIGCONT (18) resumes it and the whole 8192-byte write lands, in order.
+#   display-drop    a DISPLAY channel (endowed with a4 0): the child's 100 write#1 of 8 bytes each return 8 at once (a 2 s
+#                   watchdog kills a child that waits); the driver reads the newest 64 (first seq 36).
+#   send-drop       CH_SEND on a TERMINAL channel keeps drop-oldest: 100 sends of 8 bytes each return 8; the program in the
+#                   terminal reads the newest 64 (first seq 36).
+#   two-writer      the terminal's owner AND its grandchild (a PTY descendant) each write 200 records of 64 bytes, blocking,
+#                   while the host drains slowly: 400 records, each writer's seqs 0..199 in order, none torn.
+#   ep-timeout      epoll_wait (EPW_TIMED 300 ms) on the emulator's end, EPOLLIN, nothing queued: 0 at >= 300 ms (the
+#                   measured wake is printed; < 300 ms + 50 ms gated).
+#   ep-in           the program in the terminal writes one record 50 ms into a 5 s wait: 1, EPOLLIN, data = the fd, < 1 s.
+#   ep-out          the terminal's inbox FULL: a poll of EPOLLOUT is 0; the program reads one record 50 ms into a 5 s wait:
+#                   1, EPOLLOUT, < 1 s.
+#   ep-hup          the program CH_CLOSEs its end 50 ms into a 5 s EPOLLIN wait: 1, EPOLLIN | EPOLLHUP, < 1 s. (A close,
+#                   not a death: a child's death also posts SIGCHLD, which wakes the driver's wait on its own.)
+#   ep-display-out  an unendowed (display) channel: a 200-byte write#1 is still a one-record 64-byte short write; with its
+#                   peer inbox then FULL (CH_SEND) it is still EPOLLOUT (its write never waits).
+#   ep-in-term      the program in the terminal (a PTY-mode end, fd 0) watches its own fd 0: the host's write 50 ms into
+#                   its 5 s wait ends it: 1, EPOLLIN, data 0, < 1 s.
+#   ep-inert        a child holding INERT inherited copies of the driver's two channel ends: SET on either is -1; a legacy
+#                   op-1 ADD on the readable one is accepted but a poll reports nothing (the driver's own SET + poll on the
+#                   same end reports EPOLLIN — so the readiness exists and the child is refused authority, not emptiness).
+#   conn-*          sock_connect#47 SC_TIMED (bit 32 of src_port; a4 = ms) to a SILENT peer (the full-table fixture, fx_up
+#                   below — a listener whose passive open is refused for capacity drops every SYN): 1500 ms -> -1 in
+#                   [1500, 1525) ms; 3000 ms -> -1 in [3000, 3025) ms; WITHOUT the opt-in (a3 = -1, whose bit 32 is set,
+#                   and a4 = 1500 passed anyway) -> -1 after >= 7 s (a4 never read); 20000 ms -> clamped to the ~8 s ceiling; a4 0 -> the id at once, a
+#                   500 ms EPOLLOUT wait on it times out, #50 closes it; the TCP table's free slots are the same after all
+#                   of it (no half-open left). Loopback: SC_TIMED 1000 ms connects; a3 = 0x10000 / -1 without the bit
+#                   still auto-assign a port; SC_TIMED a4 0 returns the id at once and EPOLLOUT arrives (connected); to a
+#                   CLOSED port it returns the id at once and EPOLLERR | EPOLLHUP arrives (refused), #50 frees the slot.
+
+var PB_STDIO = 1000;                 # CH_ENDOW a4 sentinel: PTY mode
+var EPW_TIMED = 0x100000000;         # epoll_wait#21: bit 32 of max = a4 is the timeout (ms)
+var SC_TIMED = 0x100000000;          # sock_connect#47: bit 32 of src_port = a4 is the deadline (ms)
+var EP_TCP = 0x10000;
+var EPOLLIN = 1;
+var EPOLLOUT = 4;
+var EPOLLHUP = 0x10;
+var LO = 0x7F000001;
+var pb_fds[2];
+var pb_fds2[2];
+var pb_pfd[2];
+var pb_rec[8];                       # one 64-byte record
+var pb_big[2560];                    # 20480 B: the write pattern
+var pb_rd[2560];                     # 20480 B: what the host read
+var pb_line[32];                     # 256 B spawn line
+var PB_LN = 0;
+var pb_pass = 0;
+var pb_fail = 0;
+var pb_ob[64];
+var PB_ON = 0;
+var pb_evs[8];                       # 5 event records {u32 mask; u64 data} at a 12 B stride
+var pb_pl[128];                      # 1024 B: proclist#99 (16 x 64-byte records)
+
+fn o_flush() { if (PB_ON > 0) { syscall(1, 1, &pb_ob, PB_ON, 0); } PB_ON = 0; return 0; }
+fn o_putc(ch) { store8(&pb_ob + PB_ON, ch); PB_ON = PB_ON + 1; if (ch == 10) { o_flush(); } if (PB_ON >= 500) { o_flush(); } return 0; }
+fn o_out(s) { var i = 0; while (load8(s + i) != 0) { o_putc(load8(s + i)); i = i + 1; } return 0; }
+fn o_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { o_putc(45); n = 0 - n; }
+    if (n == 0) { o_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; o_putc(load8(&b + i)); }
+    return 0;
+}
+fn o_kv(k, v) { o_out(" "); o_out(k); o_out("="); o_num(v); return 0; }
+fn ok(ph) { o_out("PTYB-OK "); o_out(ph); pb_pass = pb_pass + 1; return 0; }
+fn bad(ph) { o_out("PTYB-FAIL "); o_out(ph); pb_fail = pb_fail + 1; return 0; }
+fn verdict(c, ph) { if (c == 1) { ok(ph); } else { bad(ph); } return 0; }
+
+fn eq(a, b) {
+    var i = 0;
+    while (1 == 1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn pb_atoi(s) {
+    var v = 0;
+    var i = 0;
+    while (load8(s + i) >= 48) { if (load8(s + i) > 57) { break; } v = v * 10 + (load8(s + i) - 48); i = i + 1; }
+    return v;
+}
+fn rd(fd, buf, n, a4) { return syscall(5, fd, buf, n, a4); }
+fn wr(fd, buf, n, a4) { return syscall(1, fd, buf, n, a4); }
+fn cls(fd) { return syscall(6, fd, 0, 0, 0); }
+fn ch_close(fd) { return syscall(97, 4, fd, 0, 0); }
+fn ch_mint(out) { return syscall(97, 1, out, 0, 0); }
+fn ch_endow(fd, mode) { return syscall(97, 5, fd, 0, mode); }
+fn ch_send(fd, buf, n) { return syscall(97, 2, fd, buf, n); }
+fn reap(pid) { return syscall(4, 0x100 | pid, 0, 0, 0); }
+fn us() { return syscall(95, 0, 0, 0, 0); }                    # uptime_us#95
+fn msleep(ms) { return syscall(41, ms, 0, 0, 0); }
+fn kill(pid, sig) { return syscall(16, pid, sig, 0, 0); }
+fn ep_new() { return syscall(19, 0, 0, 0, 0); }
+fn ep_set(ep, tg, evm) { return syscall(20, ep, 3, tg, evm); }
+fn ep_wait(ep, max, ms) { return syscall(21, ep, &pb_evs, max | EPW_TIMED, ms); }
+fn ev_mask(i) { return load32(&pb_evs + i * 12); }
+fn ev_data(i) { return load64(&pb_evs + i * 12 + 4); }
+fn ev_clear() { var i = 0; while (i < 8) { store64(&pb_evs + i * 8, 0); i = i + 1; } return 0; }
+fn pat(i) { return i % 251; }
+fn pat_fill(n) { var i = 0; while (i < n) { store8(&pb_big + i, pat(i)); i = i + 1; } return 0; }
+# #99: the state of `pid` (6 = BLOCKED in a kernel wait, 5 = STOPPED), or -1 when it is not listed.
+fn pstate(pid) {
+    var n = syscall(99, &pb_pl, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        if (load64(&pb_pl + i * 64) == pid) { return load64(&pb_pl + i * 64 + 8); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+# Sleep-poll (#41 1 ms) until `pid` is in state `st`, at most 2 s. 1 = seen.
+fn await_state(pid, st) {
+    var t = us();
+    while ((us() - t) < 2000000) {
+        if (pstate(pid) == st) { return 1; }
+        msleep(1);
+    }
+    return 0;
+}
+fn byte_out(fd, v) { var b[8]; store8(&b, v); return wr(fd, &b, 1, 0); }
+fn byte_in(fd) { var b[8]; store64(&b, 0); if (rd(fd, &b, 1, 0) != 1) { return 0 - 1; } return load8(&b); }
+
+# The spawn line "/bin/agnsh <role> <a> <b> <c> <d>" in pb_line.
+fn ln_s(s) { var i = 0; while (load8(s + i) != 0) { store8(&pb_line + PB_LN, load8(s + i)); PB_LN = PB_LN + 1; i = i + 1; } return 0; }
+fn ln_n(n) {
+    var b[24];
+    var i = 0;
+    if (n == 0) { store8(&pb_line + PB_LN, 48); PB_LN = PB_LN + 1; return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(&pb_line + PB_LN, load8(&b + i)); PB_LN = PB_LN + 1; }
+    return 0;
+}
+fn spawn4(role, a, b, c, d) {
+    PB_LN = 0;
+    ln_s("/bin/agnsh "); ln_s(role);
+    ln_s(" "); ln_n(a); ln_s(" "); ln_n(b); ln_s(" "); ln_n(c); ln_s(" "); ln_n(d);
+    store8(&pb_line + PB_LN, 0);
+    return syscall(43, &pb_line, PB_LN, 0, 0);
+}
+# Mint a channel and endow its far end in PTY mode; (near, far) in pb_fds. 0 / -1.
+fn mint_tty() {
+    if (ch_mint(&pb_fds) != 0) { return 0 - 1; }
+    if (ch_endow(load64(&pb_fds + 8), PB_STDIO) < 3) { return 0 - 1; }
+    return 0;
+}
+# Read records from `fd` (blocking) into pb_rd until EOF or `cap` bytes; a 2 ms pause every 16 records. -> bytes.
+fn drain_slow(fd, cap) {
+    var got = 0;
+    var k = 0;
+    while (got < cap) {
+        var n = rd(fd, &pb_rd + got, 64, 0);
+        if (n <= 0) { break; }
+        got = got + n;
+        k = k + 1;
+        if ((k % 16) == 0) { msleep(2); }
+    }
+    return got;
+}
+fn bad_bytes(n) { var b = 0; var i = 0; while (i < n) { if (load8(&pb_rd + i) != pat(i)) { b = b + 1; } i = i + 1; } return b; }
+
+# ── child roles (inside the terminal unless noted: fd 0..2 = the PTY-mode end) ──
+# big <n>: ONE blocking write of n pattern bytes. Exit 0 iff it returned n.
+fn c_big(n) {
+    pat_fill(n);
+    var r = wr(1, &pb_big, n, 0);
+    if (r == n) { return 0; }
+    return 1;
+}
+# hold <go_r> <ms>: write a 1-byte ready record, then wait for a byte on go_r (go_r > 0) or sleep ms; exit 0. Never reads.
+fn c_hold(gor, ms) {
+    store64(&pb_rec, 0x52);
+    wr(1, &pb_rec, 1, 0);
+    if (gor > 0) { byte_in(gor); } else { msleep(ms); }
+    return 0;
+}
+# nbw: a4 != 0 writes into the emulator's empty inbox: 5000 -> 4096, then 10 -> 0. Exit bits 1 | 2; good = 3.
+fn c_nbw() {
+    pat_fill(5000);
+    var bits = 0;
+    if (wr(1, &pb_big, 5000, 1) == 4096) { bits = bits | 1; }
+    if (wr(1, &pb_big, 10, 1) == 0) { bits = bits | 2; }
+    return bits;
+}
+# dispw <tfd> (NOT in a terminal: a DISPLAY endowment at tfd): 100 write#1 of 8 bytes [seq] with a4 0 into the driver's
+# inbox, which nobody reads meanwhile. Exit = how many returned 8 (100 = every one, at once — drop-oldest).
+fn c_dispw(tfd) {
+    var n = 0;
+    var s = 0;
+    while (s < 100) {
+        store64(&pb_rec, s);
+        if (wr(tfd, &pb_rec, 8, 0) == 8) { n = n + 1; }
+        s = s + 1;
+    }
+    return n;
+}
+# rdseq <go_r>: after a go byte, read every queued record non-blocking. Exit = the first record's seq when exactly 64
+# arrived, else 255.
+fn c_rdseq(gor) {
+    byte_in(gor);
+    var n = 0;
+    var first = 0 - 1;
+    while (n < 200) {
+        store64(&pb_rec, 0);
+        var r = rd(0, &pb_rec, 64, 1);
+        if (r <= 0) { break; }
+        if (first < 0) { first = load64(&pb_rec); }
+        n = n + 1;
+    }
+    if (n == 64) { return first & 0xFF; }
+    return 255;
+}
+# tw <tag> <n> <spawn>: write n records of 64 bytes [tag, seq lo, seq hi, tag x 61], each one blocking write; spawn = 1
+# first spawns `tw <tag+1> <n> 0` (a grandchild — a PTY descendant writing the same terminal) and reaps it at the end.
+# Exit 0 iff every write returned 64 (and the grandchild exited 0).
+fn c_tw(tag, n, sp) {
+    var gp = 0 - 1;
+    if (sp == 1) { gp = spawn4("tw", tag + 1, n, 0, 0); }
+    var b[64];
+    var j = 3;
+    while (j < 64) { store8(&b + j, tag); j = j + 1; }
+    store8(&b, tag);
+    var bad1 = 0;
+    var s = 0;
+    while (s < n) {
+        store8(&b + 1, s & 0xFF);
+        store8(&b + 2, (s >> 8) & 0xFF);
+        if (wr(1, &b, 64, 0) != 64) { bad1 = bad1 + 1; }
+        s = s + 1;
+    }
+    if (gp >= 0) { if (reap(gp) != 0) { bad1 = bad1 + 1; } }
+    if (sp == 1) { if (gp < 0) { bad1 = bad1 + 1; } }
+    if (bad1 == 0) { return 0; }
+    return 1;
+}
+# epc <go_r>: the epoll companion. ready record; go -> 50 ms -> write one 64-byte record; go -> 50 ms -> read one record
+# from fd 0; go -> 50 ms -> CH_CLOSE its end (fd 0); go -> exit 0.
+# ⚠ The HUP comes from CH_CLOSE, NOT from this process's death: a death also posts SIGCHLD to the driver (its parent),
+# and that post WAKES the driver's epoll_wait by itself (ep_sig_locked), which hid a missing channel-close wake (M5).
+fn c_epc(gor) {
+    store64(&pb_rec, 0x52);
+    wr(1, &pb_rec, 1, 0);
+    byte_in(gor); msleep(50);
+    store64(&pb_rec, 0x494E);
+    wr(1, &pb_rec, 64, 0);
+    byte_in(gor); msleep(50);
+    rd(0, &pb_rec, 64, 0);
+    byte_in(gor); msleep(50);
+    ch_close(0);
+    byte_in(gor);
+    return 0;
+}
+# epin: watch fd 0 (this PTY-mode end) for EPOLLIN, write a ready record, wait 5 s. Result record [7, ret, us, mask, data].
+fn c_epin() {
+    var ep = ep_new();
+    var sr = ep_set(ep, 0, EPOLLIN);
+    store64(&pb_rec, 0x52);
+    wr(1, &pb_rec, 1, 0);
+    ev_clear();
+    var t0 = us();
+    var r = ep_wait(ep, 4, 5000);
+    var el = us() - t0;
+    var tag = 7;
+    if (sr != 0) { tag = 8; }
+    if (ep < 0) { tag = 8; }
+    var m = ev_mask(0);
+    var d = ev_data(0);
+    rd(0, &pb_big, 64, 1);                               # the host's record (consumed after the wait)
+    store64(&pb_rec, tag);
+    store64(&pb_rec + 8, r);
+    store64(&pb_rec + 16, el);
+    store64(&pb_rec + 24, m);
+    store64(&pb_rec + 32, d);
+    wr(1, &pb_rec, 40, 0);
+    return 0;
+}
+# inert <fa> <fb> (NOT in a terminal: stdio is the console; fa/fb are INERT inherited copies of the driver's channel).
+# Exit bits: 1 SET fb -1 · 2 SET fa -1 · 4 legacy ADD fb accepted · 8 a poll then reports nothing. Good = 15.
+fn c_inert(fa, fb) {
+    var ep = ep_new();
+    var bits = 0;
+    if (ep_set(ep, fb, EPOLLIN) == (0 - 1)) { bits = bits | 1; }
+    if (ep_set(ep, fa, EPOLLOUT) == (0 - 1)) { bits = bits | 2; }
+    if (syscall(20, ep, 1, fb, 0) == 0) { bits = bits | 4; }
+    ev_clear();
+    if (syscall(21, ep, &pb_evs, 4, 0) == 0) { bits = bits | 8; }
+    o_out("PTYB-CHILD inert"); o_kv("bits", bits); o_out("\n");
+    return bits;
+}
+
+fn child(): i64 {
+    var role = argv(1);
+    var a = 0; var b = 0; var c = 0; var d = 0;
+    if (argc() > 2) { a = pb_atoi(argv(2)); }
+    if (argc() > 3) { b = pb_atoi(argv(3)); }
+    if (argc() > 4) { c = pb_atoi(argv(4)); }
+    if (argc() > 5) { d = pb_atoi(argv(5)); }
+    if (eq(role, "big") == 1) { return c_big(a); }
+    if (eq(role, "hold") == 1) { return c_hold(a, b); }
+    if (eq(role, "nbw") == 1) { return c_nbw(); }
+    if (eq(role, "rdseq") == 1) { return c_rdseq(a); }
+    if (eq(role, "dispw") == 1) { return c_dispw(a); }
+    if (eq(role, "tw") == 1) { return c_tw(a, b, c); }
+    if (eq(role, "epc") == 1) { return c_epc(a); }
+    if (eq(role, "epin") == 1) { return c_epin(); }
+    if (eq(role, "inert") == 1) { return c_inert(a, b); }
+    return 99;
+}
+
+# ── driver phases ──
+fn ph_big() {
+    if (mint_tty() != 0) { bad("big"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    var pid = spawn4("big", 20000, 0, 0, 0);
+    if (pid < 0) { bad("big"); o_kv("spawn", pid); o_out("\n"); ch_close(pa); return 0; }
+    msleep(200);
+    # The inbox (4096 B) is full: the writer waits. ⚠ AWAITED, not sampled once: the wait's 100 ms backstop makes the
+    # writer READY for an instant every 100 ms, and a single #99 read at 200 ms landed on one (state 1, a flake).
+    var st = 0;
+    if (await_state(pid, 6) == 1) { st = 6; }
+    var t0 = us();
+    var got = drain_slow(pa, 20480);
+    var el = us() - t0;
+    var ws = reap(pid);
+    ch_close(pa);
+    var nb = bad_bytes(got);
+    # drain_us: ~20 paced pauses (~190 ms measured). A drain that does not WAKE the blocked writer leaves it to its
+    # 100 ms backstop once per full inbox (~5 rounds for 20,000 bytes) — the 350 ms bound catches that.
+    verdict(st == 6 && got == 20000 && nb == 0 && ws == 0 && el < 350000, "big");
+    o_kv("state_seen", st); o_kv("bytes", got); o_kv("bad_bytes", nb); o_kv("writer_status", ws); o_kv("drain_us", el);
+    o_out(" (want state 6, 20000 bytes in order, status 0, drain < 350000 us)\n");
+    return 0;
+}
+
+fn ph_nb() {
+    # nb-emulator: the driver's a4 != 0 writes into the terminal's inbox (its owner never reads).
+    syscall(25, &pb_pfd, 0, 0, 0);
+    var gr = load64(&pb_pfd); var gw = load64(&pb_pfd + 8);
+    if (mint_tty() != 0) { bad("nb-emulator"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    pat_fill(5000);
+    var pid = spawn4("hold", gr, 0, 0, 0);
+    var rn = rd(pa, &pb_rec, 64, 0);                             # ready
+    var w1 = wr(pa, &pb_big, 5000, 1);
+    var w2 = wr(pa, &pb_big, 10, 1);
+    byte_out(gw, 1);
+    var ws = reap(pid);
+    var w3 = wr(pa, &pb_big, 10, 1);                             # the terminal end died with its owner
+    var w4 = wr(pa, &pb_big, 10, 0);
+    ch_close(pa);
+    verdict(rn == 1 && w1 == 4096 && w2 == 0 && ws == 0 && w3 == (0 - 1) && w4 == (0 - 1), "nb-emulator");
+    o_kv("nb5000", w1); o_kv("nb10_full", w2); o_kv("nb_after_death", w3); o_kv("blk_after_death", w4); o_kv("status", ws);
+    o_out(" (want 4096, 0, -1, -1)\n");
+    # nb-terminal: the same from inside the terminal; the host then reads exactly 4096 bytes, in order.
+    if (mint_tty() != 0) { bad("nb-terminal"); o_out(" mint/endow failed\n"); return 0; }
+    pa = load64(&pb_fds);
+    pid = spawn4("nbw", 0, 0, 0, 0);
+    var bits = reap(pid);
+    var got = drain_slow(pa, 20480);
+    ch_close(pa);
+    var nb = bad_bytes(got);
+    cls(gr); cls(gw);
+    verdict(bits == 3 && got == 4096 && nb == 0, "nb-terminal");
+    o_kv("child_bits", bits); o_kv("bytes", got); o_kv("bad_bytes", nb); o_out(" (want bits 3, 4096 bytes in order)\n");
+    return 0;
+}
+
+# death-*: the terminal's owner (`hold` 30 ms after its ready record) exits while the driver's write waits on its full
+# inbox. The death lands well before the writer's first 100 ms backstop, so only a WAKE returns it in < 90 ms.
+fn ph_death() {
+    # -1: the inbox full, nothing of the 100 bytes is taken.
+    if (mint_tty() != 0) { bad("death-none"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    pat_fill(5000);
+    var pid = spawn4("hold", 0, 30, 0, 0);
+    var rn = rd(pa, &pb_rec, 64, 0);
+    var wf = wr(pa, &pb_big, 4096, 1);
+    var t0 = us();
+    var r = wr(pa, &pb_big, 100, 0);
+    var el = us() - t0;
+    var ws = reap(pid);
+    ch_close(pa);
+    verdict(rn == 1 && wf == 4096 && ws == 0 && r == (0 - 1) && el < 90000, "death-none");
+    o_kv("fill", wf); o_kv("ret", r); o_kv("us", el); o_out(" (want -1 in < 90000 us: the reader's death wakes the writer)\n");
+    # partial: 63 records queued; the 200-byte write takes one record and waits.
+    if (mint_tty() != 0) { bad("death-partial"); o_out(" mint/endow failed\n"); return 0; }
+    pa = load64(&pb_fds);
+    pid = spawn4("hold", 0, 30, 0, 0);
+    rn = rd(pa, &pb_rec, 64, 0);
+    wf = wr(pa, &pb_big, 4032, 1);
+    t0 = us();
+    r = wr(pa, &pb_big, 200, 0);
+    el = us() - t0;
+    ws = reap(pid);
+    ch_close(pa);
+    verdict(rn == 1 && wf == 4032 && ws == 0 && r == 64 && el < 90000, "death-partial");
+    o_kv("fill", wf); o_kv("ret", r); o_kv("us", el); o_out(" (want 64 in < 90000 us)\n");
+    return 0;
+}
+
+fn ph_kill() {
+    if (mint_tty() != 0) { bad("kill"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    var pid = spawn4("big", 20000, 0, 0, 0);
+    var seen = await_state(pid, 6);
+    var t0 = us();
+    var k = kill(pid, 9);
+    var ws = reap(pid);
+    var el = us() - t0;
+    ch_close(pa);
+    verdict(seen == 1 && k == 0 && ws == 265 && el < 50000, "kill");
+    o_kv("blocked", seen); o_kv("kill", k); o_kv("status", ws); o_kv("kill_to_reap_us", el); o_out(" (want 265 in < 50000 us)\n");
+    return 0;
+}
+
+fn ph_stop() {
+    if (mint_tty() != 0) { bad("stop-cont"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    var pid = spawn4("big", 8192, 0, 0, 0);
+    var s1 = await_state(pid, 6);
+    var k1 = kill(pid, 19);
+    var s2 = await_state(pid, 5);
+    var g1 = 0;
+    while (g1 < 4096) {                                          # drain the full inbox while the writer is stopped
+        var n = rd(pa, &pb_rd + g1, 64, 1);
+        if (n <= 0) { break; }
+        g1 = g1 + n;
+    }
+    msleep(50);
+    var still = pstate(pid);
+    var extra = rd(pa, &pb_rec, 64, 1);                          # nothing may arrive while it is stopped: -2
+    var k2 = kill(pid, 18);
+    var g2 = g1;
+    while (g2 < 20480) {
+        var m = rd(pa, &pb_rd + g2, 64, 0);
+        if (m <= 0) { break; }
+        g2 = g2 + m;
+    }
+    var ws = reap(pid);
+    ch_close(pa);
+    var nb = bad_bytes(g2);
+    verdict(s1 == 1 && k1 == 0 && s2 == 1 && g1 == 4096 && still == 5 && extra == (0 - 2) && k2 == 0 && g2 == 8192
+      && nb == 0 && ws == 0, "stop-cont");
+    o_kv("blocked", s1); o_kv("stopped", s2); o_kv("drained", g1); o_kv("state_after_drain", still); o_kv("extra", extra);
+    o_kv("total", g2); o_kv("bad_bytes", nb); o_kv("status", ws); o_out(" (want 4096 drained while stopped, -2, then 8192 in order)\n");
+    return 0;
+}
+
+# WAIT_BLOCK-free reap with a watchdog: poll waitpid#4 until `pid` exits or `lim` µs pass; then kill(9) + reap and
+# return -999 (a writer that should never have waited is still waiting).
+fn reap_within(pid, lim) {
+    var t = us();
+    while ((us() - t) < lim) {
+        var r = syscall(4, pid, 0, 0, 0);
+        if (r != (0 - 2)) { return r; }
+        msleep(5);
+    }
+    kill(pid, 9);
+    reap(pid);
+    return 0 - 999;
+}
+fn ph_display() {
+    # display-drop: a child holding a DISPLAY endowment writes 100 x 8 B with write#1 a4 0 into the driver's inbox,
+    # which nobody reads meanwhile: every write returns 8 at once (drop-oldest); the driver then reads the newest 64.
+    if (ch_mint(&pb_fds2) != 0) { bad("display-drop"); o_out(" mint failed\n"); return 0; }
+    var da = load64(&pb_fds2); var db = load64(&pb_fds2 + 8);
+    var tfd = ch_endow(db, 0);
+    var t0 = us();
+    var pid = spawn4("dispw", tfd, 0, 0, 0);
+    var okw = reap_within(pid, 2000000);
+    var el = us() - t0;
+    var n = 0;
+    var first = 0 - 1;
+    while (n < 200) {
+        var r = rd(da, &pb_rec, 64, 1);
+        if (r <= 0) { break; }
+        if (first < 0) { first = load64(&pb_rec); }
+        n = n + 1;
+    }
+    ch_close(da);
+    verdict(okw == 100 && n == 64 && first == 36, "display-drop");
+    o_kv("writes_8", okw); o_kv("us", el); o_kv("read", n); o_kv("first_seq", first);
+    o_out(" (want 100 writes of 8 at once, then 64 records from seq 36)\n");
+    # ep-display-out (+ the one-record short write): the driver's own unendowed pair. A 200-byte write#1 into the empty
+    # inbox is ONE 64-byte record; CH_SEND then fills the peer inbox; the display end is still EPOLLOUT.
+    if (ch_mint(&pb_fds2) != 0) { bad("ep-display-out"); o_out(" mint failed\n"); return 0; }
+    da = load64(&pb_fds2); db = load64(&pb_fds2 + 8);
+    pat_fill(200);
+    var w200 = wr(da, &pb_big, 200, 0);
+    var r200 = rd(db, &pb_rd, 64, 1);
+    var s = 0;
+    while (s < 100) { store64(&pb_rec, s); ch_send(da, &pb_rec, 8); s = s + 1; }
+    var ep = ep_new();
+    var es = ep_set(ep, da, EPOLLOUT);
+    ev_clear();
+    var er = syscall(21, ep, &pb_evs, 4 | EPW_TIMED, 0);
+    var em = ev_mask(0);
+    cls(ep);
+    ch_close(da); ch_close(db);
+    verdict(w200 == 64 && r200 == 64 && es == 0 && er == 1 && (em & EPOLLOUT) == EPOLLOUT, "ep-display-out");
+    o_kv("w200", w200); o_kv("r200", r200); o_kv("set", es); o_kv("ret", er); o_kv("mask", em);
+    o_out(" (want a 64-byte short write, then 1 ready with EPOLLOUT over a full peer inbox)\n");
+    # send-drop: CH_SEND keeps drop-oldest on a TERMINAL channel.
+    syscall(25, &pb_pfd, 0, 0, 0);
+    var gr = load64(&pb_pfd); var gw = load64(&pb_pfd + 8);
+    if (mint_tty() != 0) { bad("send-drop"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    pid = spawn4("rdseq", gr, 0, 0, 0);
+    var oks = 0;
+    s = 0;
+    while (s < 100) {
+        store64(&pb_rec, s);
+        if (ch_send(pa, &pb_rec, 8) == 8) { oks = oks + 1; }
+        s = s + 1;
+    }
+    byte_out(gw, 1);
+    var ws = reap(pid);
+    ch_close(pa);
+    cls(gr); cls(gw);
+    verdict(oks == 100 && ws == 36, "send-drop");
+    o_kv("sends_8", oks); o_kv("child_first_seq", ws); o_out(" (want 100 and 36: the newest 64)\n");
+    return 0;
+}
+
+fn ph_two_writer() {
+    if (mint_tty() != 0) { bad("two-writer"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    var pid = spawn4("tw", 65, 200, 1, 0);
+    var na = 0; var nb2 = 0; var torn = 0; var order = 0; var other = 0;
+    var t0 = us();
+    var k = 0;
+    while (1 == 1) {
+        var n = rd(pa, &pb_rec, 64, 0);
+        if (n <= 0) { break; }
+        k = k + 1;
+        if ((k % 32) == 0) { msleep(1); }
+        if (n != 64) { torn = torn + 1; continue; }
+        var tg = load8(&pb_rec);
+        var sq = load8(&pb_rec + 1) | (load8(&pb_rec + 2) << 8);
+        var j = 3;
+        while (j < 64) { if (load8(&pb_rec + j) != tg) { torn = torn + 1; break; } j = j + 1; }
+        if (tg == 65) { if (sq != na) { order = order + 1; } na = na + 1; }
+        elif (tg == 66) { if (sq != nb2) { order = order + 1; } nb2 = nb2 + 1; }
+        else { other = other + 1; }
+        if ((us() - t0) > 20000000) { break; }
+    }
+    var el = us() - t0;
+    var ws = reap(pid);
+    ch_close(pa);
+    verdict(na == 200 && nb2 == 200 && torn == 0 && order == 0 && other == 0 && ws == 0, "two-writer");
+    o_kv("owner_recs", na); o_kv("grandchild_recs", nb2); o_kv("torn", torn); o_kv("out_of_order", order); o_kv("other", other);
+    o_kv("status", ws); o_kv("us", el); o_out(" (want 200 + 200, none torn, lost or reordered)\n");
+    return 0;
+}
+
+fn ph_epoll() {
+    syscall(25, &pb_pfd, 0, 0, 0);
+    var gr = load64(&pb_pfd); var gw = load64(&pb_pfd + 8);
+    if (mint_tty() != 0) { bad("ep-timeout"); o_out(" mint/endow failed\n"); return 0; }
+    var pa = load64(&pb_fds);
+    var pid = spawn4("epc", gr, 0, 0, 0);
+    var rn = rd(pa, &pb_rec, 64, 0);                             # ready
+    var ep = ep_new();
+    var s1 = ep_set(ep, pa, EPOLLIN);
+    # ep-timeout
+    ev_clear();
+    var t0 = us();
+    var r1 = ep_wait(ep, 4, 300);
+    var e1 = us() - t0;
+    verdict(rn == 1 && s1 == 0 && r1 == 0 && e1 >= 300000 && e1 < 350000, "ep-timeout");
+    o_kv("ret", r1); o_kv("us", e1); o_out(" (want 0 at [300000, 350000) us — the measured wake)\n");
+    # ep-in
+    byte_out(gw, 1);
+    ev_clear();
+    t0 = us();
+    var r2 = ep_wait(ep, 4, 5000);
+    var e2 = us() - t0;
+    var m2 = ev_mask(0); var d2 = ev_data(0);
+    var n2 = rd(pa, &pb_rec, 64, 1);
+    verdict(r2 == 1 && (m2 & EPOLLIN) == EPOLLIN && d2 == pa && e2 < 1000000 && n2 == 64, "ep-in");
+    o_kv("ret", r2); o_kv("mask", m2); o_kv("data", d2); o_kv("us", e2); o_kv("rec", n2); o_out(" (want 1 EPOLLIN < 1 s)\n");
+    # ep-out: fill the terminal's inbox, then the program reads one record.
+    pat_fill(5000);
+    var wf = wr(pa, &pb_big, 4096, 1);
+    var s3 = ep_set(ep, pa, EPOLLOUT);
+    ev_clear();
+    var p3 = syscall(21, ep, &pb_evs, 4 | EPW_TIMED, 0);         # a poll: not writable
+    byte_out(gw, 1);
+    ev_clear();
+    t0 = us();
+    var r3 = ep_wait(ep, 4, 5000);
+    var e3 = us() - t0;
+    var m3 = ev_mask(0);
+    verdict(wf == 4096 && s3 == 0 && p3 == 0 && r3 == 1 && (m3 & EPOLLOUT) == EPOLLOUT && e3 < 1000000, "ep-out");
+    o_kv("fill", wf); o_kv("poll_full", p3); o_kv("ret", r3); o_kv("mask", m3); o_kv("us", e3); o_out(" (want poll 0, then 1 EPOLLOUT < 1 s)\n");
+    # ep-hup: the program CH_CLOSEs its end (no death: no SIGCHLD to wake this wait instead).
+    var s4 = ep_set(ep, pa, EPOLLIN);
+    byte_out(gw, 1);
+    ev_clear();
+    t0 = us();
+    var r4 = ep_wait(ep, 4, 5000);
+    var e4 = us() - t0;
+    var m4 = ev_mask(0);
+    byte_out(gw, 1);
+    var ws = reap(pid);
+    verdict(s4 == 0 && r4 == 1 && (m4 & (EPOLLIN | EPOLLHUP)) == (EPOLLIN | EPOLLHUP) && e4 < 1000000 && ws == 0, "ep-hup");
+    o_kv("ret", r4); o_kv("mask", m4); o_kv("us", e4); o_kv("status", ws); o_out(" (want 1 EPOLLIN|EPOLLHUP < 1 s)\n");
+    cls(ep);
+    ch_close(pa);
+    cls(gr); cls(gw);
+    # ep-in-term: the PTY-mode end watches its own fd 0.
+    if (mint_tty() != 0) { bad("ep-in-term"); o_out(" mint/endow failed\n"); return 0; }
+    pa = load64(&pb_fds);
+    pid = spawn4("epin", 0, 0, 0, 0);
+    var rr = rd(pa, &pb_rec, 64, 0);                             # ready (it is about to wait)
+    msleep(50);
+    store64(&pb_rec, 0x4859);
+    var hw = wr(pa, &pb_rec, 8, 0);
+    store64(&pb_rec, 0);
+    var rn5 = rd(pa, &pb_rec, 64, 0);
+    var tg5 = load64(&pb_rec); var r5 = load64(&pb_rec + 8); var e5 = load64(&pb_rec + 16);
+    var m5 = load64(&pb_rec + 24); var d5 = load64(&pb_rec + 32);
+    ws = reap(pid);
+    ch_close(pa);
+    verdict(rr == 1 && hw == 8 && rn5 == 40 && tg5 == 7 && r5 == 1 && (m5 & EPOLLIN) == EPOLLIN && d5 == 0
+      && e5 < 1000000 && ws == 0, "ep-in-term");
+    o_kv("tag", tg5); o_kv("ret", r5); o_kv("mask", m5); o_kv("data", d5); o_kv("us", e5); o_out(" (want 1 EPOLLIN on fd 0 < 1 s)\n");
+    # ep-inert: inherited copies are inert for a child; the driver's own claim is watchable.
+    if (ch_mint(&pb_fds2) != 0) { bad("ep-inert"); o_out(" mint failed\n"); return 0; }
+    var fa = load64(&pb_fds2); var fb = load64(&pb_fds2 + 8);
+    store64(&pb_rec, 0x494E);
+    wr(fa, &pb_rec, 8, 0);                                       # fb is readable to its owner
+    var ep2 = ep_new();
+    var os = ep_set(ep2, fb, EPOLLIN);
+    ev_clear();
+    var op = syscall(21, ep2, &pb_evs, 4 | EPW_TIMED, 0);
+    cls(ep2);
+    pid = spawn4("inert", fa, fb, 0, 0);
+    var ib = reap(pid);
+    ch_close(fa); ch_close(fb);
+    verdict(os == 0 && op == 1 && ib == 15, "ep-inert");
+    o_kv("owner_set", os); o_kv("owner_poll", op); o_kv("child_bits", ib); o_out(" (want owner 0/1, child 15: refused, nothing reported)\n");
+    return 0;
+}
+
+# ── sock_connect#47 SC_TIMED ──
+fn s_listen(p) { return syscall(56, p, 0, 0, 0); }
+fn s_close(c) { return syscall(50, c, 0, 0, 0); }
+fn s_accept_wait(l) {
+    var t = us();
+    while ((us() - t) < 2000000) {
+        var c = syscall(57, l, 0, 0, 0);
+        if (c >= 0) { return c; }
+        msleep(1);
+    }
+    return 0 - 1;
+}
+var pb_lq[16];
+# The free TCP slots: LISTEN claims on port.. until one is refused (a LISTEN claim is not subject to the passive reserve),
+# then released. (sock-wait's s_fullnet_up probe.)
+fn free_slots(port) {
+    var n = 0;
+    while (n < 16) {
+        var q = s_listen(port + n);
+        if (q < 0) { break; }
+        store64(&pb_lq + n * 8, q);
+        n = n + 1;
+    }
+    var i = 0;
+    while (i < n) { s_close(load64(&pb_lq + i * 8)); i = i + 1; }
+    return n;
+}
+fn dial(ip, port, a3, a4) { return syscall(47, ip, port, a3, a4); }
+# ⭐ THE SILENT PEER (sock-wait N6's fixture, tests/sockwait/sockw.cyr s_fullnet_up): agnos answers a SYN to a closed
+# port with RST|ACK, so the one SILENT refusal is a passive open refused for CAPACITY. This process takes 6 of the 8
+# slots — two listeners + two loopback pairs (each a client end here and an unaccepted ESTABLISHED child) — leaving 2
+# free; a dial's SYN_SENT takes one, and its SYN (and every retransmit) then finds 1 free <= the passive reserve (1)
+# and is DROPPED: #47 waits for a SYN-ACK that never comes. Host-independent (no NIC, no slirp, no route): a real SYN
+# leaves the client and the peer's stack silently drops it. The arithmetic is ASSERTED (free == 2), not assumed.
+var PB_SLOTS = 8;
+var PB_FULL = 19200;                 # the fixture's first listener: the silent dial target
+var pb_fx[8];
+var PB_FXN = 0;
+fn fx_put(id) { store64(&pb_fx + PB_FXN * 8, id); PB_FXN = PB_FXN + 1; return 0; }
+fn fx_down() {
+    var i = 0;
+    while (i < PB_FXN) { s_close(load64(&pb_fx + i * 8)); i = i + 1; }  # listeners first: their reap RSTs the pairs
+    PB_FXN = 0;
+    msleep(20);
+    return 0;
+}
+# 1 = the fixture is up with exactly 2 free slots; 0 = it could not be built as asserted.
+fn fx_up() {
+    PB_FXN = 0;
+    var l1 = s_listen(PB_FULL);
+    var l2 = s_listen(PB_FULL + 1);
+    if (l1 >= 0) { fx_put(l1); }
+    if (l2 >= 0) { fx_put(l2); }
+    if (l1 < 0 || l2 < 0) { return 0; }
+    var k = 0;
+    while (k < 2) {
+        var c = dial(LO, PB_FULL, 0, 0);
+        if (c < 0) { return 0; }
+        fx_put(c);
+        k = k + 1;
+    }
+    if (free_slots(19100) != 2) { return 0; }
+    return 1;
+}
+fn conn_timed(ms, ph) {
+    var t0 = us();
+    var r = dial(LO, PB_FULL, SC_TIMED, ms);
+    var el = us() - t0;
+    verdict(r == (0 - 1) && el >= ms * 1000 && el < ms * 1000 + 25000, ph);
+    o_kv("ret", r); o_kv("us", el); o_kv("over_us", el - ms * 1000); o_out(" (want -1 in [deadline, deadline + 25000) us)\n");
+    return 0;
+}
+fn ph_connect() {
+    var f0 = free_slots(19100);
+    var fx = fx_up();
+    var fa = 0 - 1;
+    if (fx == 1) { fa = free_slots(19100); }
+    o_out("PTYB-FIXTURE"); o_kv("up", fx); o_kv("free_all", f0); o_kv("free_fixture", fa); o_out("\n");
+    conn_timed(1500, "conn-1500");
+    conn_timed(3000, "conn-3000");
+    # NO opt-in: a3 = -1 (auto port, as always — and bit 32 is SET in it, so only an exact `bits 63..32 == 1` test
+    # leaves it alone) and a4 = 1500, which must not be read.
+    var t0 = us();
+    var r = dial(LO, PB_FULL, 0 - 1, 1500);
+    var el = us() - t0;
+    verdict(r == (0 - 1) && el >= 7000000 && el < 12000000, "conn-noflag");
+    o_kv("ret", r); o_kv("us", el); o_out(" (want -1 after the ~8 s ceiling: a4 ignored without SC_TIMED)\n");
+    t0 = us();
+    r = dial(LO, PB_FULL, SC_TIMED, 20000);                      # above the ceiling: clamped to it
+    el = us() - t0;
+    verdict(r == (0 - 1) && el >= 7000000 && el < 12000000, "conn-clamp");
+    o_kv("ret", r); o_kv("us", el); o_out(" (want -1 at the ~8 s ceiling, not 20 s)\n");
+    # A non-blocking dial to the silent peer: the id at once; EPOLLOUT never comes; #50 closes it.
+    t0 = us();
+    var nc = dial(LO, PB_FULL, SC_TIMED, 0);
+    var ne = us() - t0;
+    var ep = ep_new();
+    var es = ep_set(ep, EP_TCP | nc, EPOLLOUT);
+    ev_clear();
+    t0 = us();
+    var er = ep_wait(ep, 4, 500);
+    var ee = us() - t0;
+    var nx = s_close(nc);
+    cls(ep);
+    verdict(nc >= 0 && ne < 50000 && es == 0 && er == 0 && ee >= 500000 && nx == 0, "conn-nb-hole");
+    o_kv("id", nc); o_kv("dial_us", ne); o_kv("wait_ret", er); o_kv("wait_us", ee); o_kv("close", nx);
+    o_out(" (want an id in < 50000 us, no EPOLLOUT in 500 ms, close 0)\n");
+    var fb = 0 - 1;
+    if (fx == 1) { fb = free_slots(19100); }
+    fx_down();
+    var f1 = free_slots(19100);
+    verdict(fx == 1 && fa == 2 && fb == 2 && f0 == PB_SLOTS && f1 == f0, "conn-slots");
+    o_kv("free_all_before", f0); o_kv("free_fixture_before", fa); o_kv("free_fixture_after", fb); o_kv("free_all_after", f1);
+    o_out(" (want 8 / 2 / 2 / 8: no half-open slot left by a spent deadline or a closed non-blocking dial)\n");
+    # Loopback: the timed form connects; high a3 without the bit still auto-assigns; the non-blocking form completes.
+    var l = s_listen(19300);
+    t0 = us();
+    var c1 = dial(LO, 19300, SC_TIMED, 1000);
+    var e1 = us() - t0;
+    var a1 = s_accept_wait(l);
+    var c2 = dial(LO, 19300, 0x10000, 0);
+    var a2 = s_accept_wait(l);
+    var c3 = dial(LO, 19300, 0 - 1, 0);
+    var a3 = s_accept_wait(l);
+    verdict(l >= 0 && c1 >= 0 && e1 < 200000 && a1 >= 0 && c2 >= 0 && a2 >= 0 && c3 >= 0 && a3 >= 0, "conn-loop");
+    o_kv("listen", l); o_kv("timed", c1); o_kv("timed_us", e1); o_kv("a3_0x10000", c2); o_kv("a3_m1", c3);
+    o_out(" (want three connections; the timed one < 200000 us)\n");
+    s_close(c1); s_close(a1); s_close(c2); s_close(a2); s_close(c3); s_close(a3);
+    t0 = us();
+    var c4 = dial(LO, 19300, SC_TIMED, 0);
+    var e4 = us() - t0;
+    var ep4 = ep_new();
+    var s4 = ep_set(ep4, EP_TCP | c4, EPOLLOUT);
+    ev_clear();
+    t0 = us();
+    var r4 = ep_wait(ep4, 4, 2000);
+    var w4 = us() - t0;
+    var m4 = ev_mask(0);
+    var a4c = s_accept_wait(l);
+    verdict(c4 >= 0 && e4 < 50000 && s4 == 0 && r4 == 1 && (m4 & EPOLLOUT) == EPOLLOUT && w4 < 1000000 && a4c >= 0, "conn-nb-loop");
+    o_kv("id", c4); o_kv("dial_us", e4); o_kv("ret", r4); o_kv("mask", m4); o_kv("wait_us", w4); o_kv("accepted", a4c);
+    o_out(" (want an id at once, then EPOLLOUT: connected)\n");
+    cls(ep4);
+    s_close(c4); s_close(a4c); s_close(l);
+    # conn-nb-rst: a non-blocking dial to a CLOSED loopback port — the id at once (the RST lands in the one net_poll or
+    # just after), then EPOLLERR | EPOLLHUP on it; #50 releases it. (Before 1.57.18 the same call blocked and returned -1.)
+    var EPOLLERR = 8;
+    t0 = us();
+    var c5 = dial(LO, 19399, SC_TIMED, 0);
+    var e5 = us() - t0;
+    var ep5 = ep_new();
+    var s5 = ep_set(ep5, EP_TCP | c5, EPOLLOUT);
+    ev_clear();
+    var r5 = ep_wait(ep5, 4, 2000);
+    var m5 = ev_mask(0);
+    var x5 = s_close(c5);
+    cls(ep5);
+    var f2 = free_slots(19100);
+    verdict(c5 >= 0 && e5 < 50000 && s5 == 0 && r5 == 1 && (m5 & (EPOLLERR | EPOLLHUP)) == (EPOLLERR | EPOLLHUP)
+      && (m5 & EPOLLOUT) == 0 && x5 == 0 && f2 == PB_SLOTS, "conn-nb-rst");
+    o_kv("id", c5); o_kv("dial_us", e5); o_kv("ret", r5); o_kv("mask", m5); o_kv("close", x5); o_kv("free_after", f2);
+    o_out(" (want an id at once, then EPOLLERR|EPOLLHUP without EPOLLOUT; all 8 slots free after #50)\n");
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) { return child(); }
+    o_out("PTYB-BEGIN pid="); o_num(syscall(2, 0, 0, 0, 0)); o_out("\n");
+    ph_big();
+    ph_nb();
+    ph_death();
+    ph_kill();
+    ph_stop();
+    ph_display();
+    ph_two_writer();
+    ph_epoll();
+    ph_connect();
+    o_out("PTYB-DONE"); o_kv("pass", pb_pass); o_kv("fail", pb_fail); o_out("\n");
+    o_out("PTYB-EXIT 0\n");
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

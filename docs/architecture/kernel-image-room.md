@@ -182,6 +182,11 @@ Moved — 11 arrays, 300,064 B; every one first touched after `room_init`, CPU-o
 | 9 | `pcpu_sc_gpuop` | 16,384 | syscall.cyr | gpu_op#92 |
 | 10 | `lo_ring` | 12,288 | net.cyr | the first loopback frame |
 | 11 | `exfat_upcase_buf` | 8,192 | exfat.cyr | an exFAT mount |
+| 12 | `proc_cwd_buf` | 65,536 | proc.cyr | the first chdir#112 / PWD= seed off `/` (1.57.18; a length-0 cwd — `/` — never reads it) |
+| 13 | `pcpu_sc_path` | 32,768 | syscall.cyr | the first path-taking syscall (1.57.18, the path ingress — `working-directory.md`) |
+
+(1.57.18 added slots 12–13 — 13 arrays, 398,368 B — for the per-process working directory; the figures in the line
+above are 1.57.12's.)
 
 The four PCI tables kept their declared sizes, each 8× its use (128 × 32 B = 4 KB of PciDevs in a `[4096]` u64, and so
 on — the module-scope u64 unit read as bytes). That cost 84 KB of image until the move and costs RAM in the room now;

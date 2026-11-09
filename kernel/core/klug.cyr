@@ -241,6 +241,7 @@ fn klug_replay_fb() {
     var n = klug_head;
     if (klug_count >= 65536) { n = 65536; }     # wrapped — best-effort, whole ring
     fb_print(klug_buf, n);
+    fb_cursor_sync();                            # 1.57.18: the cursor bar, once, at the end of the repaint
     return 0;
 }
 

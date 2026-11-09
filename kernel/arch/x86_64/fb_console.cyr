@@ -17,8 +17,8 @@
 # the only thing on the framebuffer once shell comes up.
 #
 # Font: IBM VGA BIOS 8x16 ROM font (public domain, IBM 1981; same byte
-# table Linux's lib/fonts/font_8x16.c carries). Covers printable ASCII
-# 0x20..0x7F (96 glyphs, 1536 bytes). Each glyph is 16 bytes top-to-bottom;
+# table Linux's lib/fonts/font_8x16.c carries). Covers CP437 0x20..0xFF plus kashi's
+# extension cells (U+2026, U+FFFD) since kashi 1.1.0. Each glyph is 16 bytes top-to-bottom;
 # bit 7 = leftmost pixel of that row. As of agnos 1.37.5 the glyph data
 # + accessors live in the **kashi** freestanding font-data core
 # (`../kashi/src/font_data.cyr`, pulled via `[deps.kashi]` in cyrius.cyml);
@@ -31,9 +31,16 @@
 # is retained in kashi (`KASHI_FONT_CGA_8X8`) for future low-res / dense-grid
 # uses but agnos's kernel console doesn't render it.
 #
-# Color: white foreground on black background. Both pixels are painted
-# per glyph cell (no transparency) so the console area paints fully even
-# over whatever the UEFI firmware left there.
+# Color: white foreground on black background by default (SGR changes both, since 1.43.1). Both pixels are
+# painted per glyph cell (no transparency) so the console area paints fully even over whatever the UEFI firmware
+# left there.
+#
+# 1.57.18 — the console is a terminal for full-screen programs (issue 2026-11-06-the-console-is-short-of-a-terminal):
+# UTF-8 through kashi's CP437 cells (kashi_cp437_from_unicode; one U+FFFD cell where there is none), EL / ED in the
+# active background, a drawn cursor (?25h / ?25l), 32 CSI parameters, SGR 7 / 27, OSC / DCS / APC / PM / SOS
+# swallowed, Tab, the last-column pending wrap and DECAWM — agnos-userland-abi.md's "console escape support" table.
+# The scroll is `rep movsq` through the RAM shadow, and the framebuffer is really write-combined (vmm.cyr
+# pat_init_cpu): 194 ms -> ~2 ms per scrolled line at 2048x2048 under KVM.
 #
 # Geometry comes from boot_info (Path C struct) every fb_putc call —
 # kept dynamic because cold boots can reassign the GOP BAR between burns.
@@ -254,17 +261,12 @@ fn fb_console_init() {
     if (fb_clr != 0) {
         var pitch_clr  = fb_pitch();
         var height_clr = fb_height();
-        # u64 block-zero: 2 pixels per cycle. Halves loop count vs u32.
-        # pitch is 8-aligned at 1080p (7680 = 8*960); a non-8-aligned
-        # pitch would leave 4-7 bytes per row dirty (right-edge), same
-        # failure mode as a non-4-aligned pitch under the prior u32
-        # loop. WC-mapped FB writes coalesce into 8-byte bursts.
+        # u64 block-zero: 2 pixels per qword. pitch is 8-aligned at 1080p (7680 = 8*960); a non-8-aligned
+        # pitch would leave 4-7 bytes per row dirty (right-edge), same failure mode as a non-4-aligned pitch
+        # under the prior u32 loop. 1.57.18: one `rep stosq` per scanline (fb_stosq; the bulk-store banner).
         var stride_u64 = pitch_clr / 8;
         for (var py = 0; py < height_clr; py = py + 1) {
-            var scan_clr = fb_clr + py * pitch_clr;
-            for (var px = 0; px < stride_u64; px = px + 1) {
-                store64(scan_clr + px * 8, 0);
-            }
+            fb_stosq(fb_clr + py * pitch_clr, 0, stride_u64);
         }
     }
     # Glyph data lives in kashi (1.37.5 fold-in). One init populates kashi's
@@ -310,8 +312,18 @@ fn fb_verify_wc() {
     var pde = vmm_get_pde_2mb(phys);
     # PAT-index = PWT(bit3) | PCD(bit4)<<1 | PAT-page(bit12)<<2
     var pat_idx = ((pde >> 3) & 1) | (((pde >> 4) & 1) << 1) | (((pde >> 12) & 1) << 2);
-    if (pat_idx == 1) {
+    # ⛔ 1.57.18 — THE INDEX ALONE NEVER PROVED WC. This line printed "WC verified" for years while PAT entry 1 held the
+    # firmware's 0x04 = WT (vmm.cyr pat_init_cpu). Decode the entry's TYPE from the live MSR too.
+    var pat_ty = (rdmsr(0x277) >> (pat_idx * 8)) & 0xFF;
+    if (pat_idx == 1 && pat_ty == 1) {
         serial_println("fb: WC verified (PAT entry 1)", 29);
+        serial_print("fb: PAT entry 1 = 0x01 WC (firmware PAT ", 40);
+        kfmt_hex0x(pat_fw_value);
+        serial_println(")", 1);
+    } elif (pat_idx == 1) {
+        serial_print("fb: WARN PAT entry 1 is type ", 29);
+        kfmt_hex0x(pat_ty);
+        serial_println(", not 0x01 WC -- framebuffer stores are not write-combined", 58);
     } else {
         serial_print("fb: WARN expected PAT entry 1 (WC), got entry ", 46);
         kfmt_int(pat_idx);
@@ -375,9 +387,7 @@ fn fb_shadow_init() {
     # (the extra <=7 B stay within the FB's 2 MB-aligned WC region). The FB side is
     # device memory at its identity VA (PDPT[2..3], mirrored into every CR3).
     var words = (need + 7) / 8;
-    for (var i = 0; i < words; i = i + 1) {
-        store64(kva + i * 8, load64(phys + i * 8));
-    }
+    fb_movsq(kva, phys, words);
     fb_shadow = kva;
     fb_shadow_size = n * 0x200000;
     serial_print("fb: shadow ", 11);
@@ -419,12 +429,14 @@ fn fb_pan_armed() {
 # fb_pan_arm — called by the #93 PAN op once the scanout has been flipped to the pan buffer AND
 # fb_set_scanout_base points at it. limit_bytes = slack rows * pitch.
 fn fb_pan_arm(limit_bytes) {
+    fb_cursor_undraw();                 # 1.57.18: never let the bar ride a base change (the cursor banner)
     fb_pan_bytes = 0;
     fb_pan_limit = limit_bytes;
     return 0;
 }
 # fb_pan_disarm — fall back to the software scroll. The caller MUST have re-pointed the scanout first.
 fn fb_pan_disarm() {
+    fb_cursor_undraw();
     fb_pan_bytes = 0;
     fb_pan_limit = 0;
     return 0;
@@ -438,6 +450,7 @@ fn fb_draw_base() {
 }
 # fb_set_scanout_base — the redirect switch (called from gpu_scanout_redirect once scanout is re-pointed).
 fn fb_set_scanout_base(b) {
+    fb_cursor_undraw();                 # 1.57.18: never let the bar ride a base change (the cursor banner)
     fb_scanout_base = b;
     return 0;
 }
@@ -458,13 +471,27 @@ var fb_geom_pitch = 0;   # BYTES per scanline (= surface pitch-px * bytes-per-pi
 # bit 28, nobody else) once its console is settled. Posted from here, before mdo_native's fb_console_clear and
 # matchgeom's clear + klug replay, a watcher on another CPU could redraw on the signal and have the redraw wiped by the
 # clear that followed (1.57.13 review).
+# ⭐ 1.57.18 — under the console lock: the cursor bar comes off at the OLD geometry (its recorded offset is only right
+# there), and no kprint on another CPU paints between the cells changing (every caller runs outside the emitters).
+# ⛔ And a geometry the RAM shadow cannot hold turns the shadow off (direct paint, the fb_shadow_init fallback): it was
+# sized for the boot geometry, and every mirror store, clear and scroll would otherwise run past its end.
 fn fb_set_geom(w, h, pitch_bytes) {
+    console_spin_lock();
+    fb_cursor_undraw();
     var sg_before = fb_winsize();
     fb_geom_w = w;
     fb_geom_h = h;
     fb_geom_pitch = pitch_bytes;
-    if (fb_winsize() != sg_before) { return 1; }
-    return 0;
+    if (fb_shadow != 0) {
+        if (fb_pitch() * fb_height() > fb_shadow_size) {
+            fb_shadow = 0;
+            serial_println("fb: shadow smaller than the new geometry -- direct paint", 56);
+        }
+    }
+    var sg_r = 0;
+    if (fb_winsize() != sg_before) { sg_r = 1; }
+    console_spin_unlock();
+    return sg_r;
 }
 # fb_geom_active — 1 once the geometry has been matched to the real surface (lets the matcher run idempotently
 # from an early AND a late call site without double-clearing).
@@ -599,10 +626,38 @@ var FB_BG = 0x00000000;  # black (default background)
 # directly (no per-pixel cost added). Defaults match the historical white-on-black.
 var fb_fg_color = 0x00FFFFFF;   # current foreground, PACKED for the FB pixel format
 var fb_bg_color = 0x00000000;   # current background,  PACKED for the FB pixel format
-var fb_ansi_state = 0;          # 0 = normal, 1 = saw ESC, 2 = inside CSI (ESC[…)
-var fb_ansi_params[8];          # CSI numeric params (module-global → 8×u64); >8 capped
+# ⭐ 1.57.18 — THE CONSOLE AS A TERMINAL (issue 2026-11-06-the-console-is-short-of-a-terminal; thoth's TUI carried a
+# filter that stood in for all of this). Prior art: Linux drivers/tty/vt/vt.c (do_con_trol's states, csi_J / csi_K,
+# vc_con_write_normal, the UTF-8 decoder and its U+FFFD, vc_need_wrap) with xterm's ctlseqs for the semantics. The
+# "console escape support" table in agnos-userland-abi.md lists every sequence; the states:
+#   0 NORMAL · 1 ESC seen (intermediates 0x20-0x2F stay here until the final byte) · 2 CSI (parameters) ·
+#   3 a control STRING — OSC `ESC ]`, DCS `ESC P`, APC `ESC _`, PM `ESC ^`, SOS `ESC X` — swallowed whole up to BEL or
+#     ST (`ESC \`), CAN / SUB cancel it, and after FB_STR_MAX body bytes it ENDS (the next byte draws): an
+#     unterminated string must not eat the console for good (VTE caps a string at 4096 bytes, VTE_SEQ_STRING_MAX_CAPACITY)
+#   4 a string's ESC (`\` ends it as ST; any other byte starts a new sequence, as vt.c's ESesc does).
+# C0 controls inside states 1 and 2 are EXECUTED and the sequence goes on (ECMA-48 / vt.c "control characters can be
+# used in the middle of an escape sequence"); a byte >= 0x80 abandons the sequence and is drawn.
+var FB_NPAR = 32;               # CSI parameters kept (vt.c NPAR 16, xterm NPARAM 30, VTE 32); later ones are ignored
+var FB_STR_MAX = 4096;          # control-string body bytes swallowed before the string is ended
+var fb_ansi_state = 0;          # 0..4, above
+var fb_ansi_params[32];         # CSI numeric params (module-global -> 32 x u64), each clamped to 65535
 var fb_ansi_nparam = 0;         # index of the param currently being accumulated
-var fb_ansi_have_digit = 0;     # 1 if the current param slot has seen ≥1 digit
+var fb_ansi_have_digit = 0;     # 1 if the current param slot has seen >= 1 digit
+var fb_ansi_priv = 0;           # the CSI private marker ('?' '>' '<' '=') when it led the parameters, else 0
+var fb_ansi_inter = 0;          # 1 once a CSI intermediate byte (0x20-0x2F) was seen (no such final is handled)
+var fb_ansi_ovf = 0;            # 1 once a CSI ran past FB_NPAR parameters (the rest are ignored, not folded into the last)
+var fb_str_n = 0;               # control-string body bytes swallowed so far
+# UTF-8 (Unicode 15 Table 3-7 well-formed sequences). One replacement cell per MAXIMAL SUBPART of an ill-formed
+# sequence (Unicode 15 § 3.9 U+FFFD substitution, "best practice"; vt.c's vc_sanitize_unicode / rescan): a lone
+# continuation byte, a byte that is never a lead (C0 C1 F5..FF), an overlong / surrogate / > U+10FFFF second byte, and
+# a sequence cut short by any non-continuation byte (which is then processed on its own). The state persists across
+# write calls, so a codepoint split between two writes still decodes.
+var fb_u8_need = 0;             # continuation bytes still expected (0 = none in flight)
+var fb_u8_cp = 0;               # codepoint accumulated so far
+var fb_u8_lo = 0x80;            # the next continuation byte's allowed range (E0: A0.., ED: ..9F, F0: 90.., F4: ..8F)
+var fb_u8_hi = 0xBF;
+var fb_rev = 0;                 # SGR 7 (reverse video) — 27 / 0 clear it
+var fb_awm = 1;                 # DECAWM (?7h, the default) — 0 after ?7l: the last column is overwritten, never wrapped
 
 # Pack an (r,g,b) triple (each 0..255) into the 32bpp FB pixel value, honouring
 # the EFI pixel format: pf 1 = BGRX (byte0=B,1=G,2=R) → 0x00RRGGBB; pf 0 = RGBX
@@ -699,56 +754,250 @@ fn fb_winsize() {
     return (cols << 16) | rows;
 }
 
-# Paint a solid-color cell (8*scale × 16*scale) at (cell_x, abs_y_px).
-# Used by scroll bottom-row clear and backspace; not by glyph render
-# (which interleaves FG/BG per font bit).
-fn fb_fill_cell(cell_x, abs_y, color) {
-    var fb = fb_draw_base();
-    if (fb == 0) { return 0; }
-    var pitch = fb_pitch();
-    var width = fb_width();
-    var s = fb_scale();
-    var cell_w = 8 * s;
-    var cell_h = 16 * s;
-    var x_px = cell_x * cell_w;
-    if (x_px + cell_w > width) { return 0; }
-    # Mirror into the WB shadow at the same byte offset (1.53.7). sh_delta is the
-    # loop-invariant shadow-vs-FB address bias; the have_sh branch is perfectly
-    # predicted, so the extra WB store costs ~nothing next to the WC store.
-    var have_sh = 0;
-    var sh_delta = 0;
-    if (fb_shadow != 0) { have_sh = 1; sh_delta = fb_shadow - fb; }
-    for (var dy = 0; dy < cell_h; dy = dy + 1) {
-        for (var dx = 0; dx < cell_w; dx = dx + 1) {
-            var a = fb + (abs_y + dy) * pitch + (x_px + dx) * 4;
-            store32(a, color);
-            if (have_sh == 1) { store32(a + sh_delta, color); }
-        }
+# ═══════════════ 1.57.18 — bulk stores, the grid, span fills ═══════════════
+# ⭐ WHERE A SCROLL'S 194 ms WENT (measured with the TSC, 2048x2048 under KVM, issue 2026-11-06): the shadow memmove
+# was 4.8 ms (a cyrius store64 loop; `rep movsq` 1.1 ms), the bottom-row clear 0.07 ms, and the FLUSH of 16 MB to the
+# framebuffer 190 ms — 183 ms even with `rep movsq`, i.e. the stores themselves, ~90 MB/s. That is a write-through
+# mapping: PAT entry 1 was the firmware's 0x04 = WT, not WC (vmm.cyr pat_init_cpu). With entry 1 WC the same
+# `rep movsq` flush is 0.8 ms. The scroll is therefore: the PAT fix + one `rep movsq` memmove in the RAM shadow + one
+# `rep stosq` clear + one `rep movsq` flush (Linux memmove_64.S takes the same forward `rep movs` for dst < src;
+# vidya graphics/framebuffer_rendering: bulk string stores, never per-pixel loops).
+#
+# fb_movsq(dst, src, n): copy n qwords, ascending. ⚠ Overlap is safe only with dst BELOW src (the scroll's shape):
+# rep movs is architecturally an in-order element loop, which fast-string hardware preserves for overlapping operands.
+# asm register contract — in: rdi = dst ([rbp-0x08]), rsi = src ([rbp-0x10]), rcx = n ([rbp-0x18]); out: none;
+# clobbers: rdi, rsi, rcx, DF (cleared by cld; the kernel never runs with DF set).
+fn fb_movsq(dst, src, n) {
+    if (n <= 0) { return 0; }
+    asm {
+        0x48; 0x8B; 0x7D; 0xF8;       # mov rdi, [rbp-0x08]   ; dst
+        0x48; 0x8B; 0x75; 0xF0;       # mov rsi, [rbp-0x10]   ; src
+        0x48; 0x8B; 0x4D; 0xE8;       # mov rcx, [rbp-0x18]   ; n (qwords)
+        0xFC;                         # cld
+        0xF3; 0x48; 0xA5;             # rep movsq
     }
     return 0;
 }
+# fb_stosq(dst, v, n): store the qword v n times, ascending.
+# asm register contract — in: rdi = dst ([rbp-0x08]), rax = v ([rbp-0x10]), rcx = n ([rbp-0x18]); out: none;
+# clobbers: rdi, rcx, rax, DF (cleared).
+fn fb_stosq(dst, v, n) {
+    if (n <= 0) { return 0; }
+    asm {
+        0x48; 0x8B; 0x7D; 0xF8;       # mov rdi, [rbp-0x08]   ; dst
+        0x48; 0x8B; 0x45; 0xF0;       # mov rax, [rbp-0x10]   ; v
+        0x48; 0x8B; 0x4D; 0xE8;       # mov rcx, [rbp-0x18]   ; n (qwords)
+        0xFC;                         # cld
+        0xF3; 0x48; 0xAB;             # rep stosq
+    }
+    return 0;
+}
+
+# The live text grid, read once per byte (fb_putc / fb_ctrl / fb_ansi_dispatch) into these cells, which every helper
+# below uses: the paint base, pitch, scale, cell size, cols and rows (winsize#60's math). -> 0 when there is no grid
+# (no framebuffer, or a geometry smaller than one cell). Written under the console lock like every fb_* cell.
+var fb_g_fb = 0;
+var fb_g_pitch = 0;
+var fb_g_h = 0;
+var fb_g_s = 1;
+var fb_g_cw = 8;
+var fb_g_ch = 16;
+var fb_g_cols = 0;
+var fb_g_rows = 0;
+fn fb_grid() {
+    var fb = fb_draw_base();
+    if (fb == 0) { return 0; }
+    var h = fb_height();
+    var s = 1;
+    if (h > 1200) { s = 2; }
+    fb_g_fb = fb;
+    fb_g_pitch = fb_pitch();
+    fb_g_h = h;
+    fb_g_s = s;
+    fb_g_cw = 8 * s;
+    fb_g_ch = 16 * s;
+    fb_g_cols = fb_width() / fb_g_cw;
+    fb_g_rows = (h - FB_CONSOLE_Y0) / fb_g_ch;
+    if (fb_g_cols <= 0) { return 0; }
+    if (fb_g_rows <= 0) { return 0; }
+    return 1;
+}
+
+# Fill cells [c0, c1) of text row `row` with `color` (two packed pixels per qword), framebuffer and shadow alike.
+# The erase primitive of EL / ED / BS / the live-line blank. Needs fb_grid().
+fn fb_fill_span(row, c0, c1, color) {
+    if (c1 > fb_g_cols) { c1 = fb_g_cols; }
+    if (c0 < 0) { c0 = 0; }
+    if (c0 >= c1) { return 0; }
+    if (row < 0) { return 0; }
+    if (row >= fb_g_rows) { return 0; }
+    var c64 = (color << 32) | color;
+    var nq = (c1 - c0) * fb_g_cw / 2;                  # cw pixels per cell, 2 per qword
+    var a = fb_g_fb + (FB_CONSOLE_Y0 + row * fb_g_ch) * fb_g_pitch + c0 * fb_g_cw * 4;
+    var sh_delta = 0;
+    if (fb_shadow != 0) { sh_delta = fb_shadow - fb_g_fb; }
+    var y = 0;
+    while (y < fb_g_ch) {
+        fb_stosq(a, c64, nq);
+        if (fb_shadow != 0) { fb_stosq(a + sh_delta, c64, nq); }
+        a = a + fb_g_pitch;
+        y = y + 1;
+    }
+    return 0;
+}
+# Fill whole text rows [r0, r1) — every scanline, pitch padding included, as the ED 2 clear does; through the bottom
+# of the framebuffer when r1 is the last row (the band below the grid takes the colour too). Needs fb_grid().
+fn fb_fill_rows(r0, r1, color) {
+    if (r0 < 0) { r0 = 0; }
+    if (r1 > fb_g_rows) { r1 = fb_g_rows; }
+    if (r0 >= r1) { return 0; }
+    var y0 = FB_CONSOLE_Y0 + r0 * fb_g_ch;
+    var y1 = FB_CONSOLE_Y0 + r1 * fb_g_ch;
+    if (r1 == fb_g_rows) { y1 = fb_g_h; }
+    var c64 = (color << 32) | color;
+    var nq = (y1 - y0) * fb_g_pitch / 8;
+    fb_stosq(fb_g_fb + y0 * fb_g_pitch, c64, nq);
+    if (fb_shadow != 0) { fb_stosq(fb_shadow + y0 * fb_g_pitch, c64, nq); }
+    return 0;
+}
+
+# ═══════════════ 1.57.18 — THE CURSOR (DECTCEM ?25h / ?25l) ═══════════════
+# Prior art: Linux fbcon's default CUR_UNDERLINE — the bottom 2 font rows of the cursor cell drawn inverted
+# (fbcon_cursor / soft_cursor XOR the cursor mask into the glyph) — and vt.c's discipline: do_con_write HIDES the
+# cursor before it touches the screen (hide_cursor) and con_flush_chars / vt_console_print SET it again once the
+# batch is done (set_cursor). Here: the bar is a pixel XOR (0x00FFFFFF) of those 2*s scanlines, sourced from the RAM
+# shadow when there is one (so a blit#39 that painted over the cell cannot be XORed twice into a smear) and written to
+# the framebuffer and the shadow alike; XORing it again takes it off exactly. ⛔ NO GHOST, BY CONSTRUCTION: fb_putc
+# takes the bar off before ANY byte can move the cursor, scroll or erase; fb_console_clear forgets it (the clear wiped
+# it); fb_set_geom / fb_set_scanout_base / the pan arm-disarm take it off before the geometry or the base moves under
+# it (gpu.cyr's two seed copies take it off before they copy the screen into a new buffer). The kprint emitters
+# (kputc / kprint / kprintln / kprint_user) and klug_replay_fb draw it again — ONCE per batch, never per byte.
+# Shown by default (every VT is); at the pending wrap it sits on the last column, where xterm draws it.
+var fb_cur_on = 1;              # DECTCEM: 1 = shown
+var fb_cur_drawn = 0;           # 1 = the bar is on the glass at the cells below
+var fb_cur_dfb = 0;             # the paint base it was drawn into
+var fb_cur_doff = 0;            # byte offset of its first scanline
+var fb_cur_dw = 0;              # its width in pixels
+var fb_cur_dh = 0;              # its height in scanlines
+var fb_cur_dpitch = 0;
+fn fb_cursor_xor() {
+    var sh_delta = 0;
+    if (fb_shadow != 0) { sh_delta = fb_shadow - fb_cur_dfb; }
+    var row = fb_cur_dfb + fb_cur_doff;
+    var y = 0;
+    while (y < fb_cur_dh) {
+        var a = row;
+        var x = 0;
+        while (x < fb_cur_dw) {
+            var v = 0;
+            if (fb_shadow != 0) { v = load32(a + sh_delta); } else { v = load32(a); }
+            v = v ^ 0x00FFFFFF;
+            store32(a, v);
+            if (fb_shadow != 0) { store32(a + sh_delta, v); }
+            a = a + 4;
+            x = x + 1;
+        }
+        row = row + fb_cur_dpitch;
+        y = y + 1;
+    }
+    return 0;
+}
+fn fb_cursor_undraw() {
+    if (fb_cur_drawn == 0) { return 0; }
+    fb_cur_drawn = 0;
+    fb_cursor_xor();
+    return 0;
+}
+# Draw the bar at the cursor cell (the end of a batch). A no-op while the console is not drawing or ?25l is in force.
+fn fb_cursor_sync() {
+    if (fb_console_ready == 0) { return 0; }
+    if (fb_defer != 0) { return 0; }
+    fb_cursor_undraw();
+    if (fb_cur_on == 0) { return 0; }
+    if (fb_grid() == 0) { return 0; }
+    var col = fb_cur_x;
+    if (col >= fb_g_cols) { col = fb_g_cols - 1; }     # the pending wrap: on the last column
+    var row = fb_cur_y;
+    if (row >= fb_g_rows) { row = fb_g_rows - 1; }
+    fb_cur_dfb = fb_g_fb;
+    fb_cur_dpitch = fb_g_pitch;
+    fb_cur_dw = fb_g_cw;
+    fb_cur_dh = 2 * fb_g_s;
+    fb_cur_doff = (FB_CONSOLE_Y0 + row * fb_g_ch + fb_g_ch - fb_cur_dh) * fb_g_pitch + col * fb_g_cw * 4;
+    fb_cursor_xor();
+    fb_cur_drawn = 1;
+    return 0;
+}
+
+# ═══════════════ 1.57.18 — the parser state, saved around output that is not the program's stream ═══════════════
+# A ring-3 program's escape / UTF-8 state persists across its write calls. KERNEL lines (kprint / kprintln), the
+# keystroke echo (kputc) and the live-line replay are not part of that stream: each runs on a parser in the NORMAL
+# state and the program's state comes back after it. Without that, a kernel line arriving between two writes of one
+# split sequence would break the sequence AND be eaten by it (Linux vt_console_print writes printk text without
+# going through do_con_trol at all; the colours, as there, are the console's current ones). Slot 0 = the kprint
+# bracket, slot 1 = fb_oob_end's replay (which runs inside it). 16 qwords of state + the 32 parameters per slot.
+var fb_ps[96];
+fn fb_pstate_push(slot) {
+    var p = &fb_ps + slot * 48 * 8;
+    store64(p, fb_ansi_state);
+    store64(p + 8, fb_ansi_nparam);
+    store64(p + 16, fb_ansi_have_digit);
+    store64(p + 24, fb_ansi_priv);
+    store64(p + 32, fb_ansi_inter);
+    store64(p + 40, fb_str_n);
+    store64(p + 48, fb_u8_need);
+    store64(p + 56, fb_u8_cp);
+    store64(p + 64, fb_u8_lo);
+    store64(p + 72, fb_u8_hi);
+    store64(p + 80, fb_ansi_ovf);
+    if (fb_ansi_state == 2) { fb_movsq(p + 128, &fb_ansi_params, 32); }
+    fb_ansi_state = 0;
+    fb_u8_need = 0;
+    fb_u8_lo = 0x80;
+    fb_u8_hi = 0xBF;
+    return 0;
+}
+fn fb_pstate_pop(slot) {
+    var p = &fb_ps + slot * 48 * 8;
+    fb_ansi_state = load64(p);
+    fb_ansi_nparam = load64(p + 8);
+    fb_ansi_have_digit = load64(p + 16);
+    fb_ansi_priv = load64(p + 24);
+    fb_ansi_inter = load64(p + 32);
+    fb_str_n = load64(p + 40);
+    fb_u8_need = load64(p + 48);
+    fb_u8_cp = load64(p + 56);
+    fb_u8_lo = load64(p + 64);
+    fb_u8_hi = load64(p + 72);
+    fb_ansi_ovf = load64(p + 80);
+    if (fb_ansi_state == 2) { fb_movsq(&fb_ansi_params, p + 128, 32); }
+    return 0;
+}
+# The kprint emitters' bracket (kprint.cyr): kernel text and the echo draw on a NORMAL-state parser.
+fn fb_kern_begin() { fb_pstate_push(0); return 0; }
+fn fb_kern_end() { fb_pstate_pop(0); return 0; }
 
 # Scroll the console area up by one cell row (16*scale pixels). Copy the
 # rectangle from y=FB_CONSOLE_Y0+cell_h..height down to
 # y=FB_CONSOLE_Y0..(height-cell_h), then clear the new bottom row.
 #
-# Pitch-aware: inner loops iterate `pitch / 4` u32s per row, not
-# `width`. Same rationale as fb_console_init's clear — when ppl > hres,
+# Pitch-aware: the copies and clears cover `pitch` bytes per scanline, not
+# `width` pixels. Same rationale as fb_console_init's clear — when ppl > hres,
 # the padding columns carry stale firmware paint that the scroll body
 # was previously leaving untouched. Copy is byte-stable either way; the
 # bottom-row clear specifically needs the pitch extent.
+# 1.57.18: whole-region `rep movsq` / `rep stosq` (the rows are contiguous at the pitch), see the bulk-store banner.
 fn fb_scroll_up() {
     var fb = fb_draw_base();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var height = fb_height();
     var cell_h = 16 * fb_scale();
-    # u64 block-copy: 2 pixels per cycle. At 1080p, pitch=7680 -> 960 u64s per row
-    # (vs 1920 u32s). Halves both inner-loop count and WC-write-combiner burst count.
-    var stride_u64 = pitch / 8;
+    var q = pitch / 8;                     # qwords per scanline
     var rows_to_copy = height - FB_CONSOLE_Y0 - cell_h;
     if (rows_to_copy <= 0) { return 0; }
     var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
+    var top = FB_CONSOLE_Y0 * pitch;
     # Two packed pixels per u64 for the bottom-row clear (1.43.1: current bg, not a
     # hardcoded FB_BG=0; black → 0, identical to before).
     var bg64 = (fb_bg_color << 32) | fb_bg_color;
@@ -772,12 +1021,7 @@ fn fb_scroll_up() {
         # [0, vis-step). A forward copy is therefore safe without a temp — same argument the shadow
         # memmove below relies on, in the opposite direction.
         if (next > fb_pan_limit) {
-            var keep = vis - step;              # rows that survive the scroll, i.e. everything but the top one
-            var k = 0;
-            while (k < keep) {
-                store64(base + k, load64(base + next + k));
-                k = k + 8;
-            }
+            fb_movsq(base, base + next, (vis - step + 7) / 8);   # rows that survive the scroll, i.e. everything but the top one
             fb_pan_bytes = 0;
             next = 0;
             # The bottom row is cleared below, at the post-reset offset.
@@ -785,12 +1029,7 @@ fn fb_scroll_up() {
         # ── Clear the cell_h rows that are about to become the bottom line. At the new pan offset these sit
         # at [next + vis - step, next + vis) — off-screen right up until the address commit below makes them
         # the last visible row, so there is no flash of stale content.
-        var cb = base + next + vis - step;
-        var c = 0;
-        while (c < step) {
-            store64(cb + c, bg64);
-            c = c + 8;
-        }
+        fb_stosq(base + next + vis - step, bg64, (step + 7) / 8);
         fb_pan_bytes = next;
         # ── Commit. gpu_pan_commit writes DCSURF_PRIMARY_SURFACE_ADDRESS live — the same address-group
         # write gpu_blit_present does every frame for DOOM, which is why this needs no OTG envelope.
@@ -802,55 +1041,23 @@ fn fb_scroll_up() {
         # SHADOW PATH (1.53.7). The killer optimization: the OLD path read the WC
         # framebuffer back (~1M uncached WC loads/newline at 1080p) to source the
         # scrolled pixels. With a WB RAM shadow the scroll is a pure RAM memmove +
-        # ONE write-only flush — zero FB reads. WC reads are far costlier than WC
-        # writes (uncombinable, pipeline-stalling), so the real-Zen win exceeds the
-        # naive "half the traffic" estimate.
+        # ONE write-only flush — zero FB reads.
         var sh = fb_shadow;
-        # 1. Shift the shadow up by one cell row. dst is BELOW src and the ranges
-        #    overlap, so a forward (low→high) copy reads each source word before any
-        #    later store can clobber it — safe without a temp.
-        for (var y = 0; y < rows_to_copy; y = y + 1) {
-            var s_src = sh + (FB_CONSOLE_Y0 + cell_h + y) * pitch;
-            var s_dst = sh + (FB_CONSOLE_Y0 + y) * pitch;
-            for (var x = 0; x < stride_u64; x = x + 1) {
-                store64(s_dst + x * 8, load64(s_src + x * 8));
-            }
-        }
+        # 1. Shift the shadow up by one cell row. dst is BELOW src and the ranges overlap: the ascending copy reads
+        #    each source word before any later store can clobber it — safe without a temp.
+        fb_movsq(sh + top, sh + top + cell_h * pitch, rows_to_copy * q);
         # 2. Clear the new bottom cell_h rows in the shadow.
-        for (var yc = 0; yc < cell_h; yc = yc + 1) {
-            var s_row = sh + (clear_y + yc) * pitch;
-            for (var xc = 0; xc < stride_u64; xc = xc + 1) {
-                store64(s_row + xc * 8, bg64);
-            }
-        }
-        # 3. Flush the whole console region [FB_CONSOLE_Y0 .. height) shadow→FB,
-        #    WRITE-ONLY (the reads hit the WB shadow, cheap; the WC stores are the
-        #    same volume the old path wrote, minus every FB read).
-        var flush_rows = height - FB_CONSOLE_Y0;
-        for (var yf = 0; yf < flush_rows; yf = yf + 1) {
-            var f_src = sh + (FB_CONSOLE_Y0 + yf) * pitch;
-            var f_dst = fb + (FB_CONSOLE_Y0 + yf) * pitch;
-            for (var xf = 0; xf < stride_u64; xf = xf + 1) {
-                store64(f_dst + xf * 8, load64(f_src + xf * 8));
-            }
-        }
+        fb_stosq(sh + clear_y * pitch, bg64, cell_h * q);
+        # 3. Flush the whole console region [FB_CONSOLE_Y0 .. height) shadow→FB, WRITE-ONLY (the reads hit the WB
+        #    shadow; the WC stores are the same volume the old path wrote, minus every FB read).
+        fb_movsq(fb + top, sh + top, (height - FB_CONSOLE_Y0) * q);
         return 0;
     }
 
     # FALLBACK PATH (no shadow): the original in-place WC FB copy — reads the FB
-    # back. Copy line-by-line, top-down (no overlap risk since src is below dst).
-    for (var y = 0; y < rows_to_copy; y = y + 1) {
-        var src = fb + (FB_CONSOLE_Y0 + cell_h + y) * pitch;
-        var dst = fb + (FB_CONSOLE_Y0 + y) * pitch;
-        for (var x = 0; x < stride_u64; x = x + 1) {
-            store64(dst + x * 8, load64(src + x * 8));
-        }
-    }
-    for (var y = 0; y < cell_h; y = y + 1) {
-        for (var x = 0; x < stride_u64; x = x + 1) {
-            store64(fb + (clear_y + y) * pitch + x * 8, bg64);
-        }
-    }
+    # back. Top-down (src is below dst), so the ascending copy is safe.
+    fb_movsq(fb + top, fb + top + cell_h * pitch, rows_to_copy * q);
+    fb_stosq(fb + clear_y * pitch, bg64, cell_h * q);
     return 0;
 }
 
@@ -858,32 +1065,26 @@ fn fb_scroll_up() {
 # load64(&X + i*8) (the kernel's exec_ctx convention; `X[i]` indexing isn't a
 # thing for module globals here).
 fn fb_ansi_p(i) {
+    if (i >= FB_NPAR) { return 0; }
     return load64(&fb_ansi_params + i * 8);
 }
 
 # Clear the whole framebuffer to the current background colour + home the
-# cursor. Backs `ESC[2J`. Mirrors fb_console_init's clear loop but packs the
+# cursor. Backs `ESC[2J`. Mirrors fb_console_init's clear but packs the
 # current bg into the u64 block-store (black today → 0, identical to before).
+# ⚠ ED 2 HOMES THE CURSOR here (since 1.43.1; agnsh's `clear` and the FB_ANSI_SELFTEST rely on it) — xterm and vt.c
+# leave it where it was. 1.57.18: one `rep stosq` per buffer, and the cursor bar is FORGOTTEN, not XORed (the clear
+# overwrote it — callers outside fb_putc, the geometry matchers and fb_defer_rescue, reach here with it drawn).
 fn fb_console_clear() {
+    fb_cur_drawn = 0;
     var fb = fb_draw_base();
     if (fb == 0) { fb_cur_x = 0; fb_cur_y = 0; return 0; }
-    var pitch = fb_pitch();
-    var height = fb_height();
-    var stride_u64 = pitch / 8;
+    var nq = fb_pitch() * fb_height() / 8;
     var bg64 = (fb_bg_color << 32) | fb_bg_color;   # two packed pixels per u64
+    fb_stosq(fb, bg64, nq);
     # Mirror the clear into the WB shadow so a later scroll flush doesn't repaint
     # stale content over a cleared screen (1.53.7).
-    var have_sh = 0;
-    var sh_delta = 0;
-    if (fb_shadow != 0) { have_sh = 1; sh_delta = fb_shadow - fb; }
-    for (var py = 0; py < height; py = py + 1) {
-        var scan = fb + py * pitch;
-        for (var px = 0; px < stride_u64; px = px + 1) {
-            var a = scan + px * 8;
-            store64(a, bg64);
-            if (have_sh == 1) { store64(a + sh_delta, bg64); }
-        }
-    }
+    if (fb_shadow != 0) { fb_stosq(fb_shadow, bg64, nq); }
     fb_cur_x = 0;
     fb_cur_y = 0;
     return 0;
@@ -892,22 +1093,25 @@ fn fb_console_clear() {
 # Apply an SGR (`ESC[…m`) parameter list to the current fg/bg colour state.
 # Supports: 0/bare = reset, 30-37/90-97 fg + 40-47/100-107 bg (16 colours),
 # 39/49 default fg/bg, 38;5;N / 48;5;N (256-colour), 38;2;R;G;B / 48;2;R;G;B
-# (truecolour). Unsupported attrs (bold/underline/reverse) are skipped — colour
-# is what the tools need. `np` is the param count (0 == bare `ESC[m`).
+# (truecolour), and since 1.57.18 7 / 27 (reverse video on / off: the glyph swaps fg and bg; an erase still uses the
+# background, as vt.c's erase character does). Other attributes (bold, underline, blink) are skipped.
+# `np` is the param count (0 == bare `ESC[m`).
 fn fb_ansi_sgr(np) {
-    if (np == 0) { fb_fg_color = FB_FG; fb_bg_color = FB_BG; return 0; }
+    if (np == 0) { fb_fg_color = FB_FG; fb_bg_color = FB_BG; fb_rev = 0; return 0; }
     var i = 0;
     while (i < np) {
         var p = fb_ansi_p(i);
-        if (p == 0) { fb_fg_color = FB_FG; fb_bg_color = FB_BG; }
+        if (p == 0) { fb_fg_color = FB_FG; fb_bg_color = FB_BG; fb_rev = 0; }
+        elif (p == 7) { fb_rev = 1; }
+        elif (p == 27) { fb_rev = 0; }
         elif (p == 38) {
             if (i + 1 < np) {
                 var m = fb_ansi_p(i + 1);
                 if (m == 5) {
-                    if (i + 2 < np) { fb_fg_color = fb_256_rgb(fb_ansi_p(i + 2)); }
+                    if (i + 2 < np) { fb_fg_color = fb_256_rgb(fb_ansi_p(i + 2) & 0xFF); }
                     i = i + 2;
                 } elif (m == 2) {
-                    if (i + 4 < np) { fb_fg_color = fb_pack(fb_ansi_p(i + 2), fb_ansi_p(i + 3), fb_ansi_p(i + 4)); }
+                    if (i + 4 < np) { fb_fg_color = fb_pack(fb_ansi_p(i + 2) & 0xFF, fb_ansi_p(i + 3) & 0xFF, fb_ansi_p(i + 4) & 0xFF); }
                     i = i + 4;
                 }
             }
@@ -916,10 +1120,10 @@ fn fb_ansi_sgr(np) {
             if (i + 1 < np) {
                 var m2 = fb_ansi_p(i + 1);
                 if (m2 == 5) {
-                    if (i + 2 < np) { fb_bg_color = fb_256_rgb(fb_ansi_p(i + 2)); }
+                    if (i + 2 < np) { fb_bg_color = fb_256_rgb(fb_ansi_p(i + 2) & 0xFF); }
                     i = i + 2;
                 } elif (m2 == 2) {
-                    if (i + 4 < np) { fb_bg_color = fb_pack(fb_ansi_p(i + 2), fb_ansi_p(i + 3), fb_ansi_p(i + 4)); }
+                    if (i + 4 < np) { fb_bg_color = fb_pack(fb_ansi_p(i + 2) & 0xFF, fb_ansi_p(i + 3) & 0xFF, fb_ansi_p(i + 4) & 0xFF); }
                     i = i + 4;
                 }
             }
@@ -935,15 +1139,58 @@ fn fb_ansi_sgr(np) {
     return 0;
 }
 
-# Dispatch a completed CSI sequence by its final byte. SGR (`m`), ED (`J`,
-# only the `2` = whole-screen form), CUP (`H`/`f`). Everything else no-ops
-# (safer than mis-rendering); extend as tools need cursor moves / EL.
+# DEC private modes (`ESC[?Nh` / `ESC[?Nl`): 25 DECTCEM (the cursor shown / hidden) and 7 DECAWM (autowrap at the
+# last column on / off). Every other mode is ignored.
+fn fb_ansi_decset(np, on) {
+    var i = 0;
+    while (i < np) {
+        var m = fb_ansi_p(i);
+        if (m == 25) { fb_cur_on = on; }
+        if (m == 7) { fb_awm = on; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Dispatch a completed CSI sequence by its final byte: SGR (`m`), ED (`J`: 0 cursor to the end, 1 the start to the
+# cursor inclusive, 2 the whole screen + home; 3 has no scrollback to erase), EL (`K`: 0 cursor to the end of the
+# line, 1 its start to the cursor inclusive, 2 the whole line), CUP (`H` / `f`), and the DEC private modes `?h` / `?l`.
+# EL and ED fill with the ACTIVE background (xterm's bce, vt.c's erase character) and leave the pending wrap (the
+# cursor column is clamped to the last one — xterm ResetWrap, vt.c csi_K). A private final other than h / l, and
+# every other final, no-ops (safer than mis-rendering).
 fn fb_ansi_dispatch(cmd, np) {
-    if (cmd == 0x6D) { fb_ansi_sgr(np); return 0; }     # 'm'
+    if (cmd == 0x6D) {                                   # 'm' (SGR; a private ?m / >m is something else)
+        if (fb_ansi_priv == 0) { fb_ansi_sgr(np); }
+        return 0;
+    }
+    if (cmd == 0x68) { if (fb_ansi_priv == 0x3F) { fb_ansi_decset(np, 1); } return 0; }   # 'h'
+    if (cmd == 0x6C) { if (fb_ansi_priv == 0x3F) { fb_ansi_decset(np, 0); } return 0; }   # 'l'
+    if (fb_ansi_priv != 0) { return 0; }
+    if (fb_grid() == 0) { return 0; }
+    var p0 = 0;
+    if (np > 0) { p0 = fb_ansi_p(0); }
+    var cx = fb_cur_x;
+    if (cx >= fb_g_cols) { cx = fb_g_cols - 1; }
+    var cy = fb_cur_y;
+    if (cy >= fb_g_rows) { cy = fb_g_rows - 1; }
     if (cmd == 0x4A) {                                   # 'J' (ED)
-        var pj = 0;
-        if (np > 0) { pj = fb_ansi_p(0); }
-        if (pj == 2) { fb_console_clear(); }
+        if (p0 == 0) {
+            fb_cur_x = cx;
+            fb_fill_span(cy, cx, fb_g_cols, fb_bg_color);
+            fb_fill_rows(cy + 1, fb_g_rows, fb_bg_color);
+        } elif (p0 == 1) {
+            fb_cur_x = cx;
+            fb_fill_rows(0, cy, fb_bg_color);
+            fb_fill_span(cy, 0, cx + 1, fb_bg_color);
+        } elif (p0 == 2) {
+            fb_console_clear();
+        }
+        return 0;
+    }
+    if (cmd == 0x4B) {                                   # 'K' (EL)
+        if (p0 == 0) { fb_cur_x = cx; fb_fill_span(cy, cx, fb_g_cols, fb_bg_color); }
+        elif (p0 == 1) { fb_cur_x = cx; fb_fill_span(cy, 0, cx + 1, fb_bg_color); }
+        elif (p0 == 2) { fb_cur_x = cx; fb_fill_span(cy, 0, fb_g_cols, fb_bg_color); }
         return 0;
     }
     if (cmd == 0x48 || cmd == 0x66) {                    # 'H' / 'f' (CUP)
@@ -951,76 +1198,111 @@ fn fb_ansi_dispatch(cmd, np) {
         var col = 1;
         if (np > 0 && fb_ansi_p(0) > 0) { row = fb_ansi_p(0); }
         if (np > 1 && fb_ansi_p(1) > 0) { col = fb_ansi_p(1); }
-        var s = 1;
-        if (fb_height() > 1200) { s = 2; }
-        var max_cols = fb_width() / (8 * s);
-        var max_rows = (fb_height() - FB_CONSOLE_Y0) / (16 * s);
         var ry = row - 1;
-        var cx = col - 1;
-        if (ry < 0) { ry = 0; }
-        if (cx < 0) { cx = 0; }
-        if (ry >= max_rows) { ry = max_rows - 1; }
-        if (cx >= max_cols) { cx = max_cols - 1; }
+        var rx = col - 1;
+        if (ry >= fb_g_rows) { ry = fb_g_rows - 1; }
+        if (rx >= fb_g_cols) { rx = fb_g_cols - 1; }
         fb_cur_y = ry;
-        fb_cur_x = cx;
+        fb_cur_x = rx;
         return 0;
     }
     return 0;
 }
 
-# Feed one byte to the ANSI state machine. Returns 1 if the byte was CONSUMED
-# as part of an escape sequence (caller must not render it), 0 if it's a normal
-# byte the caller should render. 3 states: normal → ESC (0x1B) → CSI (`[`).
+# Feed one byte to the escape parser (the states are in the banner above fb_ansi_params). Returns 1 if the byte was
+# CONSUMED by a sequence (the caller must not render it — a C0 control inside a CSI was executed here), 0 if it is
+# a normal byte the caller should render: state 0 and not ESC, or a sequence just abandoned by a byte >= 0x80, or the
+# first byte past a control string's FB_STR_MAX bound.
 fn fb_ansi_feed(ch) {
-    if (fb_ansi_state == 0) {
-        if (ch == 0x1B) { fb_ansi_state = 1; return 1; }
+    var b = ch & 0xFF;
+    var st = fb_ansi_state;
+    if (st == 0) {
+        if (b == 0x1B) { fb_ansi_state = 1; return 1; }
         return 0;
     }
-    if (fb_ansi_state == 1) {           # saw ESC
-        if (ch == 0x5B) {               # '[' → begin CSI param collection
+    if (st >= 3) { return fb_str_feed(b); }
+    # ESC or CSI: a C0 control is executed in place (ESC restarts the sequence, CAN / SUB cancel it)
+    if (b < 0x20) {
+        if (b == 0x1B) { fb_ansi_state = 1; return 1; }
+        if (b == 0x18 || b == 0x1A) { fb_ansi_state = 0; return 1; }
+        fb_ctrl(b);
+        return 1;
+    }
+    if (b >= 0x80) { fb_ansi_state = 0; return 0; }
+    if (b == 0x7F) { return 1; }                         # DEL inside a sequence: ignored
+    if (st == 1) {
+        if (b == 0x5B) {                                 # '[' -> CSI
             fb_ansi_state = 2;
             fb_ansi_nparam = 0;
             store64(&fb_ansi_params, 0);
             fb_ansi_have_digit = 0;
+            fb_ansi_priv = 0;
+            fb_ansi_inter = 0;
+            fb_ansi_ovf = 0;
             return 1;
         }
-        # ESC + non-'[' (charset designators, ESC c, etc.) — unsupported, drop
-        # both the ESC and this byte so a stray designator can't render.
-        fb_ansi_state = 0;
+        # ']' OSC, 'P' DCS, '_' APC, '^' PM, 'X' SOS -> a control string
+        if (b == 0x5D || b == 0x50 || b == 0x5F || b == 0x5E || b == 0x58) {
+            fb_ansi_state = 3;
+            fb_str_n = 0;
+            return 1;
+        }
+        if (b < 0x30) { return 1; }                      # an intermediate (ESC ( B, ESC # 8): wait for the final byte
+        fb_ansi_state = 0;                               # an ESC final (ESC c, ESC 7, ...): consumed, none acted on
         return 1;
     }
-    # state 2: collecting a CSI sequence
-    if (ch >= 0x30 && ch <= 0x39) {     # digit → accumulate into the current param
-        if (fb_ansi_nparam < 8) {
-            store64(&fb_ansi_params + fb_ansi_nparam * 8, load64(&fb_ansi_params + fb_ansi_nparam * 8) * 10 + (ch - 0x30));
+    # st == 2: collecting a CSI sequence
+    if (b >= 0x30 && b <= 0x39) {                        # digit -> the current param (clamped)
+        if (fb_ansi_ovf == 0) {
+            var pa = &fb_ansi_params + fb_ansi_nparam * 8;
+            var v = load64(pa) * 10 + (b - 0x30);
+            if (v > 65535) { v = 65535; }
+            store64(pa, v);
         }
         fb_ansi_have_digit = 1;
         return 1;
     }
-    if (ch == 0x3B) {                   # ';' → next param slot (cap at 8)
-        if (fb_ansi_nparam < 7) {
+    if (b == 0x3B) {                                     # ';' -> the next param slot
+        if (fb_ansi_nparam < FB_NPAR - 1) {
             fb_ansi_nparam = fb_ansi_nparam + 1;
             store64(&fb_ansi_params + fb_ansi_nparam * 8, 0);
+        } else {
+            fb_ansi_ovf = 1;
         }
         fb_ansi_have_digit = 0;
         return 1;
     }
-    if (ch >= 0x40 && ch <= 0x7E) {     # final byte → dispatch
-        var np = 0;
-        if (fb_ansi_have_digit == 1 || fb_ansi_nparam > 0) { np = fb_ansi_nparam + 1; }
-        fb_ansi_dispatch(ch, np);
-        fb_ansi_state = 0;
+    if (b >= 0x3C && b <= 0x3F) {                        # '<' '=' '>' '?': a private marker, only before any param
+        if (fb_ansi_nparam == 0 && fb_ansi_have_digit == 0) { fb_ansi_priv = b; }
         return 1;
     }
-    # intermediate / junk byte (0x20-0x2F or stray < 0x30): consume, stay in CSI.
+    if (b == 0x3A) { return 1; }                         # ':' sub-parameters (ITU T.416) are not taken
+    if (b < 0x30) { fb_ansi_inter = 1; return 1; }       # 0x20-0x2F intermediate
+    # 0x40-0x7E: the final byte
+    var np = 0;
+    if (fb_ansi_have_digit == 1 || fb_ansi_nparam > 0) { np = fb_ansi_nparam + 1; }
+    fb_ansi_state = 0;
+    if (fb_ansi_inter == 0) { fb_ansi_dispatch(b, np); }
     return 1;
 }
 
-# Render one glyph for `ch` at the current cursor position. Handles
-# newline (10), carriage return (13), backspace (8). ANSI escapes (ESC=0x1B
-# and the CSI bytes that follow) are intercepted by fb_ansi_feed first. Other
-# non-printable bytes outside 0x20..0x7F are silently dropped. Advances cursor;
-# wraps to next row at end of line; scrolls when bottom reached.
+# Inside a control string (state 3) or at its ESC (state 4). BEL ends it (xterm's OSC terminator; vt.c accepts it for
+# every string), ST (ESC \) ends it, CAN / SUB cancel it, an ESC followed by anything else starts that sequence;
+# every other byte — C0, UTF-8, text — is swallowed, up to FB_STR_MAX of them.
+fn fb_str_feed(b) {
+    if (fb_ansi_state == 4) {
+        if (b == 0x5C) { fb_ansi_state = 0; return 1; }  # ESC \ = ST
+        fb_ansi_state = 1;
+        return fb_ansi_feed(b);
+    }
+    if (b == 0x07) { fb_ansi_state = 0; return 1; }
+    if (b == 0x1B) { fb_ansi_state = 4; return 1; }
+    if (b == 0x18 || b == 0x1A) { fb_ansi_state = 0; return 1; }
+    fb_str_n = fb_str_n + 1;
+    if (fb_str_n > FB_STR_MAX) { fb_ansi_state = 0; return 0; }
+    return 1;
+}
+
 # === 1.56.37 — DEFERRED PAINT: never draw a line at a geometry we have not verified ====================
 # ⛔ THE REPLAY ALONE DID NOT FIX THE REPORTED SYMPTOM, and the reason is worth keeping. A text console has
 # NO SCROLLBACK: repainting the ring after the clear only redraws the last ~18 rows that fit at 800x600,
@@ -1122,8 +1404,9 @@ fn fb_line_note(ch): i64 {
         if (fb_line_n > 0) { fb_line_n = fb_line_n - 1; }
         return 0;
     }
-    if (ch < 0x20) { return 0; }
-    if (ch > 0x7F) { return 0; }
+    # 1.57.18: a Tab moves the cursor and a byte >= 0x80 is part of a UTF-8 glyph, so both are KEPT — the replay re-feeds
+    # them through the same decoder and lands the cursor where it was. Every other C0 byte draws nothing.
+    if (ch < 0x20) { if (ch != 9) { return 0; } }
     # ⚠ OVERFLOW DROPS THE TAIL RATHER THAN WRAPPING. A wrapped ring would replay the line out of order,
     # which is worse than a long line replaying short. 512 B is past the widest console row.
     if (fb_line_n >= FB_LINE_MAX) { return 0; }
@@ -1136,14 +1419,19 @@ fn fb_line_note(ch): i64 {
 # and `fb_oob_end` must replay it, 0 if there was nothing on the row.
 fn fb_oob_begin(): i64 {
     if (fb_console_ready == 0) { return 0; }
+    if (fb_defer != 0) { return 0; }
     # ⛔ THE COST GATE. Nothing happens unless the operator is mid-line — see `fb_line_live`. A kernel
     # line built from several `kprint` calls must NOT erase and replay between them.
     if (fb_line_live == 0) { return 0; }
     if (fb_line_n == 0) { return 0; }
+    if (fb_grid() == 0) { return 0; }
     fb_line_hold = 1;                       # the erase and the log must not be captured
+    if (fb_cur_drawn != 0) { fb_cursor_undraw(); }
+    # 1.57.18: the row's cells are blanked by ONE span fill (it was a fb_putc(32) per cell — through the parser, which a
+    # ring-3 program may have left mid-sequence). fb_cur_x is fb_g_cols while a wrap is pending: then the whole row.
     var back = fb_cur_x;
-    fb_cur_x = 0;
-    for (var i = 0; i < back; i = i + 1) { fb_putc(32); }   # blank the row's cells
+    if (back > fb_g_cols) { back = fb_g_cols; }
+    if (fb_cur_y < fb_g_rows) { fb_fill_span(fb_cur_y, 0, back, fb_bg_color); }
     fb_cur_x = 0;
     return 1;
 }
@@ -1151,86 +1439,207 @@ fn fb_oob_begin(): i64 {
 # Replay the saved line so the operator's cursor lands exactly where it was.
 fn fb_oob_end(did): i64 {
     if (did == 0) { fb_line_hold = 0; return 0; }
+    # 1.57.18: the operator's line replays through a parser in the NORMAL state, whatever the log left it in, and the
+    # log's state comes back after (slot 1 — kprint's kernel bracket owns slot 0).
+    fb_pstate_push(1);
     # ⚠ `kprint` (no trailing newline) can leave the cursor mid-row; the replay needs its own row or it
     # would append the prompt to the log line — the defect, inverted.
     if (fb_cur_x != 0) { fb_putc(10); }
     for (var i = 0; i < fb_line_n; i = i + 1) { fb_putc(load8(&fb_line_buf + i)); }
+    fb_pstate_pop(1);
     fb_line_hold = 0;
     return 0;
 }
 
+# ═══════════════ 1.57.18 — the byte path: UTF-8, the escape parser, controls, cells ═══════════════
+# fb_putc takes ONE byte. A UTF-8 sequence in flight takes its continuation bytes first (a byte that cannot continue
+# it ends it as one replacement cell, then is processed on its own); then the escape parser (fb_ansi_feed) takes what
+# belongs to a sequence; what is left is a C0 control, an ASCII glyph or a UTF-8 lead byte. ⛔ The cursor bar is taken
+# off the glass FIRST, before any byte can move the cursor, scroll or erase under it: a bar left drawn while its
+# pixels move or are cleared is the ghost (fb_cursor_undraw). The kprint emitters draw it again once, at the end.
 fn fb_putc(ch) {
     if (fb_console_ready == 0) { return 0; }
     # Deferred: the byte is already in serial + klug (kprint tapped it before reaching here). Dropping the
     # DRAW is the whole mechanism — the release replays the ring, so nothing is lost, it is only delayed.
     if (fb_defer != 0) { return 0; }
-    # ANSI/CSI interception (1.43.1): consume ESC + CSI bytes (colour, clear,
-    # cursor). Returns 1 when the byte was part of a sequence → nothing to draw.
-    if (fb_ansi_feed(ch) == 1) { return 0; }
+    if (fb_cur_drawn != 0) { fb_cursor_undraw(); }
+    if (fb_grid() == 0) { return 0; }
+    var b = ch & 0xFF;
+    if (fb_u8_need > 0) {
+        if (b >= fb_u8_lo && b <= fb_u8_hi) {
+            fb_line_note(b);
+            fb_u8_cp = (fb_u8_cp << 6) | (b & 0x3F);
+            fb_u8_lo = 0x80;
+            fb_u8_hi = 0xBF;
+            fb_u8_need = fb_u8_need - 1;
+            if (fb_u8_need == 0) { fb_emit_cp(fb_u8_cp); }
+            return 0;
+        }
+        # The bytes so far are ONE maximal subpart: one replacement cell; then `b` is processed on its own.
+        fb_u8_need = 0;
+        fb_u8_lo = 0x80;
+        fb_u8_hi = 0xBF;
+        fb_emit_cp(0xFFFD);
+    }
+    # ANSI/CSI/string interception (1.43.1, widened 1.57.18). 1 = the byte belonged to a sequence.
+    if (fb_ansi_feed(b) == 1) { return 0; }
     # ⭐ CAPTURE HERE, past the defer and ANSI gates, so the buffer tracks what actually reaches the
     # glass — see the live-line banner above. Cheap: a compare and a store8 per drawn byte.
-    fb_line_note(ch);
-    var fb = fb_draw_base();
-    if (fb == 0) { return 0; }
-    var pitch = fb_pitch();
-    var width = fb_width();
-    var height = fb_height();
-    # Inline fb_scale() against the height we just read — saves a redundant
-    # fb_height() (a second boot_info_ptr deref) per character. Mirrors
-    # fb_scale: h <= 1200 → 1, else 2.
-    var s = 1;
-    if (height > 1200) { s = 2; }
-    var cell_w = 8  * s;
-    var cell_h = 16 * s;
-    var max_cols = width / cell_w;
-    var max_rows = (height - FB_CONSOLE_Y0) / cell_h;
+    fb_line_note(b);
+    if (b < 0x20) { fb_ctrl(b); return 0; }
+    if (b < 0x80) { fb_emit_cell(b); return 0; }          # ASCII (0x7F draws kashi's cell 0x7F, as it always did)
+    if (b >= 0xC2 && b <= 0xDF) { fb_u8_need = 1; fb_u8_cp = b & 0x1F; return 0; }
+    if (b >= 0xE0 && b <= 0xEF) {
+        fb_u8_need = 2;
+        fb_u8_cp = b & 0x0F;
+        if (b == 0xE0) { fb_u8_lo = 0xA0; }               # no overlong 3-byte form
+        if (b == 0xED) { fb_u8_hi = 0x9F; }               # no surrogate
+        return 0;
+    }
+    if (b >= 0xF0 && b <= 0xF4) {
+        fb_u8_need = 3;
+        fb_u8_cp = b & 0x07;
+        if (b == 0xF0) { fb_u8_lo = 0x90; }               # no overlong 4-byte form
+        if (b == 0xF4) { fb_u8_hi = 0x8F; }               # nothing past U+10FFFF
+        return 0;
+    }
+    fb_emit_cp(0xFFFD);                                   # 80..BF alone, C0, C1, F5..FF: never valid where they stand
+    return 0;
+}
 
-    # Newline.
-    if (ch == 10) {
-        fb_cur_x = 0;
-        fb_cur_y = fb_cur_y + 1;
-        if (fb_cur_y >= max_rows) {
-            fb_scroll_up();
-            fb_cur_y = max_rows - 1;
-        }
-        return 0;
-    }
-    # Carriage return — move to col 0, no row change.
-    if (ch == 13) {
-        fb_cur_x = 0;
-        return 0;
-    }
-    # Backspace — back up one cell and clear it; floor at col 0 of current row.
-    if (ch == 8) {
+# A C0 control outside a string (inside a CSI it is executed and the sequence goes on). LF is the console's newline
+# (CR + LF: there is no tty layer to add the CR — unchanged since 1.30); BS is DESTRUCTIVE as it always was here (it
+# rubs the cell out: the line editors send BS SP BS either way). From the pending wrap (fb_cur_x == cols) BS lands on
+# the last column, the cell the last glyph went into. HT goes to the next multiple-of-8 column, never past the last
+# (xterm's fixed tab stops; the cells it passes are not touched, as on every terminal). BEL and the rest: nothing.
+fn fb_ctrl(b) {
+    if (fb_grid() == 0) { return 0; }
+    if (b == 10) { fb_cur_x = 0; fb_newline(); return 0; }
+    if (b == 13) { fb_cur_x = 0; return 0; }
+    if (b == 8) {
         if (fb_cur_x > 0) {
             fb_cur_x = fb_cur_x - 1;
-            fb_fill_cell(fb_cur_x, FB_CONSOLE_Y0 + fb_cur_y * cell_h, fb_bg_color);
+            if (fb_cur_x >= fb_g_cols) { fb_cur_x = fb_g_cols - 1; }      # a grid that shrank under the cursor
+            if (fb_cur_y < fb_g_rows) { fb_fill_span(fb_cur_y, fb_cur_x, fb_cur_x + 1, fb_bg_color); }
         }
         return 0;
     }
-    # Drop everything else outside printable range.
-    if (ch < 0x20) { return 0; }
-    if (ch > 0x7F) { return 0; }
+    if (b == 9) {
+        var last = fb_g_cols - 1;
+        if (fb_cur_x < last) {
+            var nx = (fb_cur_x / 8 + 1) * 8;
+            if (nx > last) { nx = last; }
+            fb_cur_x = nx;
+        }
+        return 0;
+    }
+    return 0;
+}
 
-    # Wrap at end of line BEFORE painting.
-    if (fb_cur_x >= max_cols) {
-        fb_cur_x = 0;
-        fb_cur_y = fb_cur_y + 1;
-        if (fb_cur_y >= max_rows) {
-            fb_scroll_up();
-            fb_cur_y = max_rows - 1;
+# LF's row advance: the bottom row scrolls the console up one text row.
+fn fb_newline() {
+    fb_cur_y = fb_cur_y + 1;
+    if (fb_cur_y >= fb_g_rows) {
+        fb_scroll_up();
+        fb_cur_y = fb_g_rows - 1;
+    }
+    return 0;
+}
+
+# One glyph cell at the cursor. ⭐ THE LAST COLUMN (VT100 / xterm DECAWM, vt.c vc_need_wrap): a glyph drawn in the
+# last column leaves fb_cur_x == cols — the PENDING WRAP, not a wrap — and only the NEXT glyph wraps (CR + LF) before
+# it draws. CR, LF, BS, CUP, EL and ED all leave it (each sets fb_cur_x < cols), so a full row followed by CR LF never
+# leaves a blank line, and a full bottom row does not scroll until something is written after it. ?7l (fb_awm 0): the
+# last column is overwritten instead, the cursor never leaves it.
+fn fb_emit_cell(cell) {
+    if (fb_cur_x >= fb_g_cols) {
+        if (fb_awm == 1) {
+            fb_cur_x = 0;
+            fb_newline();
+        } else {
+            fb_cur_x = fb_g_cols - 1;
         }
     }
+    if (fb_cur_y >= fb_g_rows) { fb_cur_y = fb_g_rows - 1; }   # a grid that shrank under the cursor
+    fb_draw_glyph(cell, fb_cur_x, fb_cur_y);
+    if (fb_awm == 0) { if (fb_cur_x == fb_g_cols - 1) { return 0; } }
+    fb_cur_x = fb_cur_x + 1;
+    return 0;
+}
 
-    # Render the 8x16 VGA glyph, scaling each font bit into an SxS block
-    # so the on-screen character cell is cell_w x cell_h (= 8*S x 16*S).
-    # Inner pixel paint loop runs cell_w*cell_h store32s per glyph (128
-    # at scale=1, 512 at scale=2) — same write-combiner-friendly pattern
-    # as the init clear and scroll-bottom-clear.
-    var glyph = kashi_glyph_ptr(KASHI_FONT_VGA_8X16, ch);
-    if (glyph == 0) { return 0; }       # ch outside kashi's encoded range: drop
-    var x_px = fb_cur_x * cell_w;
-    var y_px = FB_CONSOLE_Y0 + fb_cur_y * cell_h;
+# One decoded codepoint. Its cell: kashi_cp437_from_unicode — the CP437 cell that draws it (U+2500 '─' is 0xC4, U+00E9
+# 'é' is 0x82, U+2026 and U+FFFD kashi's extension cells) — else kashi's U+FFFD glyph, ONE cell, so a row keeps its
+# width (vt.c vc_get_glyph: the font's glyph, else U+FFFD). Its width (fb_ucs_width): 2 draws the cell and a blank pad
+# (vt.c vc_con_write_normal's second-column ' '), wrapping first when only the last column is left (xterm); 0 (a
+# combining mark, a zero-width format character) draws nothing — vt.c ignores a zero-width code point it cannot
+# recompose, and this console keeps no cell buffer to recompose with.
+fn fb_emit_cp(cp) {
+    var w = fb_ucs_width(cp);
+    if (w == 0) { return 0; }
+    var cell = kashi_cp437_from_unicode(cp);
+    if (cell == 0) { cell = kashi_cp437_from_unicode(0xFFFD); }
+    if (w == 2) {
+        if (fb_awm == 1) { if (fb_cur_x == fb_g_cols - 1) { fb_cur_x = fb_g_cols; } }
+        fb_emit_cell(cell);
+        fb_emit_cell(32);
+        return 0;
+    }
+    fb_emit_cell(cell);
+    return 0;
+}
+
+# The cells a codepoint takes. The East-Asian Wide / Fullwidth ranges are Markus Kuhn's wcwidth (mk_wcwidth, 2007 —
+# the table Linux vt.c carried as `double_width[]` before ucs.c), its two emoji blocks included; the zero-width set is
+# the combining-mark BLOCKS and the zero-width format characters, not the whole Mn/Me/Cf table (a mark outside these
+# blocks takes one cell — the same width a terminal without the mark's font would give it).
+fn fb_ucs_width(cp) {
+    if (cp < 0x300) { return 1; }
+    if (cp <= 0x36F) { return 0; }                          # Combining Diacritical Marks
+    if (cp >= 0x483 && cp <= 0x489) { return 0; }           # Cyrillic combining
+    if (cp >= 0x591 && cp <= 0x5BD) { return 0; }           # Hebrew points
+    if (cp >= 0x64B && cp <= 0x65F) { return 0; }           # Arabic harakat
+    if (cp < 0x1100) { return 1; }
+    if (cp <= 0x115F) { return 2; }                         # Hangul Jamo initial consonants
+    if (cp >= 0x1AB0 && cp <= 0x1AFF) { return 0; }         # Combining Diacritical Marks Extended
+    if (cp >= 0x1DC0 && cp <= 0x1DFF) { return 0; }         # Combining Diacritical Marks Supplement
+    if (cp >= 0x200B && cp <= 0x200F) { return 0; }         # ZWSP ZWNJ ZWJ LRM RLM
+    if (cp >= 0x202A && cp <= 0x202E) { return 0; }         # bidi embeddings / overrides
+    if (cp >= 0x2060 && cp <= 0x2064) { return 0; }         # word joiner, invisible operators
+    if (cp >= 0x20D0 && cp <= 0x20FF) { return 0; }         # Combining Marks for Symbols
+    if (cp == 0x2329 || cp == 0x232A) { return 2; }         # angle brackets
+    if (cp >= 0x2E80 && cp <= 0x303E) { return 2; }         # CJK radicals .. CJK symbols
+    if (cp >= 0x3040 && cp <= 0xA4CF) { return 2; }         # kana .. CJK .. Yi
+    if (cp >= 0xAC00 && cp <= 0xD7A3) { return 2; }         # Hangul syllables
+    if (cp >= 0xF900 && cp <= 0xFAFF) { return 2; }         # CJK compatibility ideographs
+    if (cp >= 0xFE00 && cp <= 0xFE0F) { return 0; }         # variation selectors
+    if (cp >= 0xFE10 && cp <= 0xFE19) { return 2; }         # vertical forms
+    if (cp >= 0xFE20 && cp <= 0xFE2F) { return 0; }         # combining half marks
+    if (cp >= 0xFE30 && cp <= 0xFE6F) { return 2; }         # CJK compatibility forms
+    if (cp == 0xFEFF) { return 0; }                         # ZWNBSP / BOM
+    if (cp >= 0xFF00 && cp <= 0xFF60) { return 2; }         # fullwidth forms
+    if (cp >= 0xFFE0 && cp <= 0xFFE6) { return 2; }
+    if (cp >= 0x1F300 && cp <= 0x1F64F) { return 2; }       # pictographs, emoticons
+    if (cp >= 0x1F900 && cp <= 0x1F9FF) { return 2; }       # supplemental pictographs
+    if (cp >= 0x20000 && cp <= 0x2FFFD) { return 2; }       # CJK extension B ..
+    if (cp >= 0x30000 && cp <= 0x3FFFD) { return 2; }
+    if (cp >= 0xE0100 && cp <= 0xE01EF) { return 0; }       # variation selectors supplement
+    return 1;
+}
+
+# Render one 8x16 VGA glyph `cell` (a kashi cell: CP437 0x20..0xFF or an extension cell) at text cell (cx, cy),
+# scaling each font bit into an SxS block so the on-screen cell is cell_w x cell_h (= 8*S x 16*S), fg on bg — swapped
+# under SGR 7. Inner pixel paint loop runs cell_w*cell_h store32s per glyph (128 at scale=1, 512 at scale=2).
+fn fb_draw_glyph(cell, cx, cy) {
+    var glyph = kashi_glyph_ptr(KASHI_FONT_VGA_8X16, cell);
+    if (glyph == 0) { return 0; }
+    var fb = fb_g_fb;
+    var pitch = fb_g_pitch;
+    var s = fb_g_s;
+    var fg = fb_fg_color;
+    var bg = fb_bg_color;
+    if (fb_rev == 1) { fg = fb_bg_color; bg = fb_fg_color; }
+    var x_px = cx * fb_g_cw;
+    var y_px = FB_CONSOLE_Y0 + cy * fb_g_ch;
     # Strength-reduce the per-pixel address: Cyrius has no loop-invariant code
     # motion, so the old `scan = fb + (y_px+row*s+dy)*pitch + (x_px+col*s)*4`
     # emitted ~3 imuls per inner iteration (up to 256/glyph at scale 2). Here
@@ -1251,8 +1660,8 @@ fn fb_putc(ch) {
         var scan0 = row_top;             # this glyph-row's top scanline, col 0
         for (var col = 0; col < 8; col = col + 1) {
             var on = (bits >> (7 - col)) & 1;
-            var color = fb_bg_color;
-            if (on == 1) { color = fb_fg_color; }
+            var color = bg;
+            if (on == 1) { color = fg; }
             var scan = scan0;
             for (var dy = 0; dy < s; dy = dy + 1) {
                 var px = scan;
@@ -1267,7 +1676,6 @@ fn fb_putc(ch) {
         }
         row_top = row_top + row_pitch;   # next scaled glyph row
     }
-    fb_cur_x = fb_cur_x + 1;
     return 0;
 }
 

@@ -1,6 +1,11 @@
 # 2026-11-06 — readlink#70 refuses a buffer shorter than the target, so a long link reads as no link
 
-**Status:** 🔴 OPEN.
+**Status:** ✅ **RESOLVED in agnos 1.57.18** (2026-11-08). `readlink`#70 copies at most `buflen` bytes and returns how many it
+copied, on ext2 and ZFS, as Linux and FreeBSD do, so cyrius's 8-byte `is_symlink` probe is right again with no change
+there. The kernel's own path walk never follows a cut target (`ext2_readlink_whole` / `zfs_readlink_ref`). Found and fixed
+with it: an ext2 slow symlink whose size exceeds its one block made #70 copy past the kernel's block buffer to ring 3
+(measured: 5,000 bytes returned, 904 of them kernel BSS) — now -1, and a ZFS link over 4096 bytes likewise. Gate
+`scripts/smoke/fs-listing-smoke.sh`. ABI row 70.
 *(Filed from thoth **0.55.1**, whose hostile pass on AGNOS found it.)*
 **Checked against:** agnos **107ad763** (1.57.17), `kernel/core/ext2.cyr:3596`, and cyrius **6.7.18**, `lib/fs.cyr`.
 **Severity:** high for anything that asks whether a path is a link, which is every consumer of the stdlib's `is_symlink`.

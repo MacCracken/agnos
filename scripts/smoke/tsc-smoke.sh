@@ -19,7 +19,8 @@
 #     to acpi_init's late decode, no `lapic: WARNING`); the LAPIC reload is measured against it (`lapic: 100 Hz
 #     reload measured against the acpi pm timer`, T2); in a HALTED window the tick tracks PM time — uptime_ms#40
 #     within 3% (T3) and the median tick period is 10 ms within 1% (T4); the klog timebase agrees within 1%
-#     (T5 strict everywhere, T8 the 1% band); the FADT decode is pure (`acpi-fadt:` 3 arms, T7); the lowest AP's
+#     (T5 strict everywhere, T8 the 1% band); the FADT decode is pure (`acpi-fadt:` 3 arms, T7) and so is
+#     power_source#114's word (`acpi-power:` 2 arms, T7p, 1.57.18: no RSDP answers 0, the re-decode restores it); the lowest AP's
 #     tick is 10 ms within 3% (`ap-tickrate:`, T9, -smp > 1); uptime_ms#40 advances across a 200 ms IF=0
 #     busy window (B5, T10 — it is backed by the calibrated TSC). No latched invariant line fires.
 #   · statically: the old, wrong refusal text (`uptime_us will report 0` — the arm returns -1) is gone
@@ -376,6 +377,11 @@ score_boot() {
     _f3=$(plain "$_log" | grep -c '^acpi-fadt: PASS')
     if [ "$_f3" = 3 ] && ! plain "$_log" | grep -q '^acpi-fadt: FAIL'; then ok "T7 FADT purity: 3/3 acpi-fadt arms$_sfx"
     else bad "T7 FADT purity: $_f3/3 acpi-fadt arms PASS ($(plain "$_log" | grep -E '^acpi-fadt: FAIL' | tr '\n' ' '))$_sfx"; fi
+    # T7p (1.57.18): power_source#114's word rides arms 2 and 3 — no RSDP answers "cannot say" (0), the re-decode
+    # restores the boot's answer (power.cyr psrc_clear / psrc_scan; power-source-smoke covers the answers themselves).
+    _p2=$(plain "$_log" | grep -c '^acpi-power: PASS')
+    if [ "$_p2" = 2 ] && ! plain "$_log" | grep -q '^acpi-power: FAIL'; then ok "T7p power-source purity: 2/2 acpi-power arms$_sfx"
+    else bad "T7p power-source purity: $_p2/2 acpi-power arms PASS ($(plain "$_log" | grep -E '^acpi-power: FAIL' | tr '\n' ' '))$_sfx"; fi
     # T8: both timebases PM-derived, so the klog band is 1%.
     if plain "$_log" | grep -qE '^klog: log timebase OK -- [0-9]+ cycles/us, agrees with tsc within 1%$'; then
         ok "T8 the klog timebase agrees within the 1% PM-pair band$_sfx"

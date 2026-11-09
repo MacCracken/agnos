@@ -124,6 +124,24 @@ printf '%s\n' "$POST_LS" | grep -qE "[[:space:]]fss([[:space:]]|$)" && r=0 || r=
 chk "$r" "/fss is GONE from the disk after mkdir -> ... -> rmdir (the on-disk side effects round-tripped)" \
          "/fss is still on the disk — rmdir#10 (or the unlink before it) did not reach the media"
 
+# ⭐ 1.57.18 — open#7's AO_MODE + fsync#115 (issue 2026-11-06-open-has-no-create-mode): the selftest's /fsm600 was
+# created with AO_MODE 0600, reopened with AO_MODE 0777 (an existing file keeps its mode), written 100 bytes and
+# fsync#115'd — debugfs must read Mode 0600, a regular file, 100 bytes; and /fsmbad (a mode field of 010000) must be gone
+# (refused, then the selftest's own no-AO_MODE create of the same name unlinked).
+FSM="$(debugfs -R "stat /fsm600" "$WORK/part-post.img" 2>/dev/null || true)"
+printf '%s\n' "$FSM" | grep -qE "Type: regular +Mode: +0600 " && r=1 || r=0
+chk "$r" "debugfs: /fsm600 is a regular file of Mode 0600 (open#7 AO_MODE; the AO_MODE 0777 reopen left it alone)" \
+         "debugfs: /fsm600 is not 'Type: regular Mode: 0600': $(printf '%s\n' "$FSM" | grep -E 'Type:' | head -1)"
+printf '%s\n' "$FSM" | grep -qE "Size: 100$" && r=1 || r=0
+chk "$r" "debugfs: /fsm600 holds the 100 bytes written before its fsync#115" \
+         "debugfs: /fsm600 size is not 100: $(printf '%s\n' "$FSM" | grep -E 'Size:' | head -1)"
+printf '%s\n' "$POST_LS" | grep -qE "[[:space:]]fsmbad([[:space:]]|$)" && r=0 || r=1
+chk "$r" "/fsmbad is not on the disk (a mode field above 07777 refused, the default-mode create unlinked)" \
+         "/fsmbad is on the disk"
+strings "$LOG" | grep -qE "fssys: fsync#115 us=[0-9]+ sectors=0 flushes=1 \| sync#12 us=[0-9]+ sectors=[0-9]+" && r=1 || r=0
+chk "$r" "fsync#115 on an ext2 fd: one device flush, no sector written ($(strings "$LOG" | grep -oE 'fssys: fsync#115 .*' | head -1 | cut -c8-))" \
+         "no 'fssys: fsync#115 ... sectors=0 flushes=1' measurement line"
+
 [ "$FSCK_RC" -eq 0 ] && r=1 || r=0
 chk "$r" "e2fsck -fn is clean after the syscall sequence (no orphaned inode or block from the create/unlink pair)" \
          "e2fsck -fn rc=$FSCK_RC — the syscall sequence left the ext2 inconsistent: $(grep -vE '^(Pass|e2fsck|AGNOS)' "$WORK/e2fsck.txt" | head -2 | tr '\n' ' ')"

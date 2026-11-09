@@ -733,12 +733,22 @@ fn elf_load_from_file_body(path, namelen, argv_src, argv_len) {
             str_o = str_o + 7;
             envc = envc + 1;
         }
-        if (str_o + 6 < ELF_STACK_SIZE) {                                # "PWD=/" + NUL
+        # ⭐ 1.57.18: "PWD=" + the working directory the child is born with — its creator's (proc_create_user copies it;
+        # with no env there is no PWD= to seed from). "PWD=/" byte-identically for a creator at "/" (every kernel load,
+        # and every process that never chdir'd). A PWD that said "/" for a child the kernel resolves from elsewhere would
+        # send a $PWD-resolving program (thoth's fs_path) to the wrong file — the bug chdir#112 exists to end. When it
+        # does not fit the string region the variable is OMITTED, never cut (getcwd#113 still answers).
+        var pw_me = proc_current_get();
+        var pw_n = proc_cwd_len_get(pw_me);
+        var pw_src = "/";
+        if (pw_n == 0) { pw_n = 1; } else { pw_src = proc_cwd_ptr(pw_me); }
+        if (str_o + 5 + pw_n < ELF_STACK_SIZE) {                         # "PWD=" + the cwd + NUL
             store8(stack_kva +str_o + 0, 80);  store8(stack_kva +str_o + 1, 87);
             store8(stack_kva +str_o + 2, 68);  store8(stack_kva +str_o + 3, 61);
-            store8(stack_kva +str_o + 4, 47);  store8(stack_kva +str_o + 5, 0);
+            memcpy(stack_kva + str_o + 4, pw_src, pw_n);
+            store8(stack_kva +str_o + 4 + pw_n, 0);
             store64(stack_kva + ELF_INIT_BLOCK + 8 + (argc + 1 + envc) * 8, stack_base + str_o);
-            str_o = str_o + 6;
+            str_o = str_o + 5 + pw_n;
             envc = envc + 1;
         }
     } else {

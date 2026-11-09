@@ -96,7 +96,9 @@ globals, the mutation arms); each item is answered by a rule below. §§ 8–17 
   slot (a different index); the first FLUSH precedes every uberblock copy, so a landed copy names durable blocks. A crash
   leaves one of two consistent pools. Proved on disk by the four crash-cut lanes (§ 17; design k.127).
 - **Durability points.** A `write`#1 through an fd is coalesced (policy B, § 17) and durable at `close`#6 of an fd of
-  its file, `sync`#12, the death of its process (committed before the death is published), `power_flush`, a threshold
+  its file, `fsync`#115 of ANY fd of its file (1.57.18, `zfs_wp_fsync` — read-only fds included; an fsync of another
+  file's fd commits NOTHING of it, since the one pending txg holds one object: OpenZFS `zil_commit(zilog, foid)`'s
+  scope), `sync`#12, the death of its process (committed before the death is published), `power_flush`, a threshold
   (the 4 MiB data arena, the metadata arena, `ZWF_TXGBLK`, OpenZFS's in-flight reserve), the 5 s age bound seen at a ZFS
   entry, and before any entry that would observe it (a read / `SEEK_END` / `stat` / `open` / exec of the object,
   `statfs`, every mutation, a write to another object). Every other write verb — create, `mkdir`, `symlink`, `unlink`,

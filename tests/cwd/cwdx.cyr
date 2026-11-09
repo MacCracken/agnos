@@ -1,0 +1,631 @@
+# cwdx — the RING-3 half of agnos 1.57.18's per-process working directory (chdir#112 / getcwd#113).
+#
+# Issue: 2026-11-06-a-relative-path-has-no-working-directory (from thoth 0.55.1: its "relative, no .." jail read
+# /etc/secret.txt for "etc/secret.txt", because agnos rooted every relative name at "/"). Operator ruling 2026-11-08: the
+# kernel keeps a working directory per process; docs/architecture/working-directory.md is the design.
+# Seeded as /bin/agnsh on a PLAIN kernel by scripts/smoke/cwd-smoke.sh (an ext2 root, the ESP's FAT at /mnt/fat, and the
+# ZFS fixture's pool at /mnt/zfs when the smoke attaches it). Raw `syscall(N, a1, a2, a3, a4)` with explicit zeros (a
+# 3-argument call passes a garbage r10). Every check prints its raw values; a failure prints `CWDX-FAIL-<name> v=...` and
+# never its OK marker. The program ALWAYS ends `CWDX-DONE pass=P fail=F` and exits 0 (a non-zero exit drops kybernet
+# into the emergency shell). It is also its own CHILD: `/bin/agnsh <role> ...` (main).
+#
+#   A  BASICS from /cwd: chdir + getcwd round trip, a too-small cap (-1, nothing written), and every path arm RELATIVE —
+#      mkdir, open AO_CREAT, stat, rename (both names), link (both), symlink (the link path; the target text verbatim),
+#      readlink, lstat, readdir#81 / readdir_at#101, statfs, unlink, rmdir — each checked by its ABSOLUTE twin.
+#   B  NORMALISATION: "." / ".." / "//" / a trailing "/" cleaned lexically, ".." at "/" stays "/".
+#   C  REFUSALS, the cwd unchanged each time: a file, a missing path, "", a NUL in the path, a relative file; a symlink to a
+#      directory is accepted and kept as the LINK's path (the shell's logical cd).
+#   D  THE ISSUE'S CASE: from /proj a relative "etc/secret.txt" does NOT read /etc/secret.txt.
+#   E  CHILDREN: spawn_path#43 with no env (inherits; its default env's PWD is the cwd), with a valid PWD= (seeded), with a
+#      bogus PWD (missing / relative / a file: ignored, inherits), execwait#37 with a PWD=, fork#96 (inherits; the child's
+#      chdir leaves the parent's alone), a RELATIVE program path (resolved from the cwd, no /bin search), a recycled pid
+#      starting at its creator's cwd, and three processes doing relative reads from three cwds at once (the -smp 4 boot
+#      runs them on different CPUs: the per-CPU ingress slots).
+#   F  ZFS (when /mnt/zfs/agnostank exists): relative open / stat / readlink / lstat / readdir / statfs / mkdir / rmdir,
+#      "../" inside the pool, and ACROSS the mount boundary both ways (/mnt/zfs/agnostank/../../.. is "/", /mnt is ext2).
+#   G  FAT (the ESP at /mnt/fat): chdir to a FAT directory, a relative open there, chdir to a FAT file refused.
+#   H  THE CWD REMOVED under the process: relative lookups fail cleanly, getcwd still answers the string, ".." works.
+#   I  OVERLONG: a 4025-byte cwd; a relative name that brings it to 4095 works, one byte more is -1 (never truncated to
+#      the existing 4095-byte name), a chdir past 4095 is refused, an input of 4096+ bytes is refused.
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var c_lb[32];           # 256 B the current output line
+var C_LN = 0;
+var C_PASS = 0;
+var C_FAIL = 0;
+var c_st[6];            # 48 B stat#33 struct (§4.1): mode @0, nlink @8, size @16, ino @24
+var c_sf[4];            # 32 B statfs#103 record
+var c_gb[528];          # 4224 B getcwd buffer
+var c_pb[1040];         # 8320 B path builder
+var c_rb[64];           # 512 B read buffer
+var c_dr[512];          # 4096 B readdir records (64 x 64 B)
+var c_env[64];          # 512 B env blob
+var c_cur[2];           # readdir_at cursor
+
+# Output is LINE-BUFFERED, one write(1) per line (a -smp 4 boot interleaves processes line by line, never mid-line).
+fn c_flush() { if (C_LN > 0) { syscall(1, 1, &c_lb, C_LN, 0); } C_LN = 0; return 0; }
+fn c_putc(ch) {
+    if (C_LN >= 250) { c_flush(); }
+    store8(&c_lb + C_LN, ch);
+    C_LN = C_LN + 1;
+    if (ch == 10) { c_flush(); }
+    return 0;
+}
+fn c_out(s) {
+    var i = 0;
+    while (load8(s + i) != 0) { c_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn c_outn(s, n) {
+    var i = 0;
+    while (i < n) { c_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn c_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { c_putc(45); n = 0 - n; }
+    if (n == 0) { c_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; c_putc(load8(&b + i)); }
+    return 0;
+}
+fn c_kv(k, v) { c_out(" "); c_out(k); c_out("="); c_num(v); return 0; }
+fn c_nl() { c_out("\n"); return 0; }
+fn c_ok(m) { c_out(m); c_nl(); C_PASS = C_PASS + 1; return 0; }
+fn c_fail(m, v) { c_out("CWDX-FAIL-"); c_out(m); c_kv("v", v); c_nl(); C_FAIL = C_FAIL + 1; return 0; }
+# One verdict: cond != 0 is the OK marker, else the FAIL line with v.
+fn c_check(cond, okm, failm, v) { if (cond != 0) { c_ok(okm); } else { c_fail(failm, v); } return 0; }
+fn c_len(s) { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn c_eq(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    var i = 0;
+    while (1 == 1) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        if (load8(a + i) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn c_atoi(s) {
+    var v = 0;
+    var i = 0;
+    while (load8(s + i) >= 48) {
+        if (load8(s + i) > 57) { return v; }
+        v = v * 10 + (load8(s + i) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+# The syscalls, a3/a4 explicit.
+fn c_open(p, fl) { return syscall(7, p, c_len(p), fl, 0); }
+fn c_close(fd) { return syscall(6, fd, 0, 0, 0); }
+fn c_mkdir(p) { return syscall(9, p, c_len(p), 0, 0); }
+fn c_rmdir(p) { return syscall(10, p, c_len(p), 0, 0); }
+fn c_unlink(p) { return syscall(30, p, c_len(p), 0, 0); }
+fn c_rename(a, b) { return syscall(31, a, c_len(a), b, c_len(b)); }
+fn c_link(a, b) { return syscall(32, a, c_len(a), b, c_len(b)); }
+fn c_symlink(t, l) { return syscall(63, t, c_len(t), l, c_len(l)); }
+fn c_readlink(p) { return syscall(70, p, c_len(p), &c_rb, 512); }
+fn c_stat(p) { return syscall(33, p, c_len(p), &c_st, 0); }
+fn c_lstat(p) { return syscall(102, p, c_len(p), &c_st, 0); }
+fn c_statfs(p) { return syscall(103, p, c_len(p), &c_sf, 0); }
+fn c_readdir(p) { return syscall(81, p, &c_dr, 64, 0); }
+fn c_readdir_at(p) { store64(&c_cur, 0); return syscall(101, p, &c_dr, 64, &c_cur); }
+fn c_chdir(p) { return syscall(112, p, c_len(p), 0, 0); }
+fn c_getcwd(buf, cap) { return syscall(113, buf, cap, 0, 0); }
+fn c_wait(pid) { return syscall(4, 0x100 | pid, 0, 0, 0); }   # WAIT_BLOCK: the child's exit code & 0xFF
+fn c_fork() { return syscall(96, 0, 0, 0, 0); }
+fn c_exit(code) { syscall(0, code, 0, 0, 0); return 0; }
+# stat#33 fields; -1 when the name does not resolve
+fn c_size(p) { if (c_stat(p) != 0) { return 0 - 1; } return load64(&c_st + 16); }
+fn c_mode(p) { if (c_stat(p) != 0) { return 0 - 1; } return load64(&c_st) & 0xF000; }
+fn c_nlink(p) { if (c_stat(p) != 0) { return 0 - 1; } return load64(&c_st + 8); }
+
+# 1 when getcwd answers exactly s (its length returned, s's bytes, a NUL after them).
+fn c_cwd_is(s) {
+    var n = c_getcwd(&c_gb, 4224);
+    var l = c_len(s);
+    if (n != l) { return 0; }
+    var i = 0;
+    while (i < l) { if (load8(&c_gb + i) != load8(s + i)) { return 0; } i = i + 1; }
+    if (load8(&c_gb + l) != 0) { return 0; }
+    return 1;
+}
+# Print what getcwd says (diagnostics), at most 200 bytes of it.
+fn c_saycwd(tag) {
+    var n = c_getcwd(&c_gb, 4224);
+    c_out(tag); c_out(" getcwd="); c_num(n);
+    if (n > 0) { c_out(" '"); if (n > 200) { c_outn(&c_gb, 200); c_out("..."); } else { c_outn(&c_gb, n); } c_out("'"); }
+    c_nl();
+    return 0;
+}
+# A file p holding exactly text (AO_WRONLY | AO_CREAT | AO_TRUNC). 0 / -1.
+fn c_put(p, text) {
+    var fd = c_open(p, 0x301);
+    if (fd < 0) { return 0 - 1; }
+    var n = c_len(text);
+    var w = syscall(1, fd, text, n, 0);
+    c_close(fd);
+    if (w != n) { return 0 - 1; }
+    return 0;
+}
+# 1 when the file p holds exactly text.
+fn c_holds(p, text) {
+    var fd = c_open(p, 0);
+    if (fd < 0) { return 0; }
+    var got = 0;
+    while (got < 512) {
+        var r = syscall(5, fd, &c_rb + got, 512 - got, 0);
+        if (r <= 0) { break; }
+        got = got + r;
+    }
+    c_close(fd);
+    var n = c_len(text);
+    if (got != n) { return 0; }
+    var i = 0;
+    while (i < n) { if (load8(&c_rb + i) != load8(text + i)) { return 0; } i = i + 1; }
+    return 1;
+}
+# 1 when readdir record i names s.
+fn c_rec_is(i, s) { return c_eq(&c_dr + i * 64, s); }
+# The env blob "a\0b\0" (b may be 0) in c_env; its length.
+fn c_envb(a, b) {
+    var o = 0;
+    var i = 0;
+    while (load8(a + i) != 0) { store8(&c_env + o, load8(a + i)); o = o + 1; i = i + 1; }
+    store8(&c_env + o, 0); o = o + 1;
+    if (b != 0) {
+        i = 0;
+        while (load8(b + i) != 0) { store8(&c_env + o, load8(b + i)); o = o + 1; i = i + 1; }
+        store8(&c_env + o, 0); o = o + 1;
+    }
+    return o;
+}
+# spawn_path#43 (the line form) then WAIT_BLOCK: the child's exit code, or 1000 + the -SPAWN_E_* code.
+fn c_run(line, env, elen) {
+    var pid = syscall(43, line, c_len(line), env, elen);
+    if (pid < 0) { return 1000 - pid; }
+    return c_wait(pid);
+}
+# envp lookup on the SysV init stack: "KEY=VALUE" -> VALUE, or 0.
+fn c_getenv(name) {
+    var base = _agnos_argv_base();
+    if (base == 0) { return 0; }
+    var ac = load64(base);
+    var nl = c_len(name);
+    var j = 0;
+    while (j < 64) {
+        var ep = load64(base + 8 + (ac + 1 + j) * 8);
+        if (ep == 0) { return 0; }
+        var m = 1;
+        var ci = 0;
+        while (ci < nl) {
+            if (load8(ep + ci) != load8(name + ci)) { m = 0; break; }
+            ci = ci + 1;
+        }
+        if (m == 1) { if (load8(ep + nl) == 61) { return ep + nl + 1; } }
+        j = j + 1;
+    }
+    return 0;
+}
+# c_pb := n copies of byte ch, NUL-terminated; returns &c_pb.
+fn c_fill(ch, n) {
+    var i = 0;
+    while (i < n) { store8(&c_pb + i, ch); i = i + 1; }
+    store8(&c_pb + n, 0);
+    return &c_pb;
+}
+
+# ═════════════════════════════════════ CHILD ROLES ═════════════════════════════════════
+# who <cwd> <mark|-> <envPWD|->: getcwd must be <cwd>; a relative "mark.txt" must hold <mark>; $PWD must be <envPWD>.
+fn c_who(): i64 {
+    if (argc() < 5) { return 20; }
+    if (c_cwd_is(argv(2)) == 0) { c_saycwd("CWDX-CHILD who"); return 10; }
+    if (c_eq(argv(3), "-") == 0) { if (c_holds("mark.txt", argv(3)) == 0) { return 11; } }
+    if (c_eq(argv(4), "-") == 0) {
+        var e = c_getenv("PWD");
+        if (e == 0) { return 12; }
+        if (c_eq(e, argv(4)) == 0) { c_out("CWDX-CHILD who env PWD='"); c_out(e); c_out("'"); c_nl(); return 13; }
+    }
+    return 0;
+}
+# loop <mark> <n>: n relative reads of "mark.txt" (and a relative stat each) must all hold <mark>.
+fn c_loop(): i64 {
+    if (argc() < 4) { return 20; }
+    var n = c_atoi(argv(3));
+    var k = 0;
+    while (k < n) {
+        if (c_holds("mark.txt", argv(2)) == 0) { return 14; }
+        if (c_size("mark.txt") != c_len(argv(2))) { return 15; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# ═════════════════════════════════════ A — BASICS ═════════════════════════════════════
+fn ph_a() {
+    c_check(c_cwd_is("/"), "CWDX-START-ROOT-OK", "START-ROOT", 0);
+    c_mkdir("/cwd");
+    var r = c_chdir("/cwd");
+    var g = c_getcwd(&c_gb, 4224);
+    c_check(r == 0 && g == 4 && c_cwd_is("/cwd") == 1, "CWDX-CHDIR-GETCWD-OK", "CHDIR-GETCWD", g);
+    # a too-small cap: -1 and NOTHING written; cap = length + 1 is enough
+    store8(&c_gb, 90); store8(&c_gb + 1, 90); store8(&c_gb + 4, 90);
+    var s1 = c_getcwd(&c_gb, 4);
+    var u1 = 0;
+    if (load8(&c_gb) == 90 && load8(&c_gb + 1) == 90) { u1 = 1; }
+    var s2 = c_getcwd(&c_gb, 5);
+    var s3 = c_getcwd(&c_gb, 0);
+    var sc = 0;
+    if (s1 == 0 - 1 && u1 == 1 && s2 == 4 && load8(&c_gb + 4) == 0 && s3 == 0 - 1) { sc = 1; }
+    c_check(sc, "CWDX-GETCWD-SMALL-CAP-OK", "GETCWD-SMALL-CAP", s1);
+    # every arm relative, each checked by its absolute twin
+    var m = c_mkdir("d1");
+    c_check(m == 0 && c_mode("/cwd/d1") == 0x4000, "CWDX-REL-MKDIR-OK", "REL-MKDIR", m);
+    var p = c_put("d1/f.txt", "F1");
+    var po = 0;
+    if (p == 0 && c_holds("/cwd/d1/f.txt", "F1") == 1 && c_size("d1/f.txt") == 2 && c_size("/f.txt") == 0 - 1) { po = 1; }
+    c_check(po, "CWDX-REL-OPEN-STAT-OK", "REL-OPEN-STAT", p);
+    var rn = c_rename("d1/f.txt", "d1/g.txt");
+    c_check(rn == 0 && c_size("/cwd/d1/g.txt") == 2 && c_size("/cwd/d1/f.txt") == 0 - 1, "CWDX-REL-RENAME-OK", "REL-RENAME", rn);
+    var lk = c_link("d1/g.txt", "h.txt");
+    var nl2 = c_nlink("/cwd/d1/g.txt");
+    var ul = c_unlink("h.txt");
+    var lo = 0;
+    if (lk == 0 && nl2 == 2 && ul == 0 && c_nlink("/cwd/d1/g.txt") == 1 && c_size("/cwd/h.txt") == 0 - 1) { lo = 1; }
+    c_check(lo, "CWDX-REL-LINK-UNLINK-OK", "REL-LINK-UNLINK", lk);
+    var sy = c_symlink("g.txt", "d1/sl");
+    var rl = c_readlink("d1/sl");
+    var rlok = 0;
+    if (rl == 5) { if (load8(&c_rb) == 103 && load8(&c_rb + 4) == 116) { rlok = 1; } }   # "g.txt" — the text verbatim
+    var lsm = 0 - 1;
+    if (c_lstat("d1/sl") == 0) { lsm = load64(&c_st) & 0xF000; }
+    var so = 0;
+    if (sy == 0 && rlok == 1 && lsm == 0xA000 && c_size("d1/sl") == 2 && c_size("/cwd/d1/sl") == 2) { so = 1; }
+    c_check(so, "CWDX-REL-SYMLINK-READLINK-LSTAT-OK", "REL-SYMLINK", rl);
+    # readdir / statfs / rmdir on a directory made by its ABSOLUTE name, so a relative name rooted anywhere but the cwd
+    # finds nothing
+    c_mkdir("/cwd/rdd"); c_put("/cwd/rdd/one", "1"); c_put("/cwd/rdd/two", "2"); c_put("/cwd/rdd/three", "3");
+    var nd = c_readdir("rdd");
+    var da = c_readdir_at("./rdd/");
+    var dc = load64(&c_cur);
+    var nda = c_readdir("/cwd/rdd");
+    c_check(nd == 3 && da == 3 && dc == 0 - 1 && nda == 3, "CWDX-REL-READDIR-OK", "REL-READDIR", nd * 100 + da);
+    var sf = c_statfs("rdd");
+    c_check(sf == 0 && load64(&c_sf) > 0 && c_statfs("nope-not-here") == 0 - 1, "CWDX-REL-STATFS-OK", "REL-STATFS", sf);
+    c_mkdir("/cwd/d2");
+    var rd = c_rmdir("d2");
+    c_check(rd == 0 && c_mode("/cwd/d2") == 0 - 1, "CWDX-REL-RMDIR-OK", "REL-RMDIR", rd);
+    var u2 = c_unlink("d1/sl");
+    c_check(u2 == 0 && c_size("/cwd/d1/g.txt") == 2 && c_lstat("/cwd/d1/sl") == 0 - 1, "CWDX-REL-UNLINK-OK", "REL-UNLINK", u2);
+    return 0;
+}
+
+# ═════════════════════════════════════ B — NORMALISATION ═════════════════════════════════════
+fn ph_b() {
+    var r1 = c_chdir("/");
+    var r2 = c_chdir("..");
+    c_check(r1 == 0 && r2 == 0 && c_cwd_is("/") == 1, "CWDX-DOTDOT-AT-ROOT-OK", "DOTDOT-AT-ROOT", r2);
+    var r3 = c_chdir("/cwd/./d1//../d1/");
+    c_check(r3 == 0 && c_cwd_is("/cwd/d1") == 1, "CWDX-CLEAN-ABS-OK", "CLEAN-ABS", r3);
+    var r4 = c_chdir(".");
+    var r5 = c_chdir("./..");
+    c_check(r4 == 0 && r5 == 0 && c_cwd_is("/cwd") == 1, "CWDX-CLEAN-REL-OK", "CLEAN-REL", r5);
+    var r6 = c_chdir("d1/../../cwd/d1/./../../..");
+    c_check(r6 == 0 && c_cwd_is("/") == 1, "CWDX-DOTDOT-PAST-ROOT-OK", "DOTDOT-PAST-ROOT", r6);
+    c_chdir("/cwd");
+    var dd = 0;
+    if (c_holds("./d1/../d1/g.txt", "F1") == 1 && c_holds("..//cwd/d1/g.txt", "F1") == 1) { dd = 1; }
+    c_check(dd, "CWDX-REL-DOTS-OPEN-OK", "REL-DOTS-OPEN", 0);
+    return 0;
+}
+
+# ═════════════════════════════════════ C — REFUSALS ═════════════════════════════════════
+fn ph_c() {
+    c_chdir("/cwd");
+    var f1 = c_chdir("/etc/secret.txt");
+    c_check(f1 == 0 - 1 && c_cwd_is("/cwd") == 1, "CWDX-CHDIR-FILE-REFUSED-OK", "CHDIR-FILE-REFUSED", f1);
+    var f2 = c_chdir("/cwd/nope");
+    c_check(f2 == 0 - 1 && c_cwd_is("/cwd") == 1, "CWDX-CHDIR-MISSING-REFUSED-OK", "CHDIR-MISSING-REFUSED", f2);
+    var f3 = syscall(112, "/", 0, 0, 0);
+    store8(&c_pb, 47); store8(&c_pb + 1, 99); store8(&c_pb + 2, 119); store8(&c_pb + 3, 0); store8(&c_pb + 4, 100);   # "/cw\0d"
+    var f4 = syscall(112, &c_pb, 5, 0, 0);
+    var en = 0;
+    if (f3 == 0 - 1 && f4 == 0 - 1 && c_cwd_is("/cwd") == 1) { en = 1; }
+    c_check(en, "CWDX-CHDIR-EMPTY-NUL-REFUSED-OK", "CHDIR-EMPTY-NUL", f4);
+    var f5 = c_chdir("d1/g.txt");
+    c_check(f5 == 0 - 1 && c_cwd_is("/cwd") == 1, "CWDX-CHDIR-REL-FILE-REFUSED-OK", "CHDIR-REL-FILE", f5);
+    # a symlink to a directory ELSEWHERE (/cwd/dl -> /proj): accepted, kept as the link's path, and ".." is LOGICAL —
+    # /cwd, where a physical ".." (Linux's) would be "/"
+    var sl = c_symlink("/proj", "/cwd/dl");
+    var f6 = c_chdir("dl");
+    var lg = 0;
+    if (sl == 0 && f6 == 0 && c_cwd_is("/cwd/dl") == 1 && c_holds("note.txt", "PROJ-NOTE\n") == 1) { lg = 1; }
+    c_check(lg, "CWDX-CHDIR-SYMLINK-LOGICAL-OK", "CHDIR-SYMLINK-LOGICAL", f6);
+    var f7 = c_chdir("..");
+    c_check(f7 == 0 && c_cwd_is("/cwd") == 1, "CWDX-SYMLINK-DOTDOT-LOGICAL-OK", "SYMLINK-DOTDOT-LOGICAL", f7);
+    return 0;
+}
+
+# ═════════════════════════════════════ D — THE ISSUE'S CASE ═════════════════════════════════════
+fn ph_d() {
+    var r = c_chdir("/proj");
+    var fd = c_open("etc/secret.txt", 0);
+    if (fd >= 0) { c_close(fd); }
+    var nr = 0;
+    if (r == 0 && fd < 0 && c_holds("note.txt", "PROJ-NOTE\n") == 1) { nr = 1; }
+    c_check(nr, "CWDX-ISSUE-NO-ROOT-SECRET-OK", "ISSUE-ROOT-SECRET-READ", fd);
+    var m = c_mkdir("etc");
+    var p = c_put("etc/secret.txt", "PROJ-SECRET");
+    var pf = 0;
+    if (m == 0 && p == 0 && c_holds("etc/secret.txt", "PROJ-SECRET") == 1) {
+        if (c_holds("/proj/etc/secret.txt", "PROJ-SECRET") == 1 && c_holds("/etc/secret.txt", "ROOT-SECRET\n") == 1) { pf = 1; }
+    }
+    c_check(pf, "CWDX-ISSUE-PROJECT-FILE-OK", "ISSUE-PROJECT-FILE", p);
+    return 0;
+}
+
+# ═════════════════════════════════════ E — CHILDREN ═════════════════════════════════════
+fn ph_e() {
+    c_mkdir("/cwd/e1"); c_put("/cwd/e1/mark.txt", "E1");
+    c_mkdir("/cwd/e2"); c_put("/cwd/e2/mark.txt", "E2");
+    c_mkdir("/cwd/e3"); c_put("/cwd/e3/mark.txt", "E3");
+    c_chdir("/cwd/e1");
+    # #43, no env: inherits, and the kernel's default env says PWD=<that cwd>
+    var e1 = c_run("/bin/agnsh who /cwd/e1 E1 /cwd/e1", 0, 0);
+    c_check(e1 == 0, "CWDX-SPAWN-INHERIT-OK", "SPAWN-INHERIT", e1);
+    # #43, PWD=/cwd/e2: seeded from the env (agnsh's case)
+    var n2 = c_envb("PWD=/cwd/e2", "HOME=/");
+    var e2 = c_run("/bin/agnsh who /cwd/e2 E2 /cwd/e2", &c_env, n2);
+    c_check(e2 == 0, "CWDX-SPAWN-PWD-SEED-OK", "SPAWN-PWD-SEED", e2);
+    # #43, PWD=/cwd/e2/./ (cleaned)
+    var n2b = c_envb("HOME=/", "PWD=/cwd//e2/./");
+    var e2b = c_run("/bin/agnsh who /cwd/e2 E2 -", &c_env, n2b);
+    c_check(e2b == 0, "CWDX-SPAWN-PWD-CLEANED-OK", "SPAWN-PWD-CLEANED", e2b);
+    # bogus PWDs are IGNORED: the child inherits the parent's /cwd/e1 (the env still carries the bogus text)
+    var n3 = c_envb("PWD=/cwd/nope", "HOME=/");
+    var e3 = c_run("/bin/agnsh who /cwd/e1 E1 /cwd/nope", &c_env, n3);
+    var n4 = c_envb("PWD=cwd/e2", 0);
+    var e4 = c_run("/bin/agnsh who /cwd/e1 E1 cwd/e2", &c_env, n4);
+    var n5 = c_envb("PWD=/cwd/e2/mark.txt", 0);
+    var e5 = c_run("/bin/agnsh who /cwd/e1 E1 -", &c_env, n5);
+    c_check(e3 == 0 && e4 == 0 && e5 == 0, "CWDX-SPAWN-BOGUS-PWD-IGNORED-OK", "SPAWN-BOGUS-PWD", e3 * 10000 + e4 * 100 + e5);
+    # #37 (execwait), PWD=/cwd/e2
+    var n6 = c_envb("PWD=/cwd/e2", 0);
+    var ln6 = "/bin/agnsh who /cwd/e2 E2 /cwd/e2";
+    var e6 = syscall(37, ln6, c_len(ln6), &c_env, n6);
+    var ln6b = "/bin/agnsh who /cwd/e1 E1 /cwd/e1";
+    var e6b = syscall(37, ln6b, c_len(ln6b), 0, 0);
+    c_check(e6 == 0 && e6b == 0, "CWDX-EXECWAIT-SEED-INHERIT-OK", "EXECWAIT", e6 * 100 + e6b);
+    # fork: the child starts in /cwd/e1; its chdir does not move the parent
+    var fk = c_fork();
+    if (fk == 0) {
+        var ok = 0;
+        if (c_cwd_is("/cwd/e1") == 1) { if (c_holds("mark.txt", "E1") == 1) { ok = 1; } }
+        c_chdir("/cwd/e2");
+        if (ok == 1) { if (c_cwd_is("/cwd/e2") == 0) { ok = 0; } }
+        c_flush();
+        if (ok == 1) { c_exit(0); }
+        c_exit(16);
+    }
+    var fw = 0 - 1;
+    if (fk > 0) { fw = c_wait(fk); }
+    c_check(fk > 0 && fw == 0 && c_cwd_is("/cwd/e1") == 1, "CWDX-FORK-INHERIT-OK", "FORK-INHERIT", fw);
+    # a RELATIVE program path resolves from the cwd, with no /bin search
+    c_chdir("/bin");
+    var rp1 = c_run("agnsh who /bin - /bin", 0, 0);
+    var rp2 = c_run("./agnsh who /bin - -", 0, 0);
+    c_chdir("/cwd/e1");
+    var rp3 = c_run("agnsh who / - -", 0, 0);          # /cwd/e1/agnsh does not exist: -SPAWN_E_NOENT (4)
+    var rp4 = c_run("../../bin/agnsh who /cwd/e1 E1 -", 0, 0);
+    var rpo = 0;
+    if (rp1 == 0 && rp2 == 0 && rp3 == 1004 && rp4 == 0) { rpo = 1; }
+    c_check(rpo, "CWDX-SPAWN-RELATIVE-PROGRAM-OK", "SPAWN-RELATIVE-PROGRAM", rp1 * 1000000 + rp2 * 10000 + rp3);
+    # a RECYCLED pid: A goes deep and exits; B, born on A's slot from a parent at "/", starts at "/"
+    c_mkdir("/cwd/e2/deep");
+    var na = c_envb("PWD=/cwd/e2", 0);
+    var la = "/bin/agnsh cdexit /cwd/e2/deep";
+    var pa = syscall(43, la, c_len(la), &c_env, na);
+    var wa = 0 - 1;
+    if (pa >= 0) { wa = c_wait(pa); }
+    c_chdir("/");
+    var lb = "/bin/agnsh who / - /";
+    var pb = syscall(43, lb, c_len(lb), 0, 0);
+    var wb = 0 - 1;
+    if (pb >= 0) { wb = c_wait(pb); }
+    c_out("CWDX-RECYCLE"); c_kv("pidA", pa); c_kv("pidB", pb); c_nl();
+    c_check(pa >= 0 && wa == 0 && pb == pa && wb == 0, "CWDX-RECYCLED-PID-CLEAN-OK", "RECYCLED-PID", wb);
+    # three processes reading relatively from three cwds at once (different CPUs at -smp 4)
+    var nl1 = c_envb("PWD=/cwd/e1", 0);
+    var lp1 = "/bin/agnsh loop E1 300";
+    var q1 = syscall(43, lp1, c_len(lp1), &c_env, nl1);
+    var nl2 = c_envb("PWD=/cwd/e2", 0);
+    var lp2 = "/bin/agnsh loop E2 300";
+    var q2 = syscall(43, lp2, c_len(lp2), &c_env, nl2);
+    c_chdir("/cwd/e3");
+    var mine = 0;
+    var k = 0;
+    while (k < 300) {
+        if (c_holds("mark.txt", "E3") == 0) { mine = mine + 1; }
+        k = k + 1;
+    }
+    var w1 = 0 - 1;
+    var w2 = 0 - 1;
+    if (q1 >= 0) { w1 = c_wait(q1); }
+    if (q2 >= 0) { w2 = c_wait(q2); }
+    var co = 0;
+    if (q1 >= 0 && q2 >= 0 && w1 == 0 && w2 == 0 && mine == 0) { co = 1; }
+    c_check(co, "CWDX-CONCURRENT-CWDS-OK", "CONCURRENT-CWDS", w1 * 10000 + w2 * 100 + mine);
+    return 0;
+}
+
+# ═════════════════════════════════════ F — ZFS ═════════════════════════════════════
+fn ph_f() {
+    if (c_mode("/mnt/zfs/agnostank") != 0x4000) { c_out("CWDX-ZFS-ABSENT"); c_nl(); return 0; }
+    c_out("CWDX-ZFS-PRESENT"); c_nl();
+    var r = c_chdir("/mnt/zfs/agnostank");
+    var zo = 0;
+    if (r == 0 && c_cwd_is("/mnt/zfs/agnostank") == 1 && c_holds("hello.txt", "hello from zfs\n") == 1) {
+        if (c_size("deep/a/b/c/d/e/leaf.txt") == 16) { zo = 1; }
+    }
+    c_check(zo, "CWDX-ZFS-REL-OPEN-STAT-OK", "ZFS-REL-OPEN-STAT", r);
+    var rl = c_readlink("sym-short");
+    var rlok = 0;
+    if (rl == 9) { if (load8(&c_rb) == 104 && load8(&c_rb + 8) == 116) { rlok = 1; } }   # "hello.txt"
+    var lsm = 0 - 1;
+    if (c_lstat("sym-short") == 0) { lsm = load64(&c_st) & 0xF000; }
+    c_check(rlok == 1 && lsm == 0xA000, "CWDX-ZFS-REL-READLINK-LSTAT-OK", "ZFS-REL-READLINK", rl);
+    var nd = c_readdir("deep");
+    var nda = c_rec_is(0, "a");
+    var da = c_readdir_at("deep/a");
+    var ndb = c_rec_is(0, "b");
+    var zr = 0;
+    if (nd == 1 && nda == 1 && da == 1 && ndb == 1 && c_statfs(".") == 0) { zr = 1; }
+    c_check(zr, "CWDX-ZFS-REL-READDIR-STATFS-OK", "ZFS-REL-READDIR", nd * 100 + da);
+    var r2 = c_chdir("deep/a/b");
+    var zd = 0;
+    if (r2 == 0 && c_cwd_is("/mnt/zfs/agnostank/deep/a/b") == 1 && c_holds("../../../hello.txt", "hello from zfs\n") == 1) { zd = 1; }
+    c_check(zd, "CWDX-ZFS-DOTDOT-IN-POOL-OK", "ZFS-DOTDOT-IN-POOL", r2);
+    var r3 = c_chdir("/mnt/zfs/somewhere/else");
+    var m = c_mkdir("cwdz");
+    var mm = c_mode("/mnt/zfs/somewhere/else/cwdz");          # the relative mkdir made it IN the pool
+    var rd = c_rmdir("cwdz");
+    var zm = 0;
+    if (r3 == 0 && m == 0 && mm == 0x4000 && rd == 0 && c_mode("/mnt/zfs/somewhere/else/cwdz") == 0 - 1) { zm = 1; }
+    c_check(zm, "CWDX-ZFS-REL-MKDIR-RMDIR-OK", "ZFS-REL-MKDIR-RMDIR", m * 100 + rd);
+    # across the mount boundary, both ways
+    c_chdir("/mnt/zfs/agnostank");
+    var x1 = c_size("../../../etc/secret.txt");
+    var r4 = c_chdir("../..");
+    var x2 = c_cwd_is("/mnt");
+    var x3 = c_holds("zfs/agnostank/hello.txt", "hello from zfs\n");
+    var r5 = c_chdir("zfs");
+    var x4 = c_cwd_is("/mnt/zfs");
+    var x5 = c_holds("agnostank/hello.txt", "hello from zfs\n");
+    var zx = 0;
+    if (x1 == 12 && r4 == 0 && x2 == 1 && x3 == 1 && r5 == 0 && x4 == 1 && x5 == 1) { zx = 1; }
+    c_check(zx, "CWDX-ZFS-ACROSS-MOUNT-OK", "ZFS-ACROSS-MOUNT", x1 * 100 + r4 * 10 + r5);
+    c_chdir("/");
+    return 0;
+}
+
+# ═════════════════════════════════════ G — FAT (the ESP) ═════════════════════════════════════
+fn ph_g() {
+    var r1 = c_chdir("/mnt/fat");
+    var r2 = c_chdir("EFI");
+    var x1 = c_cwd_is("/mnt/fat/EFI");
+    var fd = c_open("BOOT/BOOTX64.EFI", 0);
+    var mz = 0;
+    if (fd >= 0) {
+        if (syscall(5, fd, &c_rb, 2, 0) == 2) { if (load8(&c_rb) == 77 && load8(&c_rb + 1) == 90) { mz = 1; } }   # "MZ"
+        c_close(fd);
+    }
+    var r3 = c_chdir("BOOT/BOOTX64.EFI");
+    var x2 = c_cwd_is("/mnt/fat/EFI");
+    var fo = 0;
+    if (r1 == 0 && r2 == 0 && x1 == 1 && mz == 1 && r3 == 0 - 1 && x2 == 1) { fo = 1; }
+    c_check(fo, "CWDX-FAT-CHDIR-REL-OPEN-OK", "FAT-CHDIR", r1 * 1000 + r2 * 100 + fd);
+    c_chdir("/");
+    return 0;
+}
+
+# ═════════════════════════════════════ H — THE CWD REMOVED ═════════════════════════════════════
+fn ph_h() {
+    c_mkdir("/cwd/gone");
+    var r = c_chdir("/cwd/gone");
+    var p = c_put("x", "X");
+    var u = c_unlink("x");
+    var rd = c_rmdir("/cwd/gone");
+    var fd = c_open("y", 0x301);
+    if (fd >= 0) { c_close(fd); }
+    var st = c_stat(".");
+    var cw = c_cwd_is("/cwd/gone");
+    var up = c_chdir("..");
+    var ro = 0;
+    if (r == 0 && p == 0 && u == 0 && rd == 0 && fd < 0 && st == 0 - 1 && cw == 1 && up == 0 && c_cwd_is("/cwd") == 1) { ro = 1; }
+    c_check(ro, "CWDX-CWD-REMOVED-OK", "CWD-REMOVED", fd);
+    return 0;
+}
+
+# ═════════════════════════════════════ I — OVERLONG ═════════════════════════════════════
+fn ph_i() {
+    c_mkdir("/cwd/long");
+    c_chdir("/cwd/long");
+    var k = 0;
+    var bad = 0;
+    while (k < 16) {
+        var nm = c_fill(97 + k, 250);
+        if (c_mkdir(nm) != 0) { bad = 1; }
+        if (c_chdir(nm) != 0) { bad = 2; }
+        k = k + 1;
+    }
+    var g = c_getcwd(&c_gb, 4224);
+    store8(&c_gb, 90);
+    var g1 = c_getcwd(&c_gb, 4025);
+    var g2 = c_getcwd(&c_gb + 1, 4026);
+    var lc = 0;
+    if (bad == 0 && g == 4025 && g1 == 0 - 1 && load8(&c_gb) == 90 && g2 == 4025) { lc = 1; }
+    c_check(lc, "CWDX-LONG-CWD-GETCWD-OK", "LONG-CWD", bad * 100000 + g);
+    # 4025 + "/" + 69 = 4095: fits; one byte more is REFUSED, never cut to the 69-byte name that exists
+    var fd = c_open(c_fill(121, 69), 0x301);
+    if (fd >= 0) { c_close(fd); }
+    var fd2 = c_open(c_fill(121, 70), 0x301);
+    if (fd2 >= 0) { c_close(fd2); }
+    var st2 = c_stat(c_fill(121, 70));
+    var nd = c_readdir(".");
+    c_check(fd >= 0 && fd2 == 0 - 1 && st2 == 0 - 1 && nd == 1, "CWDX-LONG-NAME-REFUSED-NOT-CUT-OK", "LONG-NAME", fd2 * 100 + nd);
+    # a chdir past CWD_MAX is refused even though its 4095-byte cut names a real directory
+    var zd = c_mkdir(c_fill(122, 69));
+    var cd = c_chdir(c_fill(122, 80));
+    c_check(zd == 0 && cd == 0 - 1 && c_getcwd(&c_gb, 4224) == 4025, "CWDX-LONG-CHDIR-REFUSED-OK", "LONG-CHDIR", zd * 10 + cd);
+    # an INPUT of 4096+ bytes ("./" x 2050) is refused by length, whatever it would clean to
+    c_chdir("/cwd");
+    var i = 0;
+    while (i < 4100) { store8(&c_pb + i, 46); store8(&c_pb + i + 1, 47); i = i + 2; }
+    store8(&c_pb + 4100, 0);
+    var big = syscall(33, &c_pb, 4100, &c_st, 0);
+    var ok95 = syscall(33, &c_pb, 4094, &c_st, 0);           # 2047 x "./" cleans to the cwd itself: a directory
+    var li = 0;
+    if (big == 0 - 1 && ok95 == 0 && (load64(&c_st) & 0xF000) == 0x4000) { li = 1; }
+    c_check(li, "CWDX-LONG-INPUT-REFUSED-OK", "LONG-INPUT", big);
+    c_chdir("/");
+    return 0;
+}
+
+fn c_parent(): i64 {
+    c_out("CWDX-BEGIN"); c_nl();
+    ph_a();
+    ph_b();
+    ph_c();
+    ph_d();
+    ph_e();
+    ph_f();
+    ph_g();
+    ph_h();
+    ph_i();
+    c_out("CWDX-DONE pass="); c_num(C_PASS); c_out(" fail="); c_num(C_FAIL); c_nl();
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) {
+        var role = argv(1);
+        if (c_eq(role, "who") == 1) { return c_who(); }
+        if (c_eq(role, "loop") == 1) { return c_loop(); }
+        if (c_eq(role, "cdexit") == 1) {
+            if (argc() < 3) { return 20; }
+            if (c_chdir(argv(2)) != 0) { return 1; }
+            if (c_cwd_is(argv(2)) == 0) { return 2; }
+            return 0;
+        }
+        c_out("CWDX-CHILD-NO-ROLE"); c_nl();
+        return 99;
+    }
+    return c_parent();
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -64,6 +64,8 @@ fn room_say(slot) {
     if (slot == 9)  { serial_print("pcpu_sc_gpuop", 13); return 1; }
     if (slot == 10) { serial_print("lo_ring", 7); return 1; }
     if (slot == 11) { serial_print("exfat_upcase_buf", 16); return 1; }
+    if (slot == 12) { serial_print("proc_cwd_buf", 12); return 1; }
+    if (slot == 13) { serial_print("pcpu_sc_path", 12); return 1; }
     return 0;
 }
 
@@ -143,6 +145,8 @@ fn room_init() {
     room_take(&pcpu_sc_gpuop,       9, 16384);    # syscall.cyr — gpu_op#92 descriptor staging, 4 KB per CPU
     room_take(&lo_ring,            10, 12288);    # net.cyr — the loopback frame ring, 8 x 1536 B
     room_take(&exfat_upcase_buf,   11, 8192);     # exfat.cyr — the up-case table
+    room_take(&proc_cwd_buf,       12, 65536);    # proc.cyr — the working directories (chdir#112), 16 x 4096 B
+    room_take(&pcpu_sc_path,       13, 32768);    # syscall.cyr — the path ingress (sc_path_take), 2 x 4096 B per CPU
     if (room_used > 0x200000) {
         serial_println("PANIC: room: the moved arrays need more than the 2 MB carve-out -- halting", 74);
         arch_halt();

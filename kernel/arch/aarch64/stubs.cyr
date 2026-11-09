@@ -394,6 +394,9 @@ fn fb_print(buf, len) { return 0; }
 fn fb_println(buf, len) { return 0; }
 fn fb_oob_begin() { return 0; }
 fn fb_oob_end(did) { return 0; }
+fn fb_cursor_sync() { return 0; }     # 1.57.18: no cursor bar to draw, no escape parser to bracket
+fn fb_kern_begin() { return 0; }
+fn fb_kern_end() { return 0; }
 
 # FILESYSTEMS — ext2 / FAT / exFAT are never mounted here (no block driver: blk_* above refuse). vfs.cyr, klug.cyr's
 # spill, shell.cyr and init.cyr test the *_active flags first, as on an x86 box with no such volume, and the functions

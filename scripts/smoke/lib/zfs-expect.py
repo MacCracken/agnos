@@ -34,7 +34,8 @@
 # One op per line, single spaces, '#' starts a comment line. Paths are manifest paths (absolute under the import's
 # altroot, no whitespace — the manifest contract). Only ops that SUCCEED belong here: a refusal changes nothing.
 #   mkdir   PATH                       new empty directory
-#   create  PATH                       new empty regular file (AO_CREAT|AO_EXCL)
+#   create  PATH [MODE]                new empty regular file (AO_CREAT|AO_EXCL); MODE (1.57.18) the octal permission
+#                                      bits open#7's AO_MODE carried (0..7777, e.g. 0600) — default 0644
 #   write   PATH OFFSET LENGTH SEED    file bytes [OFFSET, OFFSET+LENGTH) := gen(SEED) bytes [OFFSET, OFFSET+LENGTH)
 #                                      (extends the file; a gap past the old EOF reads as zeros — a hole)
 #   zero    PATH OFFSET LENGTH         file bytes [OFFSET, OFFSET+LENGTH) := 0 (extends likewise)
@@ -109,6 +110,7 @@ class Inode:
         self.kind, self.data, self.size, self.sha, self.target = kind, data, size, sha, target
         self.parent = None          # the directory Inode the on-disk ZPL PARENT names (AMBIG: unknown, never judged)
         self.made = False           # (B7) created by the op list (--stat)
+        self.perm = None            # (1.57.18) a created file's permission bits (create PATH MODE); None = 0644
         self.xattrs = None          # [(name, len, sha256)] or None
 
 
@@ -272,9 +274,18 @@ def apply_ops(names, mounts, ops_path, orig):
         try:
             if op == "mkdir" and len(f) == 2:
                 fresh(f[1]); names[f[1]] = Inode("D"); names[f[1]].parent = names[parent(f[1])]; names[f[1]].made = True
-            elif op == "create" and len(f) == 2:
+            elif op == "create" and len(f) in (2, 3):
+                perm = None
+                if len(f) == 3:
+                    try:
+                        perm = int(f[2], 8)
+                    except ValueError:
+                        raise Fail("create MODE %r is not octal" % f[2])
+                    if not 0 <= perm <= 0o7777:
+                        raise Fail("create MODE %r is outside 0..7777" % f[2])
                 fresh(f[1]); names[f[1]] = Inode("F", data=bytearray()); names[f[1]].parent = names[parent(f[1])]
                 names[f[1]].made = True
+                names[f[1]].perm = perm
             elif op in ("write", "zero") and len(f) == (5 if op == "write" else 4):
                 ino = need(f[1], "F")
                 off, ln = num(f[2]), num(f[3])
@@ -361,7 +372,7 @@ def stat_lines(names, mounts):
         if ino.kind == "F":
             live = sum(1 for v in names.values() if v is ino)
             size = len(ino.data) if ino.data is not None else ino.size
-            out.append("%s 100644 %d %d" % (p, live, size))
+            out.append("%s %o %d %d" % (p, 0o100000 | (0o644 if ino.perm is None else ino.perm), live, size))
         elif ino.kind == "D":
             out.append("%s 40755 %d %d" % (p, 2 + subs.get(p, 0) + sum(1 for m in mounts if parent(m) == p and m not in names),
                                            2 + kids.get(p, 0)))

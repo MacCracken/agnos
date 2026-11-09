@@ -1,6 +1,13 @@
 # 2026-11-06 — there is no readiness wait on one fd, so a client cannot run a deadline of its own
 
-**Status:** 🔴 OPEN.
+**Status:** ✅ **RESOLVED in agnos 1.57.18** (2026-11-08, both halves). **`epoll_wait`#21 watches `#97` channel endpoints**
+(EPOLLIN = inbox non-empty or peer gone; EPOLLOUT = the peer's inbox has room; peer gone = IN | OUT | HUP; authority
+re-derived on every pass, so an inherited claim cannot be watched) — one watch on a kept instance with `EPW_TIMED` is the
+readiness wait on one fd with a deadline in ms that consumes nothing, for channels, sockets, signalfd and timerfd. The
+cyrius `fd_wait_ready` on it is filed (`cyrius/docs/development/issues/2026-11-08-agnos-fd-wait-ready-and-sock-connect-deadline.md`).
+The Related ask: **`sock_connect`#47 `SC_TIMED`** (a3 bit 32; then a4 = ms) bounds the connect at min(a4, ~8 s) measured
+once from entry, and a4 = 0 is a non-blocking connect finished by `EPOLLOUT` on `EP_TCP | id` (measured: a 1.5 s deadline
+returns at +2.6–9.9 ms past it). Gate `scripts/smoke/pty-backpressure-smoke.sh`. ABI rows 20, 21, 47.
 *(Filed from thoth **0.55.1**. It also holds thoth's F8 gate, the AGNOS window.)*
 **Checked against:** agnos **107ad763** (1.57.17) and cyrius **6.7.18**, whose `fd_wait_ready` answers -38 on agnos ("agnos has no poll").
 **Severity:** medium. A turn can sit far past its deadline, and a surface cannot wait on a channel without spinning.

@@ -149,7 +149,9 @@ def ops_from_list(path, t0):
             if not f or f[0].startswith("#"):
                 continue
             n, txg = n + 1, txg + 1
-            if f[0] in MODES or f[0] in ("write", "zero", "trunc", "unlink", "rmdir"):
+            if f[0] == "create" and len(f) == 3:
+                out.append(("create", f[1], int(f[2], 8), n, txg, False, None))   # (1.57.18) create PATH MODE: AO_MODE
+            elif f[0] in MODES or f[0] in ("write", "zero", "trunc", "unlink", "rmdir"):
                 out.append(("write" if f[0] == "zero" else f[0], f[1], None, n, txg, f[0] == "trunc", None))
             elif f[0] in ("rename", "link"):
                 out.append((f[0], f[1], f[2], n, txg, False, None))
@@ -307,6 +309,7 @@ class Obj:
         self.written = self.z0 = False
         self.gone = None                    # (clock step, 'freed' | 'dq', its number or None)
         self.touched = False
+        self.perm = None                    # (1.57.18) a create's AO_MODE permission bits (create PATH MODE); None: 0644
 
 
 def main(argv):
@@ -367,6 +370,10 @@ def main(argv):
         print("sa: %s — B6: %d created object(s) (dnode, layout, every SA value, ACL; %d held to a FreeBSD twin; %d in a "
               "NEW SA layout, B8), %d pre-existing parent(s) (SIZE, LINKS, MTIME, CTIME, FLAGS, the rest unchanged)"
               % (v, st["made"], st["twins"], st.get("newlays", 0), st["parents"]))
+        if st.get("twinless"):
+            print("sa: %s — 1.57.18: %d AO_MODE create(s) of a mode the fixture holds no FreeBSD object of: MODE and the ACL "
+                  "held to acl_trivial_access_masks here, to OpenZFS's stat(1) and a guest-made twin in the verify (B-stat, "
+                  "B-acl)" % (v, st["twinless"]))
     if st["ns"]:
         print("sa: %s — B7: %d unlink / rmdir / rename / link op(s): %d object(s) freed (the slot zeroed, or its number "
               "reused by a create), %d on a DELETE_QUEUE (LINKS 0, the queue's entry), %d other object(s) relinked / moved "
@@ -459,6 +466,7 @@ def ns_checks(z, fin, sta, fh, sh, clock, mounts, sizes, targets, objs, events, 
             name, _rel = ds_of(a)
             o = Obj(name, made=(kind, n, txg))
             o.isdir = kind == "mkdir"
+            o.perm = b if kind == "create" and isinstance(b, int) else None
             o.mt = o.ct = n
             o.touched = True
             o.par = cur.get(parent(a))
@@ -660,6 +668,8 @@ def made_check(z, F, S, num, o, paths, cur, final_num, clock, sizes, targets, st
     if sa.blen != sa.end:
         bad.append("bonus length %d, the last attribute ends at %d" % (sa.blen, sa.end))
     mode = MODES[kind]
+    if o.perm is not None:
+        mode = 0o100000 | o.perm                      # (1.57.18) open#7's AO_MODE: S_IFREG | the bits as given (no umask)
     par = final_num(o.par) if o.par is not None else None
     psa = F.sa(par) if par is not None and par in F.dn else None
     if kind == "create":
@@ -727,7 +737,13 @@ def made_check(z, F, S, num, o, paths, cur, final_num, clock, sizes, targets, st
             if twin is not None:
                 TS, tds = Sd, nm
                 break
-    if twin is None:
+    if twin is None and o.perm is not None:
+        # (1.57.18) an AO_MODE create of a mode no FreeBSD object in the fixture has (it holds 0644 / 0755 files only): the
+        # ACL above is held to acl_trivial_access_masks + zfs_acl_chmod's order (aces(), from their C), the MODE to
+        # OpenZFS's own stat(1) in the verify's B-stat, and the ACL to a twin FreeBSD makes in the guest, B-acl's
+        # fallback (zfs-fixture-guest.sh) — never silently: counted on the summary line
+        st["twinless"] = st.get("twinless", 0) + 1
+    elif twin is None:
         bad.append("no FreeBSD twin (type %d, mode %o) in %s or any dataset of the pool to compare with" % (want_ty, mode, o.ds))
     else:
         st["twins"] += 1

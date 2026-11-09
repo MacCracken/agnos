@@ -316,14 +316,22 @@ fn blk_write_on(tag, sector, buf) {
 # cache, not just the FS s_state bit. 1.33.5 fsync barrier
 # (flush-cache-prior-art.md § 3). Same registered-bit gate as the R/W
 # dispatchers. Returns 0 on success, -1 on failure.
+# 1.57.18: the FLUSHES each backend completed (indexed by the raw BLK_* tag, slot 0 unused — blk_writes_by_tag's shape),
+# counted here so a selftest can prove a sync path issued one (fs_syscall_selftest's fsync#115 block); no syscall reads
+# it. A racy increment: diagnostic, like blk_writes_by_tag.
+var blk_flushes_by_tag[6];
 fn blk_flush_on(tag) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
-    if (tag == BLK_VIRTIO)  { return vblk_blk_flush(); }
-    if (tag == BLK_NVME)    { return nvme_blk_flush(); }
-    if (tag == BLK_AHCI)    { return ahci_blk_flush(); }
-    if (tag == BLK_USB_MS)  { return msc_blk_flush(); }
-    if (tag == BLK_RAMDISK) { return ramdisk_blk_flush(); }
-    return 0 - 1;
+    var bf = 0 - 1;
+    if (tag == BLK_VIRTIO)  { bf = vblk_blk_flush(); }
+    if (tag == BLK_NVME)    { bf = nvme_blk_flush(); }
+    if (tag == BLK_AHCI)    { bf = ahci_blk_flush(); }
+    if (tag == BLK_USB_MS)  { bf = msc_blk_flush(); }
+    if (tag == BLK_RAMDISK) { bf = ramdisk_blk_flush(); }
+    if (bf == 0) {
+        if (tag >= 1) { if (tag <= 5) { store64(&blk_flushes_by_tag + tag * 8, load64(&blk_flushes_by_tag + tag * 8) + 1); } }
+    }
+    return bf;
 }
 
 fn blk_flush() {

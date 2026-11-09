@@ -15,7 +15,8 @@
 #                 selector other than 0 / 1 is -6.
 #   display       that far end endowed in DISPLAY mode: the child's GET (grid and pixels) is -1 although a size was
 #                 set on it; the child's SET is -5 (its peer is the driver's end, not a terminal); after the
-#                 endowment the driver's SET is -5 too (its peer is the child's display end).
+#                 endowment the driver's SET is -5 too (its peer is the child's display end — the child waits on a go
+#                 byte until that SET is done, so the SET never meets a released end: 1.57.18).
 #   pty-get       a PTY endowment: the child's GET before any SET is -1; the driver SETs 100x30 (800x480 px); the
 #                 child reads (100<<16)|30 on fd 0, 1 and 2 and (800<<16)|480 with selector 1; its own SET on fd 0 is
 #                 -5 (the terminal does not size itself); a GRANDCHILD (a PTY descendant) reads the same size and its
@@ -171,9 +172,13 @@ fn t_line(head, k, v) {
 }
 
 # ── child roles ──
-# disp <tfd>: holds a DISPLAY endowment at tfd (its stdio is the console). Exit bits: 1 GET grid -1 · 2 GET px -1 ·
-# 4 SET -5. Good = 7.
-fn c_disp(tfd) {
+# disp <tfd> <go_r>: holds a DISPLAY endowment at tfd (its stdio is the console). Exit bits: 1 GET grid -1 · 2 GET px
+# -1 · 4 SET -5. Good = 7.
+# ⛔ 1.57.18: it then WAITS for a go byte on go_r before it exits, so the driver's own SET on its end (expected -5: the
+# peer is this child's display end) runs while this child is PROVABLY ALIVE. Without the wait the child could finish and
+# exit first — its endpoint released, the driver's SET answering -9 PEERGONE — which a fast console made the usual order
+# (measured on the 1.57.18 console: `PTYW-CHILD disp` printed, then `set_after_endow=-9`, 2 of 2 runs at -smp 4).
+fn c_disp(tfd, gor) {
     var g = wget(tfd, 0);
     var gp = wget(tfd, 1);
     var s = wset(tfd, pk(50, 20));
@@ -182,6 +187,7 @@ fn c_disp(tfd) {
     if (g == (0 - 1)) { bits = bits | 1; }
     if (gp == (0 - 1)) { bits = bits | 2; }
     if (s == (0 - E_BADFD)) { bits = bits | 4; }
+    byte_in(gor);                                                # alive until the driver's SET is done
     return bits;
 }
 # ptygc: a grandchild inside the terminal (fd 0..2 inherited from its parent, the endpoint's owner). Exit bits:
@@ -340,7 +346,7 @@ fn child(): i64 {
     if (argc() > 3) { b = pw_atoi(argv(3)); }
     if (argc() > 4) { c = pw_atoi(argv(4)); }
     if (argc() > 5) { d = pw_atoi(argv(5)); }
-    if (eq(role, "disp") == 1) { return c_disp(a); }
+    if (eq(role, "disp") == 1) { return c_disp(a, b); }
     if (eq(role, "ptyget") == 1) { return c_ptyget(); }
     if (eq(role, "ptygc") == 1) { return c_ptygc(); }
     if (eq(role, "winw") == 1) { return c_winw(a, b, c, d); }
@@ -387,12 +393,19 @@ fn ph_notterm_display() {
     o_kv("fdm1", r1); o_kv("fd32", r2); o_kv("console", r3); o_kv("pipe", r4); o_kv("set_pipe", r5);
     o_kv("closed", r6); o_kv("own_a", r7); o_kv("own_b", r8); o_kv("set_c0", r9); o_kv("set_r0", r10);
     o_kv("set_pre_endow", r11); o_kv("sized_not_tty", r12); o_kv("sel2", r13); o_out("\n");
-    # display: fb endowed in DISPLAY mode (a4 = 0).
+    # display: fb endowed in DISPLAY mode (a4 = 0). ⛔ The go pipe is made BEFORE CH_ENDOW: the endowment announces the
+    # first free fd >= 3 at arm time, and a pipe opened between arm and spawn would take that slot (placement REFUSED).
+    syscall(25, &pw_fds, 0, 0, 0);
+    var dgr = load64(&pw_fds); var dgw = load64(&pw_fds + 8);
     var tfd = ch_endow(fb, 0);
-    var pid = spawn4("disp", tfd, 0, 0, 0);
-    var d4 = wset(fa, pk(100, 30));                              # the peer is now the child's display end
+    var pid = spawn4("disp", tfd, dgr, 0, 0);
+    # The child waits on dgr until the go byte below, so it is ALIVE here: the peer is its display end (-5), never a
+    # released one (-9 PEERGONE).
+    var d4 = wset(fa, pk(100, 30));
+    byte_out(dgw, 1);
     var st = 0 - 1;
     if (pid >= 0) { st = reap(pid); }
+    cls(dgr); cls(dgw);
     ch_close(fa);
     verdict(tfd >= 3 && pid >= 0 && st == 7 && d4 == (0 - E_BADFD), "display");
     o_kv("tfd", tfd); o_kv("pid", pid); o_kv("child_bits", st); o_kv("set_after_endow", d4); o_out("\n");

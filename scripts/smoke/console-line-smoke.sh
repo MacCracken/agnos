@@ -58,7 +58,8 @@ if [ "$rc" = "0" ]; then
     exit 0
 fi
 if [ "$rc" = "1" ]; then
-    echo "console-line-smoke: FAILED -- a kernel log altered the line being typed at the prompt"
+    # 1.57.18: the harness also fails when no cursor is drawn after the virgin prompt (the bar is the one cell it excludes)
+    echo "console-line-smoke: FAILED -- a kernel log altered the line being typed at the prompt, or no cursor was drawn after it"
     exit 1
 fi
 echo "console-line-smoke: INCONCLUSIVE (rc=$rc) -- the property was never exercised; treating as failure"

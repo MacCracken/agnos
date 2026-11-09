@@ -2317,17 +2317,67 @@ fn ext2_print_dir(dir_inode_num) {
     return count;
 }
 
+# ⭐ 1.57.18 — ONE WRITER FOR EVERY readdir#81 / readdir_at#101 RECORD (ext2's two and zfs_readdir_at), so the
+# three sites cannot drift (issue 2026-11-08-readdir-cuts-a-long-name-and-says-nothing). A record is 64 bytes:
+#   +0..   the name, NUL-terminated — at most RD_NAME_MAX = 62 bytes
+#   +63    flags: bit 0 RD_DIR (a directory) · bit 1 RD_CUT (the name was LONGER than 62 bytes and was cut)
+# Until 1.57.18 a cut said nothing, so a 70-byte name listed exactly as its 62-byte sibling did and crab's Delete
+# removed the sibling. Length is no clue: 62 bytes is a legal name. Only the kernel knows, so the kernel says.
+# ⭐ THE CUT ENDS ON A UTF-8 CHARACTER BOUNDARY (RFC 3629 § 3: a character is 1-4 bytes, every byte after the first
+# is 10xxxxxx). When the first byte DROPPED is a continuation byte, the cut is inside a character, so it backs off
+# over continuation bytes — at most 3 (the longest a valid sequence leaves) — and a cut valid UTF-8 name stays
+# valid UTF-8 (59..62 bytes). A name that is not UTF-8 is still cut at 59..62. The whole name is getdents#29's.
+enum RdRec {
+    RD_NAME_MAX = 62;
+    RD_DIR      = 1;
+    RD_CUT      = 2;
+}
+# The bytes of a name of nl bytes at name that a record keeps: nl itself when nl <= 62, else the cut.
+fn rd_name_keep(name, nl) {
+    if (nl <= RD_NAME_MAX) { return nl; }
+    var n = RD_NAME_MAX;
+    var back = 0;
+    while (back < 3 && (load8(name + n) & 0xC0) == 0x80) {
+        n = n - 1;
+        back = back + 1;
+    }
+    return n;
+}
+# Write the record at rec for the name of nl bytes at name (isdir 1 / 0). Returns 0.
+fn rd_rec_put(rec, name, nl, isdir) {
+    var n = rd_name_keep(name, nl);
+    var k = 0;
+    while (k < n) { store8(rec + k, load8(name + k)); k = k + 1; }
+    store8(rec + n, 0);                                # NUL-terminate the name
+    var fl = 0;
+    if (isdir == 1) { fl = RD_DIR; }
+    if (n < nl) { fl = fl | RD_CUT; }
+    store8(rec + 63, fl);
+    return 0;
+}
+
 # ext2_readdir_sys(path, buf, max_entries) — the readdir(#81) backend. Resolves `path`
 # (a user NUL-terminated cstring) to a directory inode and writes up to max_entries FIXED
-# 64-byte records to the user buffer `buf`: bytes 0..62 = entry name (NUL-terminated,
-# truncated to 62), byte 63 = type (1 = directory, 0 = file). Skips "." and "..". Same
+# 64-byte records to the user buffer `buf` (rd_rec_put: the name, NUL-terminated, cut to at
+# most 62 bytes on a UTF-8 boundary; byte 63 = RD_DIR | RD_CUT). Skips "." and "..". Same
 # dirent-walk shape as ext2_print_dir, but copies to a ring-3 buffer instead of printing.
 # Returns the entry count (>= 0), or a negative error (-1 bad ptr / not ext2, -2 path not
 # found, -4 not a directory). The caller (a ring-3 program) reads records at buf + i*64.
+# ⛔ 1.57.18: under fs_lock (ext2_readdir_sys_locked). #81 and #101 walked the shared ext2 scratch
+# (ext2_inode_buf, ext2_dir_buf) with NO lock since they shipped — the 1.46.x SMP sub-bite that locked
+# every other ext2 path arm missed both — so a listing on one CPU could rewrite ext2_inode_buf under
+# another CPU's locked create, which then wrote the directory's inode image over its new file's.
 fn ext2_readdir_sys(path, buf, max_entries) {
+    fs_spin_lock();
+    var r = ext2_readdir_sys_locked(path, buf, max_entries);
+    fs_spin_unlock();
+    return r;
+}
+fn ext2_readdir_sys_locked(path, buf, max_entries) {
     if (ext2_active == 0) { return 0 - 1; }
     if (max_entries <= 0) { return 0; }
-    if (is_user_range(path, 256) == 0) { return 0 - 1; }
+    # 1.57.18: `path` is the #81 arm's KERNEL copy (syscall.cyr sc_cpath_take — validated, NUL-terminated, a relative one
+    # resolved from the cwd: up to CWD_MAX bytes), no longer the user's 256-byte window.
     # ⛔ 1.56.51 SECURITY FIX. Was `is_user_range(buf, max_entries * 64)`. `max_entries` is arg3 of
     # #81, entirely ring-3 chosen and checked only for `<= 0`, so the multiply wrapped before the
     # validator ever saw it: 2^58 * 64 == 2^64 == 0, and is_user_range(buf, 0) passes. The record
@@ -2335,9 +2385,9 @@ fn ext2_readdir_sys(path, buf, max_entries) {
     # 64-byte records at buf + count*64 past the 0x40000000 ceiling — with ring-3-chosen contents,
     # since the names come from a directory the caller can create. See is_user_array in syscall.cyr.
     if (is_user_array(buf, max_entries, 64) == 0) { return 0 - 1; }
-    # bounded strlen of the user path
+    # bounded strlen of the kernel copy (NUL-terminated by sc_cpath_take within CWD_MAX)
     var path_len = 0; var pdone = 0;
-    while ((path_len < 255) && (pdone == 0)) {
+    while ((path_len < CWD_MAX) && (pdone == 0)) {
         if (load8(path + path_len) == 0) { pdone = 1; } else { path_len = path_len + 1; }
     }
     var dir_ino = ext2_path_lookup(path, path_len);
@@ -2373,15 +2423,9 @@ fn ext2_readdir_sys(path, buf, max_entries) {
                 if (name_len == 2) { if (load8(d + 8) == 46) { if (load8(d + 9) == 46) { skip = 1; } } }
                 if (skip == 0) {
                     if (count < max_entries) {
-                        var rec = buf + count * 64;
-                        var n = name_len;
-                        if (n > 62) { n = 62; }
-                        var k = 0;
-                        while (k < n) { store8(rec + k, load8(d + 8 + k)); k = k + 1; }
-                        store8(rec + n, 0);                    # NUL-terminate the name
                         var t = 0;
                         if (ftype == 2) { t = 1; }             # EXT2_FT_DIR
-                        store8(rec + 63, t);
+                        rd_rec_put(buf + count * 64, d + 8, name_len, t);
                         count = count + 1;
                     }
                 }
@@ -2410,14 +2454,44 @@ fn ext2_readdir_sys(path, buf, max_entries) {
 # returns 0, so a loop that overruns by one is harmless rather than an infinite restart from the top.
 #
 # ⛔ THE CURSOR IS USER DATA AND IS VALIDATED AS SUCH. It is rejected unless it is 4-byte aligned
-# (ext2 records always are) and inside the directory; a misaligned or out-of-range value would parse
-# a record header out of the middle of a filename. `ext2_dirent_valid` still bounds every record to
-# its block, so the worst a *valid-looking* wrong offset can do is yield nonsense names — never a
-# read outside `ext2_dir_buf`.
+# (ext2 records always are); one at or past the end of the directory is exhausted (0, cursor -1).
+# ⭐ 1.57.18: an aligned cursor that is not a record boundary — inside a header or a name — is SNAPPED to
+# the first boundary at or after it (ext2_dir_snap, Linux ext2_validate_entry), so it can no longer parse a
+# record header out of the middle of a filename and list a nonsense name, which it did until 1.57.18
+# (`ext2_dirent_valid` only kept such a read inside `ext2_dir_buf`).
+# ⛔ 1.57.18: under fs_lock — see ext2_readdir_sys.
 fn ext2_readdir_at_sys(path, buf, max_entries, cursor_uva) {
+    fs_spin_lock();
+    var r = ext2_readdir_at_sys_locked(path, buf, max_entries, cursor_uva);
+    fs_spin_unlock();
+    return r;
+}
+
+# ⭐ 1.57.18 — A RING-3 DIRECTORY POSITION SNAPPED TO A RECORD BOUNDARY: Linux fs/ext2/dir.c
+# ext2_validate_entry. `within` is a byte offset into the block in ext2_dir_buf; the block's record chain is
+# walked FROM ITS START and the first boundary at or after `within` returned (ext2_blocksize: none left in
+# this block, or the chain is corrupt before it — the caller's own ext2_dirent_valid walk stops at the same
+# record, so a corrupt block is skipped either way). Records never straddle blocks, so a block start is
+# always a boundary and a position can only be wrong WITHIN its block. Linux re-validates when the
+# directory's i_version moved since the fd's last read (an lseek resets f_version); agnos keeps no
+# i_version, so every getdents#29 / readdir_at#101 call that starts mid-block re-validates — one header
+# walk of a block the call reads anyway. That also covers a boundary that a delete merged away (ext2
+# folds a removed record into its predecessor's rec_len) between two calls.
+fn ext2_dir_snap(within) {
+    if (within <= 0) { return 0; }
+    var p = 0;
+    while (p < within) {
+        var rl = ext2_load16_le(&ext2_dir_buf + p, 4);
+        if (ext2_dirent_valid(p, rl, load8(&ext2_dir_buf + p + 6)) == 0) { return ext2_blocksize; }
+        p = p + rl;
+    }
+    return p;
+}
+
+fn ext2_readdir_at_sys_locked(path, buf, max_entries, cursor_uva) {
     if (ext2_active == 0) { return 0 - 1; }
     if (max_entries <= 0) { return 0; }
-    if (is_user_range(path, 256) == 0) { return 0 - 1; }
+    # 1.57.18: `path` is the #101 arm's KERNEL copy (sc_cpath_take), as for #81 above.
     # ⛔ 1.56.51 SECURITY FIX — the same wrap as #81 above, inherited when this arm was written
     # against #81's preamble as its model. Sharper here: #101 also writes through `cursor_uva`, so a
     # caller who survives the overflow gets both the record spray and a controlled 8-byte store.
@@ -2425,9 +2499,9 @@ fn ext2_readdir_at_sys(path, buf, max_entries, cursor_uva) {
     if (is_user_range(cursor_uva, 8) == 0) { return 0 - 1; }
     var start = load64(cursor_uva);
     if (start < 0) { return 0; }                        # already exhausted — a no-op, not a restart
-    # bounded strlen of the user path
+    # bounded strlen of the kernel copy (NUL-terminated by sc_cpath_take within CWD_MAX)
     var path_len = 0; var pdone = 0;
-    while ((path_len < 255) && (pdone == 0)) {
+    while ((path_len < CWD_MAX) && (pdone == 0)) {
         if (load8(path + path_len) == 0) { pdone = 1; } else { path_len = path_len + 1; }
     }
     var dir_ino = ext2_path_lookup(path, path_len);
@@ -2454,6 +2528,7 @@ fn ext2_readdir_at_sys(path, buf, max_entries, cursor_uva) {
         if (ext2_read_block(phys, &ext2_dir_buf) != 0) { store64(cursor_uva, pos); return count; }
 
         var off = pos - blkbase;                        # ⭐ resume MID-BLOCK, not at its start
+        if (off > 0) { off = ext2_dir_snap(off); }      # 1.57.18: on a record boundary (Linux ext2_validate_entry)
         while (off < ext2_blocksize) {
             # ⛔ THE BUDGET IS CHECKED BEFORE THE RECORD IS CONSUMED, and the cursor is parked ON the
             # record we did not take. Checking after would drop exactly one entry per batch — a bug
@@ -2470,15 +2545,9 @@ fn ext2_readdir_at_sys(path, buf, max_entries, cursor_uva) {
                 if (name_len == 1) { if (load8(d + 8) == 46) { skip = 1; } }
                 if (name_len == 2) { if (load8(d + 8) == 46) { if (load8(d + 9) == 46) { skip = 1; } } }
                 if (skip == 0) {
-                    var rec = buf + count * 64;
-                    var n = name_len;
-                    if (n > 62) { n = 62; }
-                    var k = 0;
-                    while (k < n) { store8(rec + k, load8(d + 8 + k)); k = k + 1; }
-                    store8(rec + n, 0);                 # NUL-terminate the name
                     var t = 0;
                     if (ftype == 2) { t = 1; }          # EXT2_FT_DIR
-                    store8(rec + 63, t);
+                    rd_rec_put(buf + count * 64, d + 8, name_len, t);
                     count = count + 1;
                 }
             }
@@ -2754,7 +2823,15 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
 # Create a regular file `name` (0644) in directory `dir_ino`. Returns the
 # new inode number (>0) or -1. Order (doc § 3): alloc inode (bitmap+count)
 # → init inode → insert dirent; rolls back the inode if the dirent fails.
-fn ext2_create(dir_ino, name, name_len) {
+fn ext2_create(dir_ino, name, name_len) { return ext2_create_m(dir_ino, name, name_len, 0x1A4); }
+# ⭐ 1.57.18 — the same create with the PERMISSION BITS perm (0..07777: rwx for owner / group / other, plus S_ISUID
+# 04000, S_ISGID 02000, S_ISVTX 01000) — open#7's AO_MODE (ABI § 3.3; issue 2026-11-06-open-has-no-create-mode). The
+# inode's i_mode is S_IFREG | perm, exactly as given: agnos has no umask, and every process is uid 0, the caller Linux's
+# inode_init_owner lets keep S_ISGID (it strips it only for a non-member of the group without CAP_FSETID). Linux
+# ext2_create -> ext2_new_inode(dir, mode) takes the mode open(2) carried the same way. Only a NEW inode gets perm: an
+# existing name is returned untouched (below), so open(AO_CREAT | AO_MODE) of an existing file keeps its mode, as POSIX
+# open does. Callers range-check perm (sc_open_mode); the mask here is the belt.
+fn ext2_create_m(dir_ino, name, name_len, perm) {
     if (ext2_write_ok == 0) { return 0 - 1; }
     # Duplicate-dirent guard (the 1409 e2fsck finding). ext2_link/ext2_rename
     # already refuse an existing name; ext2_create did NOT — so re-creating the
@@ -2770,7 +2847,7 @@ fn ext2_create(dir_ino, name, name_len) {
 
     var z = 0;
     while (z < ext2_inode_size) { store8(&ext2_inode_buf + z, 0); z = z + 1; }
-    ext2_inode_set_mode(&ext2_inode_buf, 0x81A4);          # S_IFREG | 0644
+    ext2_inode_set_mode(&ext2_inode_buf, 0x8000 | (perm & 0xFFF));   # S_IFREG | perm (0644 for ext2_create)
     ext2_inode_set_links_count(&ext2_inode_buf, 1);
     ext2_stamp_new(&ext2_inode_buf);                       # atime/ctime/mtime — or the buffer stays zeroed
     if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { ext2_free_inode(ino, 0); return 0 - 1; }
@@ -3587,18 +3664,37 @@ var ext2_symres_work[512];    # rewritable path being resolved
 var ext2_symres_tmp[512];     # scratch to assemble <target> + <remainder>
 var ext2_symres_inode[64];    # symlink inode scratch (kept off ext2_inode_buf)
 
-# Read a symlink target into `out` (cap bytes); returns length or -1.
-# Fast symlinks (i_blocks == 0) inline the target in the i_block area at
-# inode offset 40; slow symlinks store it in the first data block, mapped
-# extent/indirect-aware via ext2_logical_to_physical (Linux ext4 slow
-# symlinks on an extent FS are extent-mapped — reading i_block[0] as a raw
-# pointer would corrupt). Mirrors ext2_symlink's create-side format split.
-fn ext2_readlink(inode_num, out, cap) {
+# Read a symlink target into `out` (cap bytes). Fast symlinks (i_blocks == 0) inline the target in
+# the i_block area at inode offset 40; slow symlinks store it in the first data block, mapped
+# extent/indirect-aware via ext2_logical_to_physical (Linux ext4 slow symlinks on an extent FS are
+# extent-mapped — reading i_block[0] as a raw pointer would corrupt). Mirrors ext2_symlink's
+# create-side format split.
+#
+# ⭐ 1.57.18 — TWO CONTRACTS, ONE CORE (issue 2026-11-06-readlink-refuses-a-buffer-shorter-than-the-target).
+#   ext2_readlink(ino, out, cap)        readlink#70's: copies AT MOST cap bytes and returns how many it
+#                                       copied — Linux readlink_copy (fs/namei.c), FreeBSD kern_readlinkat
+#                                       (count - uio_resid). Until 1.57.18 a target longer than cap was -1,
+#                                       so cyrius's is_symlink (an 8-byte probe that tests only for success)
+#                                       read every link with a target over 8 bytes as "not a link", and a
+#                                       jail built on it passed `link-out -> /etc/secret.txt` (thoth 0.55.1).
+#   ext2_readlink_whole(ino, out, cap)  THE KERNEL FOLLOWER'S: the whole target or -1 — never a prefix. A
+#                                       path walk that followed a truncated target would resolve a DIFFERENT
+#                                       path than the link names (FreeBSD's namei reads into a MAXPATHLEN
+#                                       buffer and refuses linklen + remainder > MAXPATHLEN for the same
+#                                       reason; Linux's walk never reads a link into a caller buffer at all).
+#                                       ⛔ Every in-kernel caller that FOLLOWS a link uses this one.
+# The target's length is bounded by the FORMAT in both: a fast target fits the 60-byte i_block area and
+# a slow one its single data block (ext2_symlink writes exactly one; Linux ext4_get_link reads exactly
+# one, nd_terminate_link(bh->b_data, i_size, s_blocksize - 1)). A larger i_size is a corrupt inode: -1.
+fn ext2_readlink_core(inode_num, out, cap, whole) {
+    if (cap < 1) { return 0 - 1; }                 # Linux readlink: EINVAL for bufsiz <= 0
     if (ext2_get_inode(inode_num, &ext2_symres_inode) != 0) { return 0 - 1; }
     if ((ext2_inode_mode(&ext2_symres_inode) & 0xF000) != 0xA000) { return 0 - 1; }
     var tlen = ext2_inode_filesize(&ext2_symres_inode);
     if (tlen < 1)   { return 0 - 1; }
-    if (tlen > cap) { return 0 - 1; }
+    if (whole == 1 && tlen > cap) { return 0 - 1; }
+    var n = tlen;
+    if (n > cap) { n = cap; }
     if (ext2_inode_blocks_lo(&ext2_symres_inode) == 0) {
         # FAST: target inline at inode offset 40
         # ⛔ 1.56.51 SECURITY FIX. `tlen` is i_size straight off the DISK and the only gates above are
@@ -3611,17 +3707,25 @@ fn ext2_readlink(inode_num, out, cap) {
         # (Linux applies the same rule in ext4_inode_is_fast_symlink: i_size < EXT4_N_BLOCKS * 4.)
         if (tlen > 60) { return 0 - 1; }
         var k = 0;
-        while (k < tlen) { store8(out + k, load8(&ext2_symres_inode + 40 + k)); k = k + 1; }
-        return tlen;
+        while (k < n) { store8(out + k, load8(&ext2_symres_inode + 40 + k)); k = k + 1; }
+        return n;
     }
     # SLOW: target in the first data block (direct or extent-mapped)
+    # ⛔ 1.57.18 SECURITY FIX — THE SAME HOLE AS 1.56.51, ON THE SLOW SIDE. A slow target is copied out of
+    # `ext2_block_buf` (4096 bytes: ONE block) and was bounded only by `tlen > cap`, the CALLER's buffer.
+    # readlink#70's cap is ring 3's buffer length, so a crafted slow inode with i_size = 100000 and a
+    # 100000-byte user buffer copied ~96 KB of kernel BSS past ext2_block_buf to ring 3. Truncating to cap
+    # would have kept that hole wide open. The bound is the format's: one block.
+    if (tlen > ext2_blocksize) { return 0 - 1; }
     var phys = ext2_logical_to_physical(&ext2_symres_inode, 0);
     if (phys <= 0) { return 0 - 1; }
     if (ext2_read_block(phys, &ext2_block_buf) != 0) { return 0 - 1; }
     var j = 0;
-    while (j < tlen) { store8(out + j, load8(&ext2_block_buf + j)); j = j + 1; }
-    return tlen;
+    while (j < n) { store8(out + j, load8(&ext2_block_buf + j)); j = j + 1; }
+    return n;
 }
+fn ext2_readlink(inode_num, out, cap) { return ext2_readlink_core(inode_num, out, cap, 0); }
+fn ext2_readlink_whole(inode_num, out, cap) { return ext2_readlink_core(inode_num, out, cap, 1); }
 
 # --- Path lookup (Phase 3) --------------------------------------------
 #
@@ -3728,7 +3832,9 @@ fn ext2_path_lookup_ex(path, path_len, follow_last) {
             nfollow = nfollow + 1;
             if (nfollow > 8) { return 0 - 1; }   # ELOOP
 
-            var tlen = ext2_readlink(next_inode, &ext2_symres_tmp, 4096);
+            # ⛔ 1.57.18: the WHOLE target or -1 (ext2_readlink_whole) — readlink#70's ext2_readlink now
+            # truncates to its cap, and a walk that followed a cut target would resolve another path.
+            var tlen = ext2_readlink_whole(next_inode, &ext2_symres_tmp, 4096);
             if (tlen < 1) { return 0 - 1; }
 
             # Append the unparsed remainder (work[i..wl), includes its leading
@@ -3835,9 +3941,16 @@ fn ext2_gd_type(ft) {
 # pad to 8) into the user buffer `ubuf` (at most `ubufsize` bytes). Returns
 # bytes written (0 at end of dir, -1 on error); sets ext2_gd_next to the
 # offset the next call resumes from. (1.41.3 getdents(29) backend.)
+# ⭐ 1.57.18: `start_off` is the fd's position, which lseek#58 now lets ring 3 set (a VFS_EXT2_DIR cookie,
+# telldir/seekdir), so it is UNTRUSTED: negative is refused, and a mid-block offset is snapped to the first
+# record boundary at or after it (ext2_dir_snap, Linux ext2_validate_entry) before a header is parsed.
+# ⛔ 1.57.18: a buffer too small for the NEXT record answers -1 (Linux getdents64: EINVAL) with the position
+# unchanged. It answered 0 — end of directory — so a caller with a short buffer stopped at the first long
+# name and believed it had listed everything: the silent short listing readdir#81's cut was filed for.
 var ext2_gd_next = 0;
 fn ext2_getdents(dir_ino, start_off, ubuf, ubufsize) {
     ext2_gd_next = start_off;
+    if (start_off < 0) { return 0 - 1; }
     if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
     if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }
     var dir_size = ext2_inode_filesize(&ext2_inode_buf);
@@ -3856,6 +3969,7 @@ fn ext2_getdents(dir_ino, start_off, ubuf, ubufsize) {
         }
         if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
         var bo = within;
+        if (bo > 0) { bo = ext2_dir_snap(bo); }        # 1.57.18: on a record boundary (Linux ext2_validate_entry)
         while (bo < ext2_blocksize) {
             var d = &ext2_dir_buf + bo;
             var inum = ext2_load32_le(d, 0);
@@ -3868,6 +3982,7 @@ fn ext2_getdents(dir_ino, start_off, ubuf, ubufsize) {
                 reclen = (reclen + 7) & (0 - 8);          # round up to 8
                 if (written + reclen > ubufsize) {
                     ext2_gd_next = logical * ext2_blocksize + bo;
+                    if (written == 0) { return 0 - 1; }    # 1.57.18: not even one record fits — never "end of dir"
                     return written;
                 }
                 var rec = ubuf + written;

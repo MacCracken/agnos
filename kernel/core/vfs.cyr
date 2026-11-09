@@ -125,14 +125,19 @@ fn vfs_sec_wfile_write(base, buf, count) {
     return n;
 }
 
+# Write a VFS_SEC_WFILE's buffered content to the backend file (whole-file write via vfs_write_on) and KEEP the fd —
+# fsync#115 (1.57.18, syscall.cyr sys_fsync_fd: Linux fat_file_fsync writes the file's buffers out, then flushes the
+# device) and the flush below. Writing it twice is harmless: the buffer is the file's whole content from byte 0, and a
+# later write#1 only appends to it. Caller holds fs_lock. 0 / the backend's error.
+fn vfs_sec_wfile_sync(base) {
+    var blk = kpayload(base, 2);
+    return vfs_write_on(kpayload(base, 1), blk + 8, load64(blk), blk + 264, kpayload(base, 0));
+}
 # Flush a VFS_SEC_WFILE's buffered content to the backend file (whole-file write
 # via vfs_write_on) and release its pool block. Called from vfs_close.
 fn vfs_sec_wfile_flush(base) {
     var blk = kpayload(base, 2);
-    var be  = kpayload(base, 1);
-    var pos = kpayload(base, 0);
-    var namelen = load64(blk);
-    var rc = vfs_write_on(be, blk + 8, namelen, blk + 264, pos);
+    var rc = vfs_sec_wfile_sync(base);
     var slot = (blk - sec_wfile_buf) / 4360;      # release the pool block
     if (slot >= 0) { if (slot < 4) { store64(&sec_wfile_inuse + slot * 8, 0); } }
     return rc;

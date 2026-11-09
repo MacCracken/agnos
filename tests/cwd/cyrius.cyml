@@ -1,0 +1,17 @@
+[package]
+name = "cwdx"
+version = "0.1.0"
+description = "agnos 1.57.18 ring-3 exerciser — the per-process working directory: chdir#112 / getcwd#113 (round trip, a too-small cap, lexical normalisation, refusals), every path-taking syscall resolved relative to it (ext2, ZFS at /mnt/zfs, FAT at /mnt/fat, across mount boundaries), inheritance across spawn_path#43 / execwait#37 / fork#96, the PWD= seed (valid and bogus), a relative program path, a recycled pid, a removed cwd, and an overlong cwd + name refused, never truncated. Seeded as /bin/agnsh by scripts/smoke/cwd-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.7.18"
+
+[build]
+src = "cwdx.cyr"
+output = "build/cwdx"
+
+# AGNOS ONLY — build with `cyrius build --agnos cwdx.cyr build/cwdx`.
+[deps]
+# The FULL closure, transitives included (the tests/spawn closure: string and args -> alloc -> atomic, fnptr, poison).
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr", "poison"]

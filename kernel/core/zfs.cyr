@@ -35,6 +35,7 @@ enum ZfsK {
     ZK_MAXDS     = 32;                   # dataset slots
     ZK_MAXGR     = 64;                   # graft + virtual-dir entries
     ZK_XPHASE    = 0x1000000000000000;   # directory cursor: extras (grafts / virtual dirs) phase
+    ZK_LNKMAX    = 4096;                 # 1.57.18: a symlink target's longest (zfs_symlink's MAXPATHLEN, Linux's)
 }
 
 enum ZfsR {
@@ -1331,25 +1332,49 @@ fn zfs_read_ref(ref, off, dst, n) {
     }
     return done;
 }
-# The text of symlink ref into out (cap bytes). Length / -1.
-fn zfs_readlink_ref(ref, out, cap) {
+# The text of symlink ref into out (cap bytes).
+# ⭐ 1.57.18 — TWO CONTRACTS, ONE CORE (as ext2_readlink_core; issue 2026-11-06-readlink-refuses-a-buffer-shorter-than-
+# the-target):
+#   zfs_readlink_ref(ref, out, cap)       THE KERNEL FOLLOWER'S (zfs_resolve, the selftest walk, zfs_wt_obj): the WHOLE
+#                                         target or -1 — never a prefix (a walk that followed one resolves another path)
+#   zfs_readlink_ref_copy(ref, out, cap)  readlink#70's (zfs_readlink): copies AT MOST cap bytes, returns how many it
+#                                         copied (Linux readlink_copy; OpenZFS zfs_readlink is a uio of the caller's
+#                                         count) — until 1.57.18 a target longer than cap was -1 here too
+# The length is bounded by the format: OpenZFS's zfs_symlink refuses a target over MAXPATHLEN (4096 on Linux, 1024 on
+# FreeBSD) with ENAMETOOLONG, so a SIZE over ZK_LNKMAX is a corrupt object: -1 (it would only cost a read of up to cap
+# bytes of the object, never kernel memory — every source below is bounded by its own container).
+fn zfs_readlink_core(ref, out, cap, whole) {
+    if (cap < 1) { return 0 - 1; }                   # Linux readlink: EINVAL for bufsiz <= 0
     var di = zfs_ref_di(ref);
     var dn = zfs_dnslot(4);
     if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
     var mode = zfs_attr(di, dn, 0);
     if ((mode & 0xF000) != 0xA000) { return 0 - 1; }
     var sz = zfs_attr(di, dn, 1);
-    if (sz < 0 || sz > cap) { return 0 - 1; }
+    if (sz < 0 || sz > ZK_LNKMAX) { return 0 - 1; }
+    if (whole == 1 && sz > cap) { return 0 - 1; }
+    var n = sz;
+    if (n > cap) { n = cap; }
     if (load64(zfs_ds(di) + 520) == 1) {
+        # zfs_sa_find copies min(its length, cap) and returns its FULL length — which a corrupt SA may make differ
+        # from SIZE: the whole contract refuses one longer than cap, the copy contract reports what it copied
         var r = zfs_sa_attr(di, dn, load64(zfs_ds(di) + 576), out, cap);
-        if (r >= 0) { return r; }
+        if (r >= 0) {
+            if (r > cap) {
+                if (whole == 1) { return 0 - 1; }
+                return cap;
+            }
+            return r;
+        }
         if (r != 0 - 2) { return 0 - 1; }
     } elif (264 + sz <= load16(dn + 10)) {
-        memcpy(out, zfs_bonus(dn) + 264, sz);
-        return sz;
+        memcpy(out, zfs_bonus(dn) + 264, n);
+        return n;
     }
-    return zfs_read_ref(ref, 0, out, sz);
+    return zfs_read_ref(ref, 0, out, n);
 }
+fn zfs_readlink_ref(ref, out, cap) { return zfs_readlink_core(ref, out, cap, 1); }
+fn zfs_readlink_ref_copy(ref, out, cap) { return zfs_readlink_core(ref, out, cap, 0); }
 
 # --- the namespace: grafts, virtual dirs, path resolution ----------------------------------------------------------
 fn zfs_root_ref() {
@@ -1475,10 +1500,19 @@ fn zfs_resolve(path, len, follow) {
 # the parent filesystem never got a directory for). dots = 0 skips "." and "..". The name is at ZR_NAME
 # (zfs_it_nlen), the type in zfs_de_type, the object in zfs_de_ino. 1 / 0 end / -1 error. Names > 255 bytes (the
 # longname feature) are skipped: the VFS caps a name at 255.
+# ⭐ 1.57.18: lseek#58 lets ring 3 set a VFS_ZFS_DIR fd's cursor (telldir / seekdir), so a cursor is UNTRUSTED.
+# Every value >= 0 is a position (OpenZFS's zap_cursor_init_serialized takes any 64-bit cookie and resumes at the
+# next entry in hash order): 0 / 1 the dots; [2, ZK_XPHASE) a ZAP position — micro: an entry index, fat: block << 20
+# | chunk — from which only genuine entries are listed (a chunk is listed only when it is an entry chunk, 252, inside
+# a valid leaf of a block below zap_freeblk, the set the walk from 0 visits) and past the end of which is the extras
+# phase; >= ZK_XPHASE an extras index, past the end of which is the end. A NEGATIVE cursor is refused here: the
+# dots arm would store its NUL at ZR_NAME + c + 1, which is any kernel address (lseek refuses one; this is the
+# second wall).
 fn zfs_dir_next(ref, cur, dots) {
     var nm = zfs_mem + ZR_NAME;
     while (1 == 1) {
         var c = load64(cur);
+        if (c < 0) { return 0 - 1; }
         if (c < 2) {
             if (dots == 0) { store64(cur, 2); continue; }
             store8(nm, 46);
@@ -1729,12 +1763,12 @@ fn zfs_reloff(path, len) {
     return 0;
 }
 # readdir#81 / readdir_at#101 for a path on the ZFS mount; -99 = "not ZFS, let the ext2 arm answer". Validation is
-# ext2_readdir_sys's: a NUL-terminated user path (<= 255 B), is_user_array for the records, the 8-byte cursor.
+# ext2_readdir_sys's: is_user_array for the records, the 8-byte cursor. 1.57.18: `path` is the arm's KERNEL copy
+# (syscall.cyr sc_cpath_take — NUL-terminated within CWD_MAX, a relative one resolved from the cwd).
 fn zfs_readdir_sys(path, buf, maxn, curp) {
     if (zfs_active == 0) { return 0 - 99; }
-    if (is_user_range(path, 256) == 0) { return 0 - 99; }
     var pl = 0;
-    while (pl < 255 && load8(path + pl) != 0) { pl = pl + 1; }
+    while (pl < CWD_MAX && load8(path + pl) != 0) { pl = pl + 1; }
     if (vfs_resolve_mount(path, pl) != FS_ZFS) { return 0 - 99; }
     if (maxn <= 0) { return 0; }
     if (is_user_array(buf, maxn, 64) == 0) { return 0 - 1; }
@@ -1787,7 +1821,7 @@ fn zfs_readlink(path, len, buf, cap) {
     zfs_wp_obs(0);                                   # (1.57.12 B11) only the pending txg's age bound: a symlink is never it
     var r = zfs_resolve(path, len, 0);
     if (r < 0 || zfs_res_type != 3) { return 0 - 1; }
-    return zfs_readlink_ref(r, buf, cap);
+    return zfs_readlink_ref_copy(r, buf, cap);      # 1.57.18: at most cap bytes, the count copied (readlink#70)
 }
 # open#7 on the ZFS mount. AO_DIRECTORY -> a VFS_ZFS_DIR fd (getdents#29; no write flag). A regular file -> a
 # VFS_ZFS_FILE fd that streams any size and seeks: payload [0] the position · [1] the object's ZPL_GEN (D11: every fd
@@ -1795,7 +1829,8 @@ fn zfs_readlink(path, len, buf, cap) {
 # dataset) | ZK_FDW when the fd may write · [2] the ref. 1.57.12 B5 (design § a.1, § f.4): AO_WRONLY (1) / AO_RDWR (2)
 # need a writable pool and dataset and an object the writer accepts (zfs_wopen, named refusals); AO_TRUNC (0x200)
 # truncates to 0 in its own txg (zfs_wtrunc — on any access mode, as the ext2 arm does: design § k.44, DECIDED
-# 2026-10-11); AO_CREAT (0x100) opens an existing file and (B6) CREATES a missing one — a plain file, mode 0100644, in
+# 2026-10-11); AO_CREAT (0x100) opens an existing file and (B6) CREATES a missing one — a plain file, mode 0100644 (1.57.18:
+# or S_IFREG | the AO_MODE bits, 0x4000 + bits 32..63 of flags — ABI § 3.3), in
 # its own txg (zfs_wcreate: never through a final component that resolves at all — a dangling symlink is EEXIST, the
 # final component is not followed) — AO_EXCL (0x2000) with it refuses an existing name, tested BEFORE AO_TRUNC, and a
 # file just created is not truncated; AO_APPEND (0x400) is not honoured (ext2's rule); AO_NOFOLLOW (0x1000): the final
@@ -1823,7 +1858,9 @@ fn zfs_open(path, len, flags) {
     # creates only where its own no-follow lookup says absent and otherwise refuses BY NAME (an unreadable > 128 KiB
     # microzap parent, a dangling final symlink, ...): until then this answered an unnamed -1
     if (r < 0 && (flags & 0x900) == 0x100) {
-        if (zfs_wcreate(path, len, 0, 0, 0) != 0) { return 0 - 1; }
+        # (1.57.18) AO_MODE: the new file's permission bits from bits 32..63 of flags (sc_open_mode: -1 the default,
+        # 0100644; the syscall arm refused a field above 07777) — an existing file never reaches here, so it keeps its mode
+        if (zfs_wcreate(path, len, 0, 0, 0, sc_open_mode(flags)) != 0) { return 0 - 1; }
         r = zfs_resolve(path, len, 0);
         made = 1;
     }
@@ -1971,7 +2008,8 @@ fn zfs_getdents(base, ubuf, size) {
     }
     return written;
 }
-# readdir#81 / readdir_at#101 records: 64 bytes, name NUL-terminated (<= 62 bytes), byte 63 = 1 for a directory.
+# readdir#81 / readdir_at#101 records (ext2.cyr rd_rec_put — 1.57.18): 64 bytes, the name NUL-terminated, cut to at
+# most 62 bytes on a UTF-8 boundary; byte 63 = RD_DIR (1) for a directory | RD_CUT (2) when the name was cut.
 # "." and ".." are not listed. The cursor is opaque: 0 starts, -1 = exhausted. Count / -2 not found / -4 not a dir.
 fn zfs_readdir_at(path, plen, buf, maxn, curp) {
     zfs_wp_obs(0);                                   # (1.57.12 B11) the age bound only
@@ -1996,14 +2034,9 @@ fn zfs_readdir_at(path, plen, buf, maxn, curp) {
             if (curp != 0) { store64(curp, 0 - 1); }
             return n;
         }
-        var rec = buf + n * 64;
-        var nl = zfs_it_nlen;
-        if (nl > 62) { nl = 62; }
-        memcpy(rec, zfs_mem + ZR_NAME, nl);
-        store8(rec + nl, 0);
         var t = 0;
         if (zfs_de_type == 2) { t = 1; }
-        store8(rec + 63, t);
+        rd_rec_put(buf + n * 64, zfs_mem + ZR_NAME, zfs_it_nlen, t);
         n = n + 1;
     }
     if (curp != 0) { store64(curp, cur); }

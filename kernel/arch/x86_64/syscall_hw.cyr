@@ -222,6 +222,7 @@ fn sys_fork(user_rsp) {
     # fork, which is the entire point for a fork-per-connection server: the accepted socket must be in
     # the child. Same single inheritance point every other user proc uses.
     vfs_fd_inherit(child, parent);
+    proc_cwd_inherit(child, parent);               # 1.57.18: and its working directory (chdir#112) — Linux copy_fs
     # ⭐ AND ITS NAME — a forked child is the same program, so `proclist`#99 should say so rather than
     # leaving the slot's freshly-scrubbed empty name. Copied byte-wise from the parent's 32-byte cell.
     var cn_dst = proc_name_ptr(child);

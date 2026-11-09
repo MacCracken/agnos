@@ -574,6 +574,8 @@ fn icmp_spin_unlock() {
 #   net_tick_lock (1.57.7 S6) is a TRY-lock too: net_tick's body holds it across tcp_retx_tick + net_lo_drain; only
 #   net_tick_pause spins on it, from kmain holding nothing. icmp_lock (1.57.7 S6) is an IRQ-SAVED SIBLING LEAF at the
 #   udp rank: never held with a net chain lock, nothing taken under it, wq_wake after its release.
+#   pipe_lock (1.57.9) and chan_lock (1.57.18, the #97 channel inboxes) are SIBLING LEAVES below sched_lock: nothing
+#   is taken under either, their wakes run after the unlock, never held across a wait, never in an interrupt body.
 #   sched_lock is the INNERMOST LEAF: taken only with IF=0, any lock above may be held while taking it, nothing is
 #   taken under it (see its banner).
 # ⭐⭐ 1.57.6 (Path 2, S3.2) — EVERY PLAIN SPINLOCK DISABLES PREEMPTION FOR ITS HOLD. Each *_spin_lock
@@ -738,6 +740,41 @@ fn pipe_spin_lock() {
 }
 fn pipe_spin_unlock() {
     var addr = &pipe_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
+    return 0;
+}
+# ⭐ 1.57.18 — chan_lock: EVERY `#97` channel inbox's cursor read-modify-write and its record copy (syscall.cyr
+# chan_queue / chan_queue_bp / chan_deliver) and a mint's cursor reset. Until 1.57.18 the band took NO lock: two writers
+# on two CPUs (a shell and its child both writing the terminal) loaded the same chan_w and wrote the same slot, and a
+# drop-oldest bumped chan_r under a reader's feet. One GLOBAL lock (pipe_lock's reasoning: a parameterized lock fn is
+# the broken spin_lock_at shape, and 32 inboxes of 4 KB do not contend). A LEAF below sched_lock: nothing is acquired
+# under it — the reader/writer/epoll wakes run AFTER the unlock. Never held across wq_arm/wq_sleep; never taken in an
+# interrupt body (chan_release_pid, which the tick-path death chain reaches, does not take it). A byte-for-byte copy
+# of pipe_spin_lock / pipe_spin_unlock with the global renamed.
+# REGISTER CONTRACT (both asm blocks): in — addr from its slot; out — lock: old from the xchg into [rbp-0x08];
+# clobbers rax, rcx. Slots: lock `old` [rbp-0x08], `addr` [rbp-0x10]; unlock `addr` [rbp-0x08].
+var chan_lock = 0;
+fn chan_spin_lock() {
+    preempt_disable();                                  # a held plain spinlock is NON-PREEMPTIBLE (see the lock banner)
+    var old = 1;
+    while (old == 1) {
+        var addr = &chan_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn chan_spin_unlock() {
+    var addr = &chan_lock;
     asm {
         0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
         0x48; 0x31; 0xC9;              # xor rcx, rcx
@@ -969,6 +1006,9 @@ fn ap_entry() {
     # confirmable only at the sub-bite-7 iron burn). 0x10000 = masked.
     store32(0xFEE00350, 0x10000);
     store32(0xFEE00360, 0x10000);
+    # 1.57.18 — this AP's PAT entry 1 := WC, as the BSP's (vmm.cyr pat_init_cpu): the framebuffer's WC mapping must
+    # mean WC on every CPU that can paint it, before this one runs anything that does.
+    pat_init_cpu(0);
     # Per-CPU SYSCALL MSRs (STAR/LSTAR/CSTAR/SFMASK + EFER.SCE) for this AP — so a ring-3
     # proc scheduled here (STEP-2) can SYSCALL into the kernel with this CPU's stubs.
     syscall_msr_init();

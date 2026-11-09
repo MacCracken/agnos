@@ -18,8 +18,9 @@
 # mkdir b6, AO_CREAT | AO_EXCL b6/new.txt + 100 bytes, symlink#63 b6/sym -> new.txt (agnostank/custom holds the symlink
 # layout since fixture RECIPE 5; lstat / readlink / stat through it), AO_CREAT | AO_TRUNC b6/t.txt + 10 (a new name: not
 # truncated) — six more txgs, stat / getdents of what it made, and the refusals: an existing name, AO_EXCL, a symlink
-# whose target holds a NUL byte, one on the read-only root, a relative AO_CREAT path of 266 bytes (B6 review: it was
-# truncated to 254 and created). Every refused ZFS verb logs `zfs: <verb> refused (<why>)` — the harness holds the run
+# whose target holds a NUL byte, one on the read-only root, a relative AO_CREAT path of 4126 bytes (B6 review: a long one
+# was truncated to 254 and created; 266 bytes against that bound until 1.57.18, whose cwd ingress bounds the INPUT at
+# 4095). Every refused ZFS verb logs `zfs: <verb> refused (<why>)` — the harness holds the run
 # to that list, in order. 1.57.12 B8 (124, 126, 128, 148-149): what B6 refused there now SUCCEEDS — a symlink in
 # coff/kid (no symlink layout: a NEW SA layout, the LAYOUTS add) and a 50-byte name in b6 (its microzap UPGRADED to a fat
 # ZAP, so every later op in b6 — B7's links, renames, unlinks — works on a fat ZAP); getdents of the fat b6; a 255-byte
@@ -45,6 +46,13 @@
 # close and printed (`zfsx: b11 close ticks ...`: a CPU that held interrupts off for the commit missed its ticks — the
 # harness reports them, design k.126 (B11)); and b11exit.bin, written and NEVER CLOSED: the exit's fd-table teardown
 # commits it (160 is the clause before it; the pool is the proof). Nine txgs.
+# 1.57.18 (162-165, 170-174): open#7's AO_MODE — m600.txt / m640.txt / m755.bin / m604.txt (0604: the ACL's allow0 +
+# deny2 entries) created with their modes and read back by stat#33, mdef.txt (no AO_MODE: 0644), the existing m600.txt
+# opened AO_CREAT | AO_MODE 0777 and kept, a field above 07777 refused — five txgs; then fsync#115 in a FORKED CHILD
+# that runs once zfsx is gone (zx_child: a pending file committed by its fsync, a read-only fd committing another fd's
+# writes, an ext2 fsync that commits nothing of ZFS's against sync#12 that does, a directory and non-file fds, and
+# f115b.bin left PENDING while five other fds are fsync'd — not one sector written); it prints `zfsx: child verdict N`
+# and sleeps, so the harness's kill is a crash cut that must lose f115b.bin's bytes and keep the rest. Seven txgs.
 
 # ⚠ The large buffers live at MODULE scope (8 B per element): an agnos exec gets ~12 KB of usable init stack
 # (roadmap TRUE), so a 64 KiB local would fault before the first syscall.
@@ -95,6 +103,149 @@ fn zx_gen(s, off, dst, n) {
         k = k + 1;
     }
     return 0;
+}
+
+# ---- 1.57.18 helpers: open#7's AO_MODE and fsync#115 ----
+var zx_si[26];        # 208 B sysinfo#35 (ABI § 4.4): the per-device sectors-WRITTEN band at +104 + tag * 16 + 8
+var zx_st2[6];        # 48 B a stat#33 struct for the helpers
+# Sectors written so far on every block device (tags 1..5 of sysinfo#35's band): a commit writes, nothing else here does.
+fn zx_wsec() {
+    if (syscall(35, &zx_si, 208, 0, 0) != 0) { return 0 - 1; }
+    var t = 1;
+    var n = 0;
+    while (t <= 5) { n = n + load64(&zx_si + 104 + t * 16 + 8); t = t + 1; }
+    return n;
+}
+fn zx_us() { return syscall(95, 0, 0, 0, 0); }
+# A create of permission bits m at p (AO_WRONLY | AO_CREAT | AO_EXCL | AO_MODE, m in bits 32..63): stat#33 must read
+# S_IFREG | m. 0 / -1, the line printed either way.
+fn zx_mk(p, m) {
+    var fd = syscall(7, p, zx_len(p), 0x6101 | (m << 32), 0);
+    if (fd >= 0) { syscall(6, fd, 0, 0, 0); }
+    var md = 0 - 1;
+    if (syscall(33, p, zx_len(p), &zx_st2, 0) == 0) { md = load64(&zx_st2); }
+    syscall(1, 1, "zfsx: AO_MODE ", 14);
+    syscall(1, 1, p, zx_len(p));
+    zx_putn(" want=", 0x8000 | m);
+    zx_putn(" got=", md & 0xFFFF);
+    syscall(1, 1, "\n", 1);
+    if (fd < 0 || md != (0x8000 | m)) { return 0 - 1; }
+    return 0;
+}
+# The child's lines go out as ONE write#1 each (zx_ls / zx_ln, then zx_lput): the child runs beside agnsh, whose prompt
+# lands on the same console the moment zfsx exits — a line written in pieces came out split by it ("zfsx: child verdict
+# [ASSIST] > 170"), which the harness could not read.
+var zx_lb[32];        # 256 B the line being built
+var ZX_LN = 0;
+fn zx_ls(s) { var i = 0; while (load8(s + i) != 0 && ZX_LN < 250) { store8(&zx_lb + ZX_LN, load8(s + i)); ZX_LN = ZX_LN + 1; i = i + 1; } return 0; }
+fn zx_ln(v) {
+    if (v < 0) { zx_ls("-"); v = 0 - v; }
+    var d[3];
+    var i = 0;
+    if (v == 0) { zx_ls("0"); return 0; }
+    while (v > 0) { store8(&d + i, 48 + v % 10); v = v / 10; i = i + 1; }
+    while (i > 0 && ZX_LN < 250) { i = i - 1; store8(&zx_lb + ZX_LN, load8(&d + i)); ZX_LN = ZX_LN + 1; }
+    return 0;
+}
+fn zx_lput() {
+    store8(&zx_lb + ZX_LN, 10);
+    syscall(1, 1, &zx_lb, ZX_LN + 1, 0);
+    ZX_LN = 0;
+    return 0;
+}
+# The child's verdict (95 = clauses 170-174 held), printed for the harness — then it SLEEPS, never exits: its last file's
+# writes stay pending until the harness kills QEMU.
+fn zx_cv(code) {
+    zx_ls("zfsx: child verdict ");
+    zx_ln(code);
+    zx_lput();
+    while (1 == 1) { syscall(41, 1000, 0, 0, 0); }
+    return 0;
+}
+# ⭐ fsync#115 on the ZFS mount (1.57.18) — run by a CHILD once zfsx itself is gone (the fork in zx_main), so its last
+# pending write is held by a live process when the harness's kill cuts the machine:
+#   170 f115a.bin: 1,000 bytes pending, fsync#115 of its fd -> 0 and the commit WROTE (the sectors band moved)
+#   171 f115r.bin: a READ-ONLY fd opened before the write; another fd's 500 bytes pending, fsync#115 of the READ-ONLY fd
+#       commits them
+#   172 f115p.bin pending + an ext2 file (/zfsx-f115.txt, 4 KiB): the ext2 fsync#115 writes NOTHING (ext2 writes through;
+#       ZFS's pending txg stays pending), then sync#12 commits f115p.bin — microseconds and sectors printed
+#   173 a ZFS AO_DIRECTORY fd: 0; the console, a pipe's ends, a closed fd, 99: -1
+#   174 f115b.bin: 700 bytes pending, then fsync#115 of EVERY other fd (f115a, both f115r fds, the directory, the ext2
+#       file) -> 0 and NOT ONE sector written: another file's fsync commits nothing of it. The cut must lose them.
+fn zx_child() {
+    var fa = "/mnt/zfs/somewhere/else/f115a.bin";
+    var a = zx_open(fa, 0x2102);
+    if (a < 0) { return zx_cv(170); }
+    zx_gen("zfsx/f115a", 0, &zx_wb, 1000);
+    if (syscall(1, a, &zx_wb, 1000, 0) != 1000) { return zx_cv(170); }
+    var s0 = zx_wsec();
+    var t0 = zx_us();
+    if (syscall(115, a, 0, 0, 0) != 0) { return zx_cv(170); }
+    var t1 = zx_us();
+    var s1 = zx_wsec();
+    zx_ls("zfsx: child fsync#115 of the pending file: us=");
+    zx_ln(t1 - t0);
+    zx_ls(" sectors=");
+    zx_ln(s1 - s0);
+    zx_lput();
+    if (s0 < 0 || s1 <= s0) { return zx_cv(170); }
+    var fr = "/mnt/zfs/somewhere/else/f115r.bin";
+    var w = zx_open(fr, 0x2102);
+    var r = zx_open(fr, 0);
+    if (w < 0 || r < 0) { return zx_cv(171); }
+    zx_gen("zfsx/f115r", 0, &zx_wb, 500);
+    if (syscall(1, w, &zx_wb, 500, 0) != 500) { return zx_cv(171); }
+    s0 = zx_wsec();
+    if (syscall(115, r, 0, 0, 0) != 0) { return zx_cv(171); }
+    s1 = zx_wsec();
+    if (s1 <= s0) { return zx_cv(171); }
+    var fp = "/mnt/zfs/somewhere/else/f115p.bin";
+    var p = zx_open(fp, 0x2102);
+    if (p < 0) { return zx_cv(172); }
+    zx_gen("zfsx/f115p", 0, &zx_wb, 600);
+    if (syscall(1, p, &zx_wb, 600, 0) != 600) { return zx_cv(172); }
+    var ep = "/zfsx-f115.txt";
+    var e = zx_open(ep, 0x102);
+    if (e < 0 || syscall(1, e, &zx_big, 4096, 0) != 4096) { return zx_cv(172); }
+    s0 = zx_wsec();
+    t0 = zx_us();
+    if (syscall(115, e, 0, 0, 0) != 0) { return zx_cv(172); }
+    t1 = zx_us();
+    s1 = zx_wsec();
+    var t2 = zx_us();
+    if (syscall(12, 0, 0, 0, 0) != 0) { return zx_cv(172); }
+    var t3 = zx_us();
+    var s2 = zx_wsec();
+    zx_ls("zfsx: child with a ZFS txg pending: ext2 fsync#115 us=");
+    zx_ln(t1 - t0);
+    zx_ls(" sectors=");
+    zx_ln(s1 - s0);
+    zx_ls(" | sync#12 us=");
+    zx_ln(t3 - t2);
+    zx_ls(" sectors=");
+    zx_ln(s2 - s1);
+    zx_lput();
+    if (s1 != s0 || s2 <= s1) { return zx_cv(172); }
+    var dn = "/mnt/zfs/somewhere/else";
+    var d = zx_open(dn, 0x800);
+    var pq[2];
+    if (d < 0 || syscall(115, d, 0, 0, 0) != 0 || syscall(25, &pq, 0, 0, 0) != 0) { return zx_cv(173); }
+    if (syscall(115, 1, 0, 0, 0) != 0 - 1 || syscall(115, load64(&pq), 0, 0, 0) != 0 - 1) { return zx_cv(173); }
+    if (syscall(115, load64(&pq + 8), 0, 0, 0) != 0 - 1 || syscall(115, 30, 0, 0, 0) != 0 - 1 || syscall(115, 99, 0, 0, 0) != 0 - 1) { return zx_cv(173); }
+    var fb = "/mnt/zfs/somewhere/else/f115b.bin";
+    var b = zx_open(fb, 0x2102);
+    if (b < 0) { return zx_cv(174); }
+    zx_gen("zfsx/f115b", 0, &zx_wb, 700);
+    if (syscall(1, b, &zx_wb, 700, 0) != 700) { return zx_cv(174); }
+    s0 = zx_wsec();
+    if (syscall(115, a, 0, 0, 0) != 0 || syscall(115, r, 0, 0, 0) != 0 || syscall(115, w, 0, 0, 0) != 0) { return zx_cv(174); }
+    if (syscall(115, d, 0, 0, 0) != 0 || syscall(115, e, 0, 0, 0) != 0) { return zx_cv(174); }
+    s1 = zx_wsec();
+    zx_ls("zfsx: child f115b.bin pending, fsync#115 of five other fds: sectors=");
+    zx_ln(s1 - s0);
+    zx_lput();
+    if (s1 != s0) { return zx_cv(174); }
+    return zx_cv(95);
 }
 
 fn zx_main(): i64 {
@@ -296,19 +447,22 @@ fn zx_main(): i64 {
     if (lfd < 0) { return 124; }
     syscall(6, lfd);
     if (syscall(33, lng, zx_len(lng), &st) != 0 || load64(&st) != 0x81A4) { return 124; }
-    # B6 review (finding 6): a RELATIVE name of 255+ bytes is refused — open#7 copied 254 of them and created the
-    # TRUNCATED name. 26 + 100 x "./" + 40 = 266 bytes; its first 254 end in a 28-byte name that must not appear.
-    var rel = &zx_wc;
+    # B6 review (finding 6): a RELATIVE name is never TRUNCATED — open#7 copied 254 bytes of a longer one and created the
+    # cut name. ⭐ 1.57.18 (the working directory, chdir#112): a relative path resolves from the cwd, cleaned, and the
+    # bound is CWD_MAX = 4095 bytes of INPUT (Linux ENAMETOOLONG), no longer the old rooting buffer's 254 — so the probe
+    # moved past it: 26 + 2030 x "./" + 40 = 4126 bytes, refused whatever it would clean to; its first 4095 end in the 9
+    # bytes "relative-", a name that must not appear. (Until 1.57.18: 26 + 100 x "./" + 40 = 266 bytes against 254.)
+    var rel = &zx_big;
     var rl = 0;
     var rp0 = "mnt/zfs/somewhere/else/b6/";
     while (rl < 26) { store8(rel + rl, load8(rp0 + rl)); rl = rl + 1; }
-    while (rl < 226) { store8(rel + rl, 46); store8(rel + rl + 1, 47); rl = rl + 2; }
-    var rp1 = "relative-path-past-254-bytes-xxxxxxxxxxx";
+    while (rl < 4086) { store8(rel + rl, 46); store8(rel + rl + 1, 47); rl = rl + 2; }
+    var rp1 = "relative-path-past-the-limit-xxxxxxxxxxx";
     var r1 = 0;
     while (r1 < 40) { store8(rel + rl, load8(rp1 + r1)); rl = rl + 1; r1 = r1 + 1; }
     store8(rel + rl, 0);
     if (syscall(7, rel, rl, 0x102, 0) >= 0) { return 130; }
-    var tr = "/mnt/zfs/somewhere/else/b6/relative-path-past-254-bytes";   # what the 254-byte copy named
+    var tr = "/mnt/zfs/somewhere/else/b6/relative-";                     # what a 4095-byte cut would have named
     if (syscall(33, tr, zx_len(tr), &st) == 0) { return 130; }
     var tf = "/mnt/zfs/somewhere/else/b6/t.txt";
     var nfd = zx_open(tf, 0x301);                            # AO_CREAT | AO_TRUNC | AO_WRONLY, a NEW name: not truncated
@@ -524,6 +678,43 @@ fn zx_main(): i64 {
         c = c + 1;
     }
     syscall(1, 1, "\n", 1);
+    # ---- 1.57.18: open#7's AO_MODE (a3 0x4000; bits 32..63 = a create's mode) — clauses 162-165 ----
+    # 0600 / 0640 / 0755 and 0604 (a mode whose trivial ACL needs zfs_acl_chmod's allow0 + deny2 entries: other may read,
+    # the group may not) on agnostank/custom, one txg each; stat#33 reads S_IFREG | the mode. The pool's verify holds
+    # each to OpenZFS's own stat(1) and getfacl (B-stat, B-acl) and the SA to zfs-sa-check.py.
+    if (zx_mk("/mnt/zfs/somewhere/else/m600.txt", 0x180) != 0) { return 162; }
+    if (zx_mk("/mnt/zfs/somewhere/else/m640.txt", 0x1A0) != 0) { return 162; }
+    if (zx_mk("/mnt/zfs/somewhere/else/m755.bin", 0x1ED) != 0) { return 162; }
+    if (zx_mk("/mnt/zfs/somewhere/else/m604.txt", 0x184) != 0) { return 162; }
+    var md = "/mnt/zfs/somewhere/else/mdef.txt";                # no AO_MODE, the field set: ignored — the default 0644
+    var mdf = zx_open(md, 0x2101 | (0x180 << 32));
+    if (mdf < 0) { return 163; }
+    syscall(6, mdf);
+    if (syscall(33, md, zx_len(md), &st) != 0 || load64(&st) != 0x81A4) { return 163; }
+    var m6 = "/mnt/zfs/somewhere/else/m600.txt";                # an EXISTING file, AO_CREAT | AO_MODE 0777: untouched, no txg
+    var mef = zx_open(m6, 0x4101 | (0x1FF << 32));
+    if (mef < 0) { return 164; }
+    syscall(6, mef);
+    if (syscall(33, m6, zx_len(m6), &st) != 0 || load64(&st) != 0x8180) { return 164; }
+    var mb = "/mnt/zfs/somewhere/else/mbad.txt";                # a field above 07777: -1 before any backend, nothing made
+    if (zx_open(mb, 0x6101 | (0x1000 << 32)) != 0 - 1 || zx_open(mb, 0x6101 | (1 << 63)) != 0 - 1) { return 165; }
+    if (syscall(33, mb, zx_len(mb), &st) == 0) { return 165; }
+    # ---- 1.57.18: fsync#115 — a CHILD, after this process is gone (clauses 170-175; zx_child) ----
+    # Forked HERE, before b11exit.bin opens (the child must not hold its fd); it blocks on the pipe until this process
+    # dies — the exit commits b11exit.bin first — then runs its clauses and SLEEPS with one file's writes pending, which
+    # the harness's kill (a crash cut) must lose while every fsync#115'd file survives.
+    var pp[2];
+    if (syscall(25, &pp, 0, 0, 0) != 0) { return 170; }
+    var kid = syscall(96, 0, 0, 0, 0);
+    if (kid == 0) {
+        syscall(6, load64(&pp + 8), 0, 0, 0);
+        var one[1];
+        while (syscall(5, load64(&pp), &one, 1, 0) > 0) { }          # EOF: the parent is gone
+        syscall(41, 1500, 0, 0, 0);                                    # agnsh's `run: exit 95` and prompt go out first
+        zx_child();
+    }
+    if (kid < 0) { return 170; }
+    syscall(6, load64(&pp), 0, 0, 0);
     # b11exit.bin: written, never closed — the exit's teardown commits it
     var x11 = zx_open("/mnt/zfs/somewhere/else/b11exit.bin", 0x2102);
     if (x11 < 0) { return 161; }

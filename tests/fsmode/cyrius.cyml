@@ -1,0 +1,17 @@
+[package]
+name = "fsmode"
+version = "0.1.0"
+description = "agnos 1.57.18 ring-3 exerciser — open#7's create mode (AO_MODE: 0600 / 0640 / 0755 / 04755 / 01644, the default, an existing file kept, a bad field refused) and fsync#115 on ext2 (a file, a read-only and a directory fd, non-file fds refused, sectors and microseconds against sync#12), then a crash cut after an fsync. Seeded as /bin/agnsh by scripts/smoke/fs-create-mode-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.7.18"
+
+[build]
+src = "fsmode.cyr"
+output = "build/fsmode"
+
+# AGNOS ONLY — build with `cyrius build --agnos fsmode.cyr build/fsmode`.
+[deps]
+# The FULL closure, transitives included (the tests/rnrep / tests/sock closure: alloc -> atomic, fnptr, poison).
+stdlib = ["syscalls", "alloc", "atomic", "fnptr", "poison"]

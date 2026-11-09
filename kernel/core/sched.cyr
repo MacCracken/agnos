@@ -1283,7 +1283,7 @@ fn wq_deadline_after_us(us) {
 # (1.57.12: pcpu_spawn_elf_buf, pcpu_sc_gpuop and pcpu_elf_hdr_buf live in the ROOM carve-out — core/room.cyr — same
 # per-CPU slicing, same rules.)
 # ⚠ R4/R6 PER-CPU SCRATCH (percpu_audit): pcpu_spawn_elf_buf, pcpu_spawn_path_buf, pcpu_spawn_env_buf,
-# pcpu_sc_open_abs, pcpu_sc_gpuop, fb_scale's row buffer, gpu_texl_stage (syscall.cyr), pcpu_elf_hdr_buf,
+# pcpu_sc_path (1.57.18, was pcpu_sc_open_abs), pcpu_sc_gpuop, fb_scale's row buffer, gpu_texl_stage (syscall.cyr), pcpu_elf_hdr_buf,
 # pcpu_exec_env_src/len (elf.cyr) — never add a wq_* call inside one of their live spans.
 var wq_ntimed = 0;                          # procs with a deadline (stale-HIGH allowed; wq_tick recounts exactly)
 var wq_min_deadline = 0x7FFFFFFFFFFFFFFF;   # earliest deadline (stale-LOW allowed: an early rescan)

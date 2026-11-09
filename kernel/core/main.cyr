@@ -49,6 +49,10 @@ bsp_stack_redzone_arm();
 bsp_stack_paint();
 #endif
 
+# 1.57.18 — PAT entry 1 := WC on the BSP BEFORE the first WC remap below selects it (vmm.cyr pat_init_cpu: the
+# firmware's entry 1 is WT, which made every framebuffer store write-through — a 16 MB console scroll cost 183 ms
+# under KVM). Each AP does the same in ap_entry (smp.cyr).
+pat_init_cpu(1);
 vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 
 # Populate the 8x8 font in BSS so fb_putc renders glyphs once shell()
@@ -684,6 +688,7 @@ if (acpi_rsdp_addr != 0) {
 } else {
     kprintln("ACPI: no RSDP found", 19);
 }
+psrc_report();   # 1.57.18: `power: source ...` — power_source#114's cached answer and why (power.cyr), both branches
 # 1.57.7 (S1b): the tick was measured on the EARLY probe's port; acpi_init has just re-derived the FADT from
 # scratch (legacy scan first). A mismatch — including a late "no pm timer" — is a DIAGNOSTIC, not a
 # recalibration: a port that passed tsc_pm_alive and the agreement test is a live PM timer. Silent on a match.
@@ -2655,6 +2660,29 @@ if (exfat_active == 1) {
                 }
             }
         }
+        # ⭐ 1.57.18 — fsync#115 on a FAT / exFAT WRITE-BACK fd (VFS_SEC_WFILE) writes its buffer through NOW and keeps
+        # the fd (Linux fat_file_fsync): a read through another fd BEFORE the close sees the 16 bytes (only the close wrote
+        # them until 1.57.18), and 4 more bytes written after it land at the close (20).
+        memcpy(xu + 256, "/mnt/exfat/SYSFS.TXT", 20);
+        var xsfd = ksyscall(7, xu + 256, 20, 0x301);         # AO_WRONLY|AO_CREAT|AO_TRUNC
+        if (xsfd < 0) { kprintln("syswr: exFAT fsync open FAIL", 28); }
+        else {
+            ksyscall(1, xsfd, xu + 64, 16);
+            var xsr = ksyscall(115, xsfd, 0, 0);
+            var xsn = 0 - 1;
+            var xs2 = ksyscall(7, xu + 256, 20, 0);
+            if (xs2 >= 0) { xsn = ksyscall(5, xs2, xu + 320, 64); ksyscall(6, xs2, 0, 0); }
+            ksyscall(1, xsfd, xu + 64, 4);
+            ksyscall(6, xsfd, 0, 0);
+            var xsm = 0 - 1;
+            var xs3 = ksyscall(7, xu + 256, 20, 0);
+            if (xs3 >= 0) { xsm = ksyscall(5, xs3, xu + 384, 64); ksyscall(6, xs3, 0, 0); }
+            if (xsr == 0 && xsn == 16 && xsm == 20) { kprintln("syswr: exFAT fsync#115 write-through OK", 39); }
+            else {
+                kprint("syswr: exFAT fsync#115 FAIL r=", 30); kprint_num(xsr);
+                kprint(" before-close=", 14); kprint_num(xsn); kprint(" after=", 7); kprint_num(xsm); kprintln("", 0);
+            }
+        }
         pmm_free_2mb(xu);
     }
     var shx_dir[24];
@@ -4202,6 +4230,63 @@ fn fs_syscall_selftest() {
     # rmdir("/fss") + verify gone.
     if (ksyscall(10, u + 0, 4, 0) != 0)    { kprintln("fssys: rmdir FAIL", 17); ok = 0; }
     if (ext2_path_lookup(u + 0, 4) > 0)    { kprintln("fssys: rmdir-left FAIL", 22); ok = 0; }
+
+    # ⭐ 1.57.18 — open#7's AO_MODE (0x4000: bits 32..63 of a3 are a create's mode) and fsync#115 (issue
+    # 2026-11-06-open-has-no-create-mode). /fsm600 is LEFT on the disk: fssys-smoke reads its mode (0600) and its 100 bytes
+    # back with debugfs after the boot.
+    memcpy(u + 192, "/fsm600", 7);
+    memcpy(u + 224, "/fsmbad", 7);
+    var i7 = 0;
+    while (i7 < 100) { store8(u + 1600 + i7, 65 + i7 % 26); i7 = i7 + 1; }
+    var mfd = ksyscall(7, u + 192, 7, 0x4101 | (0x180 << 32));          # AO_WRONLY | AO_CREAT | AO_MODE, 0600
+    if (mfd < 0) { kprintln("fssys: mode creat FAIL", 22); ok = 0; }
+    if (ksyscall(33, u + 192, 7, u + 256) != 0 || load64(u + 256) != 0x8180) { kprintln("fssys: mode 0600 FAIL", 21); ok = 0; }
+    var efd = ksyscall(7, u + 192, 7, 0x4100 | (0x1FF << 32));         # the EXISTING file, AO_MODE 0777: untouched
+    if (efd < 0) { kprintln("fssys: mode reopen FAIL", 23); ok = 0; } else { ksyscall(6, efd, 0, 0); }
+    if (ksyscall(33, u + 192, 7, u + 256) != 0 || load64(u + 256) != 0x8180) { kprintln("fssys: mode kept FAIL", 21); ok = 0; }
+    if (ksyscall(7, u + 224, 7, 0x4101 | (0x1000 << 32)) != 0 - 1) { kprintln("fssys: mode bad FAIL", 20); ok = 0; }   # 010000
+    if (ext2_path_lookup(u + 224, 7) > 0) { kprintln("fssys: mode bad created FAIL", 28); ok = 0; }
+    var dfm = ksyscall(7, u + 224, 7, 0x101 | (0x1FF << 32));          # no AO_MODE: the field is ignored, 0644
+    if (dfm < 0) { kprintln("fssys: mode default FAIL", 24); ok = 0; } else { ksyscall(6, dfm, 0, 0); }
+    if (ksyscall(33, u + 224, 7, u + 256) != 0 || load64(u + 256) != 0x81A4) { kprintln("fssys: mode default FAIL", 24); ok = 0; }
+    ksyscall(30, u + 224, 7, 0);
+    # fsync#115: ext2 is write-through, so it is ONE device flush on ext2's device and NO sector written — sync#12 below
+    # rewrites the superblock as well (the numbers are printed: the ABI row's measurement)
+    if (mfd >= 0) {
+        if (ksyscall(1, mfd, u + 1600, 100) != 100) { kprintln("fssys: fsync write FAIL", 23); ok = 0; }
+        var fl0 = load64(&blk_flushes_by_tag + ext2_backend * 8);
+        var wr0 = load64(&blk_writes_by_tag + ext2_backend * 8);
+        var t0 = klog_uptime_us();
+        if (ksyscall(115, mfd, 0, 0) != 0) { kprintln("fssys: fsync FAIL", 17); ok = 0; }
+        var t1 = klog_uptime_us();
+        var fl1 = load64(&blk_flushes_by_tag + ext2_backend * 8);
+        var wr1 = load64(&blk_writes_by_tag + ext2_backend * 8);
+        if (fl1 != fl0 + 1) { kprintln("fssys: fsync flush FAIL", 23); ok = 0; }
+        if (wr1 != wr0) { kprintln("fssys: fsync wrote FAIL", 23); ok = 0; }
+        if (ksyscall(1, mfd, u + 1600, 0) != 0) { kprintln("fssys: fsync fd FAIL", 20); ok = 0; }   # the fd lives on
+        var t2 = klog_uptime_us();
+        ksyscall(12, 0, 0, 0);
+        var t3 = klog_uptime_us();
+        var wr2 = load64(&blk_writes_by_tag + ext2_backend * 8);
+        kprint("fssys: fsync#115 us=", 20); kprint_num(t1 - t0); kprint(" sectors=", 9); kprint_num(wr1 - wr0);
+        kprint(" flushes=", 9); kprint_num(fl1 - fl0);
+        kprint(" | sync#12 us=", 14); kprint_num(t3 - t2); kprint(" sectors=", 9); kprint_num(wr2 - wr1); kprintln("", 0);
+        ksyscall(6, mfd, 0, 0);
+    }
+    if (ksyscall(115, 99, 0, 0) != 0 - 1 || ksyscall(115, 0 - 1, 0, 0) != 0 - 1 || ksyscall(115, 31, 0, 0) != 0 - 1) {
+        kprintln("fssys: fsync badfd FAIL", 23); ok = 0;
+    }
+    if (ksyscall(115, 1, 0, 0) != 0 - 1) { kprintln("fssys: fsync console FAIL", 25); ok = 0; }   # fd 1: the console
+    if (ksyscall(25, u + 1800, 0, 0) == 0) {
+        var pr7 = load64(u + 1800);
+        var pw7 = load64(u + 1808);
+        if (ksyscall(115, pr7, 0, 0) != 0 - 1 || ksyscall(115, pw7, 0, 0) != 0 - 1) { kprintln("fssys: fsync pipe FAIL", 22); ok = 0; }
+        ksyscall(6, pr7, 0, 0);
+        ksyscall(6, pw7, 0, 0);
+    } else { kprintln("fssys: pipe FAIL", 16); ok = 0; }
+    var rofd = ksyscall(7, u + 192, 7, 0);                            # a READ-ONLY fd syncs too (POSIX fsync)
+    if (rofd < 0 || ksyscall(115, rofd, 0, 0) != 0) { kprintln("fssys: fsync rdonly FAIL", 24); ok = 0; }
+    if (rofd >= 0) { ksyscall(6, rofd, 0, 0); }
 
     ksyscall(12, 0, 0, 0);   # sync
 
@@ -5792,6 +5877,7 @@ fn acpi_fadt_reset_selftest() {
     var af_iommu = acpi_iommu_base;
     var af_fadt = acpi_fadt_addr;
     var af_port = acpi_pm_tmr_port;
+    var af_psrc = psrc_word;      # 1.57.18: power_source#114's answer rides the same two arms (acpi-power: lines)
     acpi_fadt_poison_st();
     acpi_xsdt_addr = 0;
     acpi_rsdt_addr = 0;
@@ -5802,9 +5888,15 @@ fn acpi_fadt_reset_selftest() {
         kprintln("acpi-fadt: FAIL a FADT decode that finds no table left a stale field", 68);
     }
     acpi_fadt_poison_st();
+    psrc_word = 0x5A6C;
     acpi_rsdp_suppress = 1;
     acpi_init();
     acpi_rsdp_suppress = 0;
+    if (psrc_word == 0) {
+        kprintln("acpi-power: PASS acpi_init with no RSDP answers cannot say (word 0)", 67);
+    } else {
+        kprintln("acpi-power: FAIL acpi_init with no RSDP left a stale power-source word", 70);
+    }
     var af_ok2 = 0;
     if (acpi_fadt_all_zero_st() == 1) {
         if (acpi_rsdp_addr == 0) { af_ok2 = 1; }
@@ -5829,6 +5921,11 @@ fn acpi_fadt_reset_selftest() {
         kprintln("acpi-fadt: PASS the re-decode restored the pm timer port and the FADT", 69);
     } else {
         kprintln("acpi-fadt: FAIL the re-decode did not restore the pm timer port and the FADT", 76);
+    }
+    if (psrc_word == af_psrc) {
+        kprintln("acpi-power: PASS the re-decode restored the power-source word", 61);
+    } else {
+        kprintln("acpi-power: FAIL the re-decode did not restore the power-source word", 68);
     }
     return 0;
 }

@@ -641,6 +641,7 @@ fn acpi_init() {
     acpi_pm_tmr_ext = 0;
     acpi_fadt_clear();          # 1.57.7 S1b: EVERY FADT field, so the no-RSDP return below leaves none stale
     # (the early probe's provisional decode would otherwise survive it)
+    psrc_clear();               # 1.57.18: power_source#114's answer too — no RSDP answers "cannot say" (power.cyr)
 
     # Find RSDP
     var rsdp = acpi_find_rsdp();
@@ -700,6 +701,9 @@ fn acpi_init() {
     # nothing and gives every later burn the power-management facts for free.
     acpi_find_fadt();
     acpi_find_s5();
+    # 1.57.18 — power_source#114: scan the DSDT (acpi_dsdt_addr, just decoded) and every SSDT for battery / AC adapter
+    # devices and cache the answer (power.cyr psrc_scan). Read-only, like the two above.
+    psrc_scan();
 
     return 0;
 }

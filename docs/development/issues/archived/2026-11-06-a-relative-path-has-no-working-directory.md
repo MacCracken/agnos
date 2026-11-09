@@ -1,6 +1,14 @@
 # 2026-11-06 — a program's relative path is rooted at /, and each program has to know that
 
-**Status:** 🟡 OPEN, for a ruling. It asks to reverse a stated boundary, so it is the maintainer's call.
+**Status:** ✅ **RESOLVED in agnos 1.57.18** (operator ruling 2026-11-08: the kernel keeps a working directory per process —
+it reverses ABI § 3.2's "CWD is userland-owned"). **`chdir`#112** / **`getcwd`#113**; inherited across `spawn`#3,
+`spawn_path`#43, `execwait`#37 and `fork`#96, and a #43 / #37 child is seeded from a valid `PWD=` in its env, so agnsh's
+children land where agnsh is with no agnsh change. Every relative path any syscall takes resolves from it through one
+ingress (`sc_path_take`, a kernel copy cleaned lexically, never truncated: 4096+ in or 4095+ out is -1). The issue's own
+case — `etc/secret.txt` from a cwd that is not `/` — no longer reads `/etc/secret.txt`. Gate `scripts/smoke/cwd-smoke.sh`
+(ext2, ZFS, FAT; -smp 1 + 4). Design `docs/architecture/working-directory.md`. ⚠ The cyrius `sys_chdir` / `sys_getcwd` peer
+is pending (`cyrius/docs/development/issues/2026-11-08-agnos-sys-chdir-getcwd-112-113-peer.md`); thoth's `fs_path` stays
+correct either way.
 *(Filed from thoth **0.55.1**, whose hostile pass on AGNOS found the cost.)*
 **Checked against:** agnos **107ad763** (1.57.17), `kernel/core/syscall.cyr:569`; cyrius **6.7.18**, `sys_chdir` returns -38; agnoshi `src/cwd.cyr`.
 **Severity:** a security defect in thoth, now fixed there, and the same trap for every other program.

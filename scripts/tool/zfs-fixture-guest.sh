@@ -1639,6 +1639,45 @@ vstep() {      # STEP PASS|FAIL|SKIP|INFO WHY...
     return 0
 }
 
+# (agnos 1.57.18) twin_file MODE — B-acl's twin for a created regular file of MODE (stat(1)'s %p form, e.g. 100600) when
+# the pool under verify holds no FreeBSD-made one (open#7's AO_MODE: the fixture has 0644 / 0755 files only): FreeBSD
+# makes it in a scratch pool on a file vdev (TWIN_POOL, made on first use, destroyed by twin_done) — by open(O_CREAT,
+# 0666) under the umask that leaves exactly MODE (zfs_create -> zfs_acl_ids_create -> zfs_acl_chmod over an empty ACL,
+# the path agnos models), or, for a mode with an x or set-id bit open(O_CREAT, 0666) cannot carry, created and then
+# chmod'ed (zfs_acl_chmod_setattr: aclmode=discard starts from an empty ACL, and split=B_TRUE drops the old trivial
+# entries in any case — the same entries). Sets TWIN_PATH to its path, or to "" (no scratch pool, or the file is not
+# MODE). ⚠ Called directly, never in $(...): the pool's name lives in this shell (a subshell's TWIN_POOL is lost).
+TWIN_POOL=""; TWIN_PATH=""
+twin_file() {
+    TWIN_PATH=""
+    _twm=$(printf '%04o' $(( 0$1 & 07777 )))
+    if [ -z "$TWIN_POOL" ]; then
+        TWIN_POOL=agnostwin$$
+        rm -rf "$TMP/twin.vdev" "$TMP/twin.m"
+        if ! { truncate -s 128m "$TMP/twin.vdev" && zpool create -m "$TMP/twin.m" "$TWIN_POOL" "$TMP/twin.vdev"; } < /dev/null > "$TMP/twin.log" 2>&1; then
+            vstep B-acl INFO "no scratch pool for a guest-made twin: $(tr '\n' ' ' < "$TMP/twin.log" | cut -c1-160)"
+            TWIN_POOL=-
+        fi
+    fi
+    [ "$TWIN_POOL" = - ] && return 0
+    _twf="$TMP/twin.m/f$_twm"
+    if [ ! -e "$_twf" ]; then
+        if [ $(( 0$_twm & 07111 )) = 0 ]; then
+            ( umask "$(printf '%03o' $(( 0666 & ~0$_twm )))"; : > "$_twf" )
+        else
+            : > "$_twf" && chmod "$_twm" "$_twf"
+        fi
+    fi
+    [ "$(stat -f %p "$_twf" 2>/dev/null)" = "$1" ] && TWIN_PATH=$_twf
+    return 0
+}
+twin_done() {
+    if [ -n "$TWIN_POOL" ] && [ "$TWIN_POOL" != - ]; then zpool destroy -f "$TWIN_POOL" < /dev/null > /dev/null 2>&1; fi
+    rm -rf "$TMP/twin.vdev" "$TMP/twin.m"
+    TWIN_POOL=""
+    return 0
+}
+
 vzdb() {       # OUTFILE ARGS... — sets ZRC to zdb's own exit status (124 = timed out, > 128 = killed by a signal)
     _vzo=$1; shift
     timeout "${ZDB_TIMEOUT:-900}" zdb "$@" > "$_vzo" 2>&1
@@ -2363,9 +2402,23 @@ EOF
                         { getfacl -q -n $_ah "$RO$_ac" 2>&1 || echo "getfacl failed"; } | sed "s|$RO$_ac|PATH|g" > "$TMP/acl.twin"
                         cmp -s "$TMP/acl.made" "$TMP/acl.twin" && { _amatch=$_ac; break; }
                     done
+                    # (agnos 1.57.18) an open#7 AO_MODE create of a mode NO FreeBSD-made object of the pool has (the
+                    # fixture holds 0644 / 0755 files only): FreeBSD makes the twin HERE (twin_file — a scratch pool on a
+                    # file vdev, gone after this loop), so the ACL agnos derived from the mode is still held to one OpenZFS
+                    # made, never only to the host's zfs-sa-check.py
+                    if [ -z "$_atw" ] && [ "$_aty" = f ]; then
+                        twin_file "$_sm"
+                        _atp=$TWIN_PATH
+                        if [ -n "$_atp" ]; then
+                            _atw=" (guest-made, a scratch pool) $_atp"
+                            { getfacl -q -n "$_atp" 2>&1 || echo "getfacl failed"; } | sed "s|$_atp|PATH|g" > "$TMP/acl.twin"
+                            cmp -s "$TMP/acl.made" "$TMP/acl.twin" && _amatch=$_atp
+                        fi
+                    fi
                     if [ -z "$_atw" ]; then _abad="$_abad $_sp: no FreeBSD twin (type $_aty, mode ${_sm#${_sm%???}}) in $_amp or the pool;"
                     elif [ -z "$_amatch" ]; then _abad="$_abad $_sp: '$(tr '\n' ' ' < "$TMP/acl.made" | cut -c1-120)' != the twins'$_atw;"; fi
                 done < "$SEED/$VLANE.stat"
+                twin_done
                 if [ -n "$_abad" ]; then vstep B-acl FAIL "$(echo "$_abad" | cut -c2-400)"
                 else vstep B-acl PASS "$_an object(s) the writer created: getfacl == a FreeBSD-made twin's (same type, mode, dataset)"; fi
             else vstep B-acl SKIP "the op list created no object"; fi

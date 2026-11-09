@@ -41,7 +41,8 @@ fn stack_canary_check(canary) {
 #    pages (1.35.4). The natural pair to 27; same pure-memory posture.
 # 45-57 = the net band (getrandom / time_unix / sock_* / udp_* / icmp_echo) — see
 #    the inline handlers below + cyrius lib/syscalls_x86_64_agnos.cyr for the full map.
-# 58=lseek(fd, offset, whence) — VFS_EXT2_FILE read/write cursor reposition (1.45.13).
+# 58=lseek(fd, offset, whence) — VFS_EXT2_FILE read/write cursor reposition (1.45.13); VFS_ZFS_FILE (1.57.11);
+#    an AO_DIRECTORY fd's opaque cookie, SEEK_SET / SEEK_CUR only (1.57.18: telldir / seekdir).
 # 59=flock(fd, op) — BSD advisory whole-file lock, inode-keyed, non-blocking, released
 #    on close#6 + proc exit (1.45.13). Both serve the server-stage persistence/locking
 #    consumers (descent libro/patra, agora shared-world door games).
@@ -52,10 +53,19 @@ fn stack_canary_check(canary) {
 # 61=net_config / 62=exec_redirect / 63=symlink / 64-69=HDA audio band — see the
 #    inline handlers below + cyrius lib/syscalls_x86_64_agnos.cyr for the full map.
 # 70=readlink(path, pathlen, buf, buflen) — symlink INTROSPECTION peer of #63: read a
-#    symbolic link's TEXT target into buf, returning the target byte length or -1. The
+#    symbolic link's TEXT target into buf — at most buflen bytes, returning how many were
+#    copied (1.57.18: a longer target is cut, as on Linux; it was -1) — or -1. The
 #    final path component is resolved NO-FOLLOW (ext2_path_lookup_ex follow_last=0) so it
 #    reads the LINK, not its target; ext2-only. The ring-3 primitive a symlink manager
 #    (hapi) needs to SEE an existing link + byte-compare its target (stat#33 follows).
+# 112=chdir(path, len) / 113=getcwd(buf, cap) — 1.57.18: the per-process WORKING DIRECTORY (proc.cyr proc_cwd_*;
+#    docs/architecture/working-directory.md). Every path-taking arm reads its path through sc_path_take (the ingress,
+#    below), which resolves a relative one against it; inherited across #3/#37/#43/#96, seeded from a #43/#37 PWD=.
+# 114=power_source() — the boot-time ACPI namespace scan's cached answer: w & 0xFF = 0 cannot say / 1 mains / 2 battery
+#    (reserved), PSRC_F_* reason bits above it (power.cyr psrc_scan; 1.57.18). No args, no pointer, never negative.
+# 115=fsync(fd) — ONE file made durable (1.57.18): ext2 the device flush (write-through, no sector), ZFS its object's
+#    pending policy-B txg committed (another file's stays pending), FAT/exFAT the write-back buffer + flush; 0 for a
+#    dir / memfile fd; -1 for a non-file fd.
 
 var sys_exit_code = 0;
 
@@ -566,27 +576,212 @@ fn is_user_array(ptr, count, stride) {
     return is_user_range(ptr, count * stride);
 }
 
-# A RELATIVE path (no leading '/') has no CWD in agnos, so it is rooted at the "/"
-# mount — the writable ext2/primary root. This scratch buffer holds the "/"-prepended
-# form so bare names (`touch foo`, `cmd > foo`) create in the root FS instead of
-# falling through to the read-only initrd (the open handler uses it; the ext2 lookup
-# needs the leading '/').
-#
-# ⛔⛔ 1.56.51 — PER-CPU. The banner here used to end "Single-threaded per syscall ⇒ one shared
-# buffer is safe", and that premise died when the SMP arc shipped: smp_wake_enabled=1
-# (main.cyr) and smp_sched_aps=1 (smp.cyr) mean APs pull real ring-3 procs, and IF=0
-# serialises nothing ACROSS cores. Both the write below and the vfs_resolve_mount that consumes
-# it sit OUTSIDE fs_spin_lock (which #7 takes later, at the ext2 arm), so two CPUs could be in
-# this arm at once: CPU 0 writes "/config", CPU 1 overwrites it with "/secrets", and CPU 0 then
-# opens a path it never named — with the two procs' fd tables private, so nothing downstream
-# notices. Every sibling scratch buffer in this file was converted for SMP and says so
-# (pcpu_spawn_path_buf, pcpu_spawn_env_buf, pcpu_sc_gpuop — and #37's pcpu_ew37_path / pcpu_ew37_env /
-# pcpu_redir_backup until 1.57.7 S3b deleted them: #37 stages through spawn_load_child's buffers now); this one was
-# missed, and its own comment is what stopped a reader noticing.
-# [128] = 128 u64 = 1024 B = 256 B per CPU x 4; cpu c at byte c*256. (The 8N module-global rule.)
+# ═══════════════ 1.57.18 — THE PATH INGRESS: one place every path a syscall takes comes through ═══════════════
+# (docs/architecture/working-directory.md; operator ruling 2026-11-08 on issue 2026-11-06-a-relative-path-has-no-working-
+# directory.) sc_path_take COPIES the caller's (ptr, len) path into this CPU's slot (Linux getname: the kernel reads the
+# user's bytes once) and, when it is RELATIVE (no leading '/'), RESOLVES it against the caller's working directory
+# (proc.cyr proc_cwd_*, chdir#112): cwd + "/" + name, cleaned LEXICALLY (path_clean_join). Every path-taking arm —
+# open#7, mkdir#9, rmdir#10, unlink#30, rename#31 (both), link#32 (both), stat#33, symlink#63 (the LINK path; its target
+# is text and is never rewritten), readlink#70, readdir#81 / readdir_at#101 (sc_cpath_take: their NUL-terminated form),
+# lstat#102, statfs#103, chdir#112, and the program path of spawn_path#43 / execwait#37 (spawn_load_child) — reads its
+# path ONLY through here, so no arm can forget the cwd.
+# ⛔ NEVER TRUNCATED. A path whose input is longer than CWD_MAX (4095) bytes, or whose resolved form (or any prefix the
+# walk builds) would be, is REFUSED (-1; Linux ENAMETOOLONG). Until 1.57.18 a relative name was rooted at "/" through a
+# 256-byte per-CPU buffer and one of 255+ bytes was refused for the buffer's sake (1.57.12 B6: it had been truncated).
+# ⭐ AN ABSOLUTE PATH IS COPIED VERBATIM — its "." / ".." are the backend's, exactly as before (ext2's on-disk "..",
+# ZFS's canonical walk), the Linux behaviour for an absolute name. Only the RELATIVE join is cleaned, because the cwd is a
+# string: "../x" from /mnt/zfs/a means /mnt/zfs/x, and ".." from /mnt/zfs is "/mnt", across the mount boundary — the
+# shell's logical `cd`. chdir#112 cleans an absolute target too (a cwd must be normalized).
+# ⛔⛔ PER-CPU (the 1.56.51 lesson that made its predecessor pcpu_sc_open_abs per-CPU): the arms run IF=0 OUTSIDE
+# fs_spin_lock until their backend arm, so two CPUs are in them at once. Two slots per CPU: rename#31 / link#32 hold two
+# paths at once (slot 0 the first, slot 1 the second). ROOM slot 13 (core/room.cyr): 4 CPUs x 2 x 4096 B = 32 KB out of
+# the image; cpu c, slot s at c * 8192 + s * 4096. Every path syscall runs long after room_init.
 # R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
-var pcpu_sc_open_abs[128];
-fn sc_open_abs_base() { return &pcpu_sc_open_abs + pcpu_cpu() * 256; }
+var pcpu_sc_path = 0xFFFFA00D00000000;   # ROOM slot 13 — 4 CPUs x 2 slots x 4096 B (core/room.cyr)
+fn sc_path_buf(slot) { return pcpu_sc_path + pcpu_cpu() * 8192 + slot * 4096; }
+
+# The cleaned absolute path of `rel` (rlen bytes) joined to the directory `base` (blen bytes: a normalized absolute path,
+# or blen 0 = "/"), written at dst and NUL-terminated there; its length, or -1 when it would exceed CWD_MAX. Lexical, as
+# Plan 9's cleanname and a shell's logical $PWD: empty components and "." vanish, ".." removes the component before it and
+# never climbs above "/", no trailing '/' (except "/" itself). A leading '/' in rel is just an empty component, so an
+# absolute rel with blen 0 cleans that path. dst never aliases base (callers pass a sc_path_buf slot; base is a cwd).
+fn path_clean_join(base, blen, rel, rlen, dst) {
+    store8(dst, 47);
+    var pj_o = 1;                                    # bytes in dst; dst[0] is the root's '/'
+    if (blen > 1) {
+        if (blen > CWD_MAX) { return 0 - 1; }
+        memcpy(dst, base, blen);
+        pj_o = blen;
+    }
+    var pj_i = 0;
+    while (pj_i < rlen) {
+        while (pj_i < rlen) { if (load8(rel + pj_i) != 47) { break; } pj_i = pj_i + 1; }
+        var pj_s = pj_i;
+        while (pj_i < rlen) { if (load8(rel + pj_i) == 47) { break; } pj_i = pj_i + 1; }
+        var pj_n = pj_i - pj_s;
+        var pj_skip = 0;
+        if (pj_n == 0) { pj_skip = 1; }
+        if (pj_n == 1) { if (load8(rel + pj_s) == 46) { pj_skip = 1; } }            # "."
+        if (pj_n == 2) {
+            if (load8(rel + pj_s) == 46) {
+                if (load8(rel + pj_s + 1) == 46) {                                  # ".." — drop the last component
+                    pj_skip = 1;
+                    while (pj_o > 1) { if (load8(dst + pj_o - 1) == 47) { break; } pj_o = pj_o - 1; }
+                    if (pj_o > 1) { pj_o = pj_o - 1; }                              # and its '/', unless that is the root
+                }
+            }
+        }
+        if (pj_skip == 0) {
+            var pj_need = pj_o + pj_n;
+            if (pj_o > 1) { pj_need = pj_need + 1; }
+            if (pj_need > CWD_MAX) { return 0 - 1; }                                # REFUSED, never cut
+            if (pj_o > 1) { store8(dst + pj_o, 47); pj_o = pj_o + 1; }
+            memcpy(dst + pj_o, rel + pj_s, pj_n);
+            pj_o = pj_o + pj_n;
+        }
+    }
+    store8(dst + pj_o, 0);
+    return pj_o;
+}
+
+# THE INGRESS. A validated user path (sc_path_ok: 1+ bytes, an owned user range) -> its length in sc_path_buf(slot),
+# NUL-terminated there; or -1 (bad range, empty, over CWD_MAX, or the relative join over CWD_MAX). The caller then routes
+# sc_path_buf(slot) — a KERNEL copy, so the backend reads exactly the bytes that were checked.
+fn sc_path_take(uptr, ulen, slot) {
+    if (sc_path_ok(uptr, ulen) == 0) { return 0 - 1; }
+    if (ulen > CWD_MAX) { return 0 - 1; }
+    var pt_d = sc_path_buf(slot);
+    if (load8(uptr) == 47) {
+        memcpy(pt_d, uptr, ulen);
+        store8(pt_d + ulen, 0);
+        return ulen;
+    }
+    var pt_me = proc_current_get();
+    return path_clean_join(proc_cwd_ptr(pt_me), proc_cwd_len_get(pt_me), uptr, ulen, pt_d);
+}
+# readdir#81 / readdir_at#101 pass a NUL-terminated path in a 256-byte window (their preamble since 1.41.x, unchanged):
+# its length -> sc_path_take. 0 for an EMPTY string (the slot holds "" and the backends answer -2 as before). ⛔ A window
+# with no NUL is REFUSED (-1) — the backends' strlen stopped at 255 and listed the directory the first 255 bytes named.
+fn sc_cpath_take(uptr, slot) {
+    if (is_user_range(uptr, 256) == 0) { return 0 - 1; }
+    var ct_n = 0;
+    while (ct_n < 256) { if (load8(uptr + ct_n) == 0) { break; } ct_n = ct_n + 1; }
+    if (ct_n >= 256) { return 0 - 1; }
+    if (ct_n == 0) { store8(sc_path_buf(slot), 0); return 0; }
+    return sc_path_take(uptr, ct_n, slot);
+}
+
+# Is the n-byte resolved absolute path p an existing DIRECTORY, on whatever owns it? 1 / 0. Follows a final symlink
+# (chdir(2) does). Takes fs_lock (callers hold none). "/" is always one. The /fonts names are files, never directories.
+var sc_isdir_st[6];                       # 48 B — zfs_stat's struct (used under fs_lock only)
+fn sc_path_is_dir(p, n) {
+    if (n < 1) { return 0; }
+    if (n == 1) { if (load8(p) == 47) { return 1; } }
+    var id_be = vfs_resolve_mount(p, n);
+    var id_r = 0;
+    fs_spin_lock();
+    if (id_be == FS_EXT2) {
+        var id_ino = ext2_path_lookup(p, n);
+        if (id_ino > 0) {
+            if (ext2_get_inode(id_ino, &ext2_inode_buf) == 0) {
+                if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x4000) { id_r = 1; }
+            }
+        }
+    }
+    if (id_be == FS_ZFS) {
+        var id_zr = zfs_reloff(p, n);
+        if (zfs_stat(p + id_zr, n - id_zr, 1, &sc_isdir_st) == 0) {
+            if ((load64(&sc_isdir_st) & 0xF000) == 0x4000) { id_r = 1; }
+        }
+    }
+    # FAT / exFAT: the mount-relative offset from the PATH (the mount table is fixed after boot), not vfs_mnt_reloff,
+    # which every CPU's vfs_resolve_mount writes (the zfs_reloff rule).
+    if (id_be == FS_FAT) {
+        var id_fo = 0;
+        if (n >= 8) { if (memeq(p, "/mnt/fat", 8) == 1) { if (n == 8 || load8(p + 8) == 47) { id_fo = 8; } } }
+        id_r = fat_path_is_dir(p + id_fo, n - id_fo);
+    }
+    if (id_be == FS_EXFAT) {
+        var id_xo = 0;
+        if (n >= 10) { if (memeq(p, "/mnt/exfat", 10) == 1) { if (n == 10 || load8(p + 10) == 47) { id_xo = 10; } } }
+        id_r = exfat_path_is_dir(p + id_xo, n - id_xo);
+    }
+    fs_spin_unlock();
+    return id_r;
+}
+
+# chdir#112(path, len) -> 0 / -1. The caller's cwd becomes the cleaned absolute form of path (a relative one joined to the
+# current cwd), when that names an existing DIRECTORY (a final symlink to one counts — the stored string is the LINK's
+# path, as a shell's logical cd keeps it). -1, NOTHING CHANGED: a bad range, an empty or NUL-holding path, one over
+# CWD_MAX (input or result), a missing path, a non-directory. The check and the store run on the caller's own CPU with
+# nothing between them that another process could act on this cwd through (only the caller writes its own cwd).
+fn sys_chdir(uptr, ulen) {
+    if (sc_path_ok(uptr, ulen) == 0) { return 0 - 1; }
+    if (ulen > CWD_MAX) { return 0 - 1; }
+    var cd_i = 0;
+    while (cd_i < ulen) { if (load8(uptr + cd_i) == 0) { return 0 - 1; } cd_i = cd_i + 1; }   # a C-string consumer of getcwd
+    var cd_me = proc_current_get();
+    if (cd_me < 0) { return 0 - 1; }
+    if (cd_me >= 16) { return 0 - 1; }
+    var cd_d = sc_path_buf(0);
+    var cd_n = 0;
+    if (load8(uptr) == 47) { cd_n = path_clean_join(0, 0, uptr, ulen, cd_d); }
+    else { cd_n = path_clean_join(proc_cwd_ptr(cd_me), proc_cwd_len_get(cd_me), uptr, ulen, cd_d); }
+    if (cd_n < 1) { return 0 - 1; }
+    if (sc_path_is_dir(cd_d, cd_n) != 1) { return 0 - 1; }
+    return proc_cwd_set(cd_me, cd_d, cd_n);
+}
+
+# getcwd#113(buf, cap) -> the cwd's length L (the NUL not counted) / -1. Writes the L bytes AND a NUL, so cap must be at
+# least L + 1; a smaller cap is -1 with NOTHING written (Linux ERANGE — never cut, unlike readlink). Only the L + 1 bytes
+# written are validated. A pure read: no lookup, no lock — the string is what the caller last chdir'd to, even if that
+# directory has since been removed or renamed (Linux answers ENOENT for an unlinked cwd; see the doc).
+fn sys_getcwd(ubuf, cap) {
+    var gw_me = proc_current_get();
+    if (gw_me < 0) { return 0 - 1; }
+    if (gw_me >= 16) { return 0 - 1; }
+    var gw_n = proc_cwd_len_get(gw_me);
+    var gw_src = "/";
+    if (gw_n == 0) { gw_n = 1; } else { gw_src = proc_cwd_ptr(gw_me); }
+    if (cap < gw_n + 1) { return 0 - 1; }
+    if (is_user_range(ubuf, gw_n + 1) == 0) { return 0 - 1; }
+    memcpy(ubuf, gw_src, gw_n);
+    store8(ubuf + gw_n, 0);
+    return gw_n;
+}
+
+# spawn_path#43 / execwait#37: SEED the new child's cwd from a `PWD=` in the env blob it was given (the kernel copy,
+# already sc_env_blob_ok'd), so agnsh's children (agnsh exports PWD) start in agnsh's directory with no agnsh change.
+# PRECEDENCE: (1) the FIRST `PWD=` entry, when its value is absolute, cleans to <= CWD_MAX and names an existing
+# directory; (2) otherwise the creator's cwd, already copied by proc_create_user. An invalid PWD (relative, empty, too
+# long, missing, a file) is IGNORED — the env still carries it, untouched (the kernel never rewrites an env) — the way
+# bash ignores a $PWD that does not name its directory. Runs before READY (the child is CLAIMING); takes fs_lock for the
+# lookup. Returns 1 seeded / 0 not.
+fn spawn_seed_cwd(child, env, elen) {
+    var sd_i = 0;
+    while (sd_i < elen) {
+        var sd_s = sd_i;
+        while (sd_i < elen) { if (load8(env + sd_i) == 0) { break; } sd_i = sd_i + 1; }
+        var sd_n = sd_i - sd_s;
+        sd_i = sd_i + 1;
+        if (sd_n >= 4) {
+            if (memeq(env + sd_s, "PWD=", 4) == 1) {
+                var sd_v = env + sd_s + 4;
+                var sd_vl = sd_n - 4;
+                if (sd_vl < 1) { return 0; }
+                if (load8(sd_v) != 47) { return 0; }
+                if (sd_vl > CWD_MAX) { return 0; }
+                var sd_d = sc_path_buf(1);
+                var sd_c = path_clean_join(0, 0, sd_v, sd_vl, sd_d);
+                if (sd_c < 1) { return 0; }
+                if (sc_path_is_dir(sd_d, sd_c) != 1) { return 0; }
+                proc_cwd_set(child, sd_d, sd_c);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
 
 # 1.41.6 (#22): the path-argument preamble every mount-routed FS syscall shares —
 # a non-empty length AND a valid user range. Returns 1 if (ptr,len) is an
@@ -1312,12 +1507,20 @@ var kbd_reclaim_said = 0;
 #                 ring in, so a key already reported is discarded too) and the NB reader's partial line. Linux
 #                 tcflush(TCIFLUSH); NOECHO|FLUSH in one call is TCSETSF, which is what tty_echo_off issues. It takes
 #                 the LINE for the flush only (console_mode_sys) and gives it straight back.
+#   CM_NOSERIAL 4 — (1.57.18, issue 2026-11-06-the-console-is-short-of-a-terminal) ⛔ NOT THE CONSOLE'S: A PER-PROCESS
+#                 bit, set and cleared by the process for ITS OWN writes. While set, what the process writes to a
+#                 console fd is drawn on the framebuffer and kept in klug but NOT mirrored to COM1 (devs.cyr
+#                 serial_dev_write); the kernel's own lines, a panic, and every other process's writes — its
+#                 children's included — stay mirrored. It lives in the process's slot (proc.cyr proc_con_noser), so it
+#                 dies with the process and a fork / spawn child starts without it. No holder, no line: any process
+#                 may set or clear only its own. Returned in the "previous flags" word with the console's bits.
 # CM_TEST (0x700): a TTY_SELFTEST build's geometry knob (tty_test_knob); a production kernel refuses it as unknown.
 enum ConsoleMode {
     CM_NOECHO   = 1;
     CM_FLUSH    = 2;
-    CM_SET_OK   = 3;           # the bits `set` may carry
-    CM_CLEAR_OK = 1;           # the bits `clear` may carry (FLUSH is no mode: nothing to clear)
+    CM_NOSERIAL = 4;           # per process (above), never the console's mode
+    CM_SET_OK   = 7;           # the bits `set` may carry
+    CM_CLEAR_OK = 5;           # the bits `clear` may carry (FLUSH is no mode: nothing to clear)
     CM_T_SAME   = 0x100;       # TTY_SELFTEST: fb_set_geom to the SAME geometry (the grid must not change: silent)
     CM_T_SHRINK = 0x200;       # TTY_SELFTEST: halve the width (the grid changes: SIGWINCH to the watchers)
     CM_T_RESTORE = 0x400;      # TTY_SELFTEST: put back the override the last SHRINK saved (changes again)
@@ -1840,7 +2043,14 @@ fn console_mode_sys(set, clear) {
     input_spin_unlock();
     kbd_irq_restore(cm_f);
     if (cm_fl == 1) { kbd_line_release(cm_me); }
-    return cm_prev;
+    # 1.57.18 — CM_NOSERIAL: the CALLER's own cell (proc.cyr proc_con_noser; only this process and its slot's scrub
+    # write it, so no lock). Applied last, after FLUSH could still refuse with nothing changed; `set` wins over `clear`
+    # (new = (old & ~clear) | set). The previous flags carry the caller's bit beside the console's.
+    var cm_ns = 0;
+    if (load64(&proc_con_noser + cm_me * 8) != 0) { cm_ns = CM_NOSERIAL; }
+    if ((clear & CM_NOSERIAL) != 0) { store64(&proc_con_noser + cm_me * 8, 0); }
+    if ((set & CM_NOSERIAL) != 0) { store64(&proc_con_noser + cm_me * 8, 1); }
+    return cm_prev | cm_ns;
 }
 
 #ifdef TTY_SELFTEST
@@ -2046,11 +2256,104 @@ fn sys_open_ext2_inner(arg1, arg2, arg3) {
         if ((arg3 & 0x100) == 0) { return 0 - 1; }
         var par7 = vfs_ext2_parent(arg1, arg2);
         if (par7 <= 0) { return 0 - 1; }
-        if (ext2_create(par7, arg1 + vfs_base_off, vfs_base_len) <= 0) { return 0 - 1; }
+        # 1.57.18: AO_MODE's permission bits for the NEW inode (sc_open_mode; the arm refused a bad field), else 0644
+        var pm7 = sc_open_mode(arg3);
+        if (pm7 < 0) { pm7 = 0x1A4; }
+        if (ext2_create_m(par7, arg1 + vfs_base_off, vfs_base_len, pm7) <= 0) { return 0 - 1; }
     } else {
         if ((arg3 & 0x200) != 0) { ext2_truncate_zero(ino7); }
     }
     return ext2_open(arg1, arg2);
+}
+
+# ═══════════════ 1.57.18 — open#7's CREATE MODE (AO_MODE) and a per-file sync (fsync#115) ═══════════════
+# Issue 2026-11-06-open-has-no-create-mode (filed from thoth 0.55.1): open#7 carried no mode, so every create got the
+# backend's default (ext2 0644, ZFS 0100644) — thoth's tool pins / session store / session log, hoosh's and daimon's
+# credentials, 0600 on Linux and macOS, landed world-readable here with no way to ask otherwise. Its "Related" half:
+# the cyrius `sys_fsync` was sync#12, the WHOLE system (every ZFS pending txg, ext2's superblock, every device flush).
+#
+# ⭐ AO_MODE (a3 bit 14, 0x4000 — the bit after AO_EXCL 0x2000) says BITS 32..63 OF a3 ARE THE CREATE MODE: 0..07777,
+# owner / group / other rwx plus S_ISUID 04000, S_ISGID 02000, S_ISVTX 01000, stored as given — agnos has NO umask (no
+# per-process state holds one; the caller applies its own), and every process is uid 0 (getuid#15 by ruling), the
+# caller Linux's inode_init_owner / FreeBSD's ufs_makeinode and zfs_acl_ids_create let keep S_ISGID. Linux keeps
+# S_ISVTX on a regular file too; FreeBSD's kern_openat strips it (`& ~S_ISTXT`) — agnos follows Linux, the ABI it maps
+# its flags from (cyrius lib/io.cyr). With AO_MODE set, a field above 07777 is -1 and nothing is created (openat2's
+# EINVAL for a mode outside S_IALLUGO; open(2) itself masks silently, which hides a caller's bug). The mode applies ONLY
+# when the call CREATES: an existing file keeps its mode (POSIX open). Without AO_MODE nothing changes: bits 32..63
+# stay ignored, as on every kernel before 1.57.18, and a create gets the default — so no shipped caller (cyrius
+# file_open maps only O_ACCMODE / O_CREAT / O_TRUNC / O_APPEND / O_DIRECTORY / O_NOFOLLOW / O_EXCL) changes. Before
+# 1.57.18 the kernel IGNORED both the bit and the field, so a caller that needs the mode honoured probes once (create,
+# stat#33, compare). Why a flag + a field of a3 and not a4: open#7 is a 3-argument call, so a4 is a stale r10 in every
+# shipped caller (the #100 rule, ABI § 1a) — the epoll_wait#21 EPW_TIMED precedent, an opt-in folded into an argument
+# the call already defines. FAT / exFAT keep no permission bits: the mode is checked and ignored there (Linux vfat
+# takes its permissions from the mount's fmask, never from the create); the initrd and /fonts never create.
+# Backends: ext2_create_m (i_mode = S_IFREG | perm) and ZFS zfs_wcreate (the SA MODE and the trivial NFSv4 ACL
+# zfs_acl_chmod derives from it — allow0 / deny1 / deny2 included, zfs_write.cyr zfs_wc_aces). mkdir#9 keeps its
+# default (0755): it has no flags argument — a3 is stale in every shipped 2-argument `sys_mkdir(path, pathlen)` — so
+# no opt-in as clean as this one exists there.
+enum AoMode {
+    AO_MODE       = 0x4000;
+    AO_MODE_SHIFT = 32;
+}
+# The permission bits open#7's a3 asks a create to use: -1 when AO_MODE is clear (the backend's default), -2 when
+# AO_MODE is set and bits 32..63 hold a value above 07777 (the arm refuses the call), else 0..07777.
+fn sc_open_mode(flags) {
+    if ((flags & AO_MODE) == 0) { return 0 - 1; }
+    var m = (flags >> AO_MODE_SHIFT) & 0xFFFFFFFF;
+    if (m > 0xFFF) { return 0 - 2; }
+    return m;
+}
+
+# ⭐ fsync#115(fd) — make what the FILE holds durable, and nothing else (Linux fsync(2) / FreeBSD fsync(2)). 0 / -1.
+# PRIOR ART: Linux ext2_fsync -> generic_file_fsync: write out that inode's dirty pages and buffers, then its metadata,
+# then blkdev_issue_flush; OpenZFS zfs_fsync -> zil_commit(zilog, zp->z_id), or with no ZIL (sync=disabled aside)
+# txg_wait_synced of the txg holding the file's dirty data. MEASURED here first (1.57.18, the ABI row's numbers):
+#   · ext2 is WRITE-THROUGH — every write#1 is on the controller when it returns (blk_write completes the command;
+#     bitmaps, inodes and the superblock's counts go out as they change) and the jbd2 journal is inert on real writes
+#     (power.cyr's header) — so an ext2 file holds NOTHING in memory: its fsync is the device FLUSH, exactly
+#     generic_file_fsync's last step, and writes no sector. sync#12 also rewrites the superblock (VALID_FS set — and the
+#     next write#1 clears it again: two more superblock writes) and commits ZFS's pending txg, whoever's it is.
+#   · ZFS policy B (1.57.12 B11) holds ONE pending txg pool-wide, of ONE object (zfs_wp_ref): fsync of that object's fd
+#     COMMITS it (two device flushes inside the commit: durable on return); of any other ZFS fd it commits NOTHING — the
+#     file has no dirty data, every earlier commit already flushed — save the age bound every ZFS entry applies
+#     (zfs_wp_obs: a pending txg past ZWP_AGE, 5 s, is committed by whoever meets it; agnos has no sync thread).
+#   · FAT / exFAT write-back fd (VFS_SEC_WFILE): its buffered content written now (the whole file, vfs_write_on — what
+#     close#6 does, the slot kept), then the device flush: Linux fat_file_fsync = generic_file_fsync + sync_mapping_buffers.
+# A READ-ONLY fd syncs its file as well (POSIX fsync needs no write access; Linux and FreeBSD fsync an O_RDONLY fd — and
+# on ZFS it commits a pending txg another fd's writes left). A directory fd (AO_DIRECTORY) is 0: ext2 flushes the device
+# (the dirents went out at the op), and every ZFS directory op is its own committed txg (policy A). A memory file (the
+# initrd, a FAT / exFAT read fd, /fonts) holds nothing to sync: 0. Any other fd — the console, a pipe, a socket, a
+# channel, a signalfd / epoll / timerfd — is -1 (Linux EINVAL), as is a closed or out-of-range one (EBADF). -1 also
+# when the device flush fails, when the fd's ZFS object is gone or is another one now (D11, as read / write), and once
+# for a ZFS file whose pending commit failed (zfs_wp_eref: the writes are lost — POSIX's deferred EIO).
+# sync#12 takes no argument (its a1 is stale in every shipped caller), so it cannot be given an fd: a new number.
+fn sys_fsync_fd(fd) {
+    if (fd < 0) { return 0 - 1; }
+    if (fd >= 32) { return 0 - 1; }
+    var base = vfs_fd_table() + fd * 32;
+    var r = 0 - 1;
+    var dev = 0 - 1;                                  # the block device to FLUSH once fs_lock is released (-1: none)
+    fs_spin_lock();
+    var t = ktag(base);
+    if (t == VFS_EXT2_FILE || t == VFS_EXT2_DIR) {
+        r = 0;
+        if (ext2_active != 0 && ext2_write_ok != 0) { dev = ext2_backend; }
+    } elif (t == VFS_ZFS_FILE || t == VFS_ZFS_DIR) {
+        r = zfs_wp_fsync(base);
+    } elif (t == VFS_SEC_WFILE) {
+        r = vfs_sec_wfile_sync(base);
+        if (r != 0) { r = 0 - 1; }
+        if (kpayload(base, 1) == FS_FAT && fatfs_active != 0) { dev = fat_backend; }
+        if (kpayload(base, 1) == FS_EXFAT && exfat_active != 0) { dev = exfat_backend; }
+    } elif (t == VFS_MEMFILE) {
+        r = 0;
+    }
+    fs_spin_unlock();
+    # the flush outside fs_lock: the block layer takes its own locks (fs < nvme / ahci, the forward order sync#12 keeps)
+    if (r == 0 && dev >= 0) {
+        if (blk_flush_on(dev) != 0) { r = 0 - 1; }
+    }
+    return r;
 }
 
 # ================================================================
@@ -6525,34 +6828,131 @@ fn chan_peer_alive(e) { return load64(&chan_end_open + (e ^ 1) * 8); }
 # ⛔ THESE TAKE AN ALREADY-AUTHORIZED ENDPOINT. Authority is re-derived by `chan_auth` at each call
 # site and is NOT re-checked here — keeping the check at the boundary is what makes an inherited fd
 # inert on every path, including these two new ones.
-fn chan_queue(se, ubuf, slen): i64 {
+# ═══════════════ 1.57.18 — TERMINAL BACK-PRESSURE, epoll ON A CHANNEL (issues 2026-11-06-a-channel-write-drops-the-oldest-
+# record-and-nobody-is-told, 2026-11-06-no-readiness-wait-on-one-fd; docs/architecture/blocking-waits.md "Channel writes")
+# ═══════════════
+# ⭐ TWO QUEUEING RULES, chosen by the CHANNEL, not the caller's mood:
+#   DISPLAY channel (neither end endowed in PTY mode) and EVERY `CH_SEND` — bounded queue, DROP-OLDEST, never blocks
+#     (planning/ipc.md §3: presents are idempotent overwrites; a blocking send would starve the peer it waits on).
+#   TERMINAL channel (either end has chan_end_pty: the terminal end, or the emulator's end of one) through write#1 —
+#     BACK-PRESSURE: a full peer inbox refuses the record (chan_queue_bp), and write#1 with a4 == 0 WAITS for room
+#     (chan_wr1_wait), as a pipe has since 1.57.9 and as a tty does (Linux n_tty_write -> wait_woken on write_wait;
+#     FreeBSD ttydisc_write -> tty_wait(t_outwait); Mach ipc_mqueue_send on a port at its qlimit). Every byte matters on
+#     a tty: thoth measured 4,037 of a 20,000-byte reply arriving, with the writer told nothing.
+# ⛔ ALL CURSOR WORK RUNS UNDER chan_lock (smp.cyr). The band had no lock until 1.57.18; back-pressure's check-then-
+# write must not admit two writers into one free slot.
+# ⛔ THE CLAIM'S CHANNEL EPOCH IS RE-CHECKED UNDER THE LOCK (`cep` = the fd's payload[1], which chan_auth compared to
+# chan_epoch before the call): a claim whose channel was closed and RE-MINTED between its authorization and the copy
+# would otherwise write into — or read out of — the new channel's inbox. A mint bumps chan_epoch under the lock.
+var CHAN_WKEY = 0x100;               # WK_CHAN | CHAN_WKEY | pe: a write#1 BLOCKED for room in endpoint pe's inbox
+var EP_CHAN_SHIFT = 8;               # WK_EPOLL key bit (EP_CHAN_SHIFT + e): an epoll_wait#21 watching endpoint e (bits 8..39)
+# 1 when endpoint e's CHANNEL is a terminal: either end was endowed in PTY mode (the terminal end, or its emulator's).
+fn chan_is_tty(e) {
+    if (load64(&chan_end_pty + e * 8) == 1) { return 1; }
+    if (load64(&chan_end_pty + (e ^ 1) * 8) == 1) { return 1; }
+    return 0;
+}
+# The claim epoch of channel fd `fd` in the caller's table (payload[1]); the arms pass it after chan_fd_endpoint.
+fn chan_fd_cep(fd) { return kpayload(vfs_fd_table() + fd * 32, 1); }
+# epoll_wait#21 wakers for endpoint bit mask `m` (bit e = the holders of endpoint e). Called AFTER the condition store
+# and a full fence (chan_spin_unlock's / sched_lock's xchg), so either the waiter's scan (after its `lock or` of
+# ep_waiters) saw the condition, or this load sees its bit — ep_wake_tcp's Dekker pair. A stale bit costs one scan.
+fn ep_wake_chan(m) {
+    if (m == 0) { return 0; }
+    if (ep_waiters == 0) { return 0; }
+    return wq_wake_anybit(WK_EPOLL, (m & 0xFFFFFFFF) << EP_CHAN_SHIFT);
+}
+# Endpoint pe's inbox GAINED a record: its blocked readers (read#5) and its epoll holders (EPOLLIN) re-check.
+fn chan_wake_in(pe) {
+    wq_wake(WK_CHAN | pe);              # 1.57.8: after the chan_w store — a blocked read#5 on pe re-checks
+    ep_wake_chan(1 << pe);
+    return 0;
+}
+# Endpoint re's inbox LOST a record while it was FULL: the writers blocked for room in it (write#1 on re's peer) and the
+# peer's epoll holders (EPOLLOUT) re-check.
+fn chan_wake_out(re) {
+    wq_wake(WK_CHAN | CHAN_WKEY | re);
+    ep_wake_chan(1 << (re ^ 1));
+    return 0;
+}
+# Endpoint e (or its peer) CLOSED — CH_CLOSE, the owner's death: every reader and every blocked writer on EITHER end of
+# the channel re-checks (the peer's readers see EOF, its writers -1 / their partial count; e's own holders find their
+# claim gone), and both ends' epoll holders re-scan (the peer reports EPOLLHUP). One class-masked wake: msk ~0x101
+# folds both endpoints of the channel and the CHAN_WKEY bit onto WK_CHAN | (e & ~1).
+fn chan_wake_all(e) {
+    wq_wake_m(WK_CHAN | (e & 0x1E), 0 - 1 - 0x101);
+    ep_wake_chan(3 << (e & 0x1E));
+    return 0;
+}
+# Copy `n` (1..64) bytes from `ubuf` into slot `wv` of endpoint pe's inbox and record its length. CALLER HOLDS chan_lock
+# and stores chan_w itself (once per hold).
+fn chan_put_locked(pe, wv, ubuf, n) {
+    var slot = chan_page(pe) + (wv % CHAN_SLOTS) * CHAN_REC_BYTES;
+    memset(slot, 0, CHAN_REC_BYTES);
+    var si = 0;
+    while (si < n) { store8(slot + si, load8(ubuf + si)); si = si + 1; }
+    store8(&chan_lens + (pe * CHAN_SLOTS + (wv % CHAN_SLOTS)), n);
+    return 0;
+}
+
+# DROP-OLDEST (CH_SEND, and write#1 on a DISPLAY channel): one record of 1..64 bytes, never refused for room.
+fn chan_queue(se, cep, ubuf, slen): i64 {
     if (slen <= 0) { return 0 - CH_E_ARG; }
     if (slen > CHAN_REC_BYTES) { return 0 - CH_E_ARG; }
     if (is_user_range(ubuf, slen) == 0) { return 0 - CH_E_ARG; }
     var pe = se ^ 1;
-    if (load64(&chan_end_open + pe * 8) != 1) { return 0 - CH_E_PEERGONE; }
+    chan_spin_lock();
+    if (load64(&chan_epoch + (se >> 1) * 8) != cep) { chan_spin_unlock(); return 0 - CH_E_BADFD; }
+    if (load64(&chan_end_open + pe * 8) != 1) { chan_spin_unlock(); return 0 - CH_E_PEERGONE; }
     var wv = load64(&chan_w + pe * 8);
     var rv = load64(&chan_r + pe * 8);
     if ((wv - rv) >= CHAN_SLOTS) {
         store64(&chan_r + pe * 8, rv + 1);      # drop the OLDEST
         chan_drops = chan_drops + 1;
     }
-    var slot = chan_page(pe) + (wv % CHAN_SLOTS) * CHAN_REC_BYTES;
-    memset(slot, 0, CHAN_REC_BYTES);
-    var si = 0;
-    while (si < slen) { store8(slot + si, load8(ubuf + si)); si = si + 1; }
-    store8(&chan_lens + (pe * CHAN_SLOTS + (wv % CHAN_SLOTS)), slen);
+    chan_put_locked(pe, wv, ubuf, slen);
     store64(&chan_w + pe * 8, wv + 1);
-    wq_wake(WK_CHAN | pe);              # 1.57.8: after the chan_w store — a blocked read#5 on pe re-checks
+    chan_spin_unlock();
+    chan_wake_in(pe);
     return slen;
 }
+# BACK-PRESSURE (write#1 on a TERMINAL channel): take up to `n` bytes as successive records of <= 64 bytes into se's peer's
+# inbox while it has free slots, in ONE chan_lock hold (a record never interleaves with another writer's; a write of
+# <= 64 bytes lands whole). -> the bytes taken (0 = the inbox is full) · -CH_E_PEERGONE (the peer is closed; nothing is
+# taken) · -CH_E_BADFD (the claim's channel was re-minted) · -CH_E_ARG (n <= 0, a bad buffer).
+fn chan_queue_bp(se, cep, ubuf, n): i64 {
+    if (n <= 0) { return 0 - CH_E_ARG; }
+    if (is_user_range(ubuf, n) == 0) { return 0 - CH_E_ARG; }
+    var pe = se ^ 1;
+    var t = 0;
+    chan_spin_lock();
+    if (load64(&chan_epoch + (se >> 1) * 8) != cep) { chan_spin_unlock(); return 0 - CH_E_BADFD; }
+    if (load64(&chan_end_open + pe * 8) != 1) { chan_spin_unlock(); return 0 - CH_E_PEERGONE; }
+    var wv = load64(&chan_w + pe * 8);
+    var rv = load64(&chan_r + pe * 8);
+    while (t < n) {
+        if ((wv - rv) >= CHAN_SLOTS) { break; }             # full — refuse, do NOT drop the oldest
+        var k = n - t;
+        if (k > CHAN_REC_BYTES) { k = CHAN_REC_BYTES; }
+        chan_put_locked(pe, wv, ubuf + t, k);
+        wv = wv + 1;
+        t = t + k;
+    }
+    store64(&chan_w + pe * 8, wv);
+    chan_spin_unlock();
+    if (t > 0) { chan_wake_in(pe); }
+    return t;
+}
 
-fn chan_deliver(re, ubuf, rcap): i64 {
+fn chan_deliver(re, cep, ubuf, rcap): i64 {
     if (rcap <= 0) { return 0 - CH_E_ARG; }
     if (is_user_range(ubuf, rcap) == 0) { return 0 - CH_E_ARG; }
+    chan_spin_lock();
+    if (load64(&chan_epoch + (re >> 1) * 8) != cep) { chan_spin_unlock(); return 0 - CH_E_BADFD; }
     var rw = load64(&chan_w + re * 8);
     var rr = load64(&chan_r + re * 8);
     if (rr >= rw) {
+        chan_spin_unlock();
         # Drained. Peer-gone is reported only once there is nothing left to read — a dead peer's
         # already-queued records must still be delivered, or a client that exits right after
         # presenting loses the present.
@@ -6562,11 +6962,102 @@ fn chan_deliver(re, ubuf, rcap): i64 {
     var rslot = chan_page(re) + (rr % CHAN_SLOTS) * CHAN_REC_BYTES;
     var rlen = load8(&chan_lens + (re * CHAN_SLOTS + (rr % CHAN_SLOTS)));
     # ⛔ A RECORD THAT DOES NOT FIT IS AN ERROR, NOT A TRUNCATION — and the record STAYS.
-    if (rlen > rcap) { return 0 - CH_E_ARG; }
+    if (rlen > rcap) { chan_spin_unlock(); return 0 - CH_E_ARG; }
     var ri = 0;
     while (ri < rlen) { store8(ubuf + ri, load8(rslot + ri)); ri = ri + 1; }
     store64(&chan_r + re * 8, rr + 1);
+    # ⭐ 1.57.18: was the inbox FULL before this record left? Only then can a writer be blocked for room in it (it
+    # blocks only after seeing it full) or a peer's EPOLLOUT have been clear. Linux's `was_full` — sound HERE because it
+    # is computed under the same lock as the writers' refusal (pipe_read's note on why it skips the test).
+    var rfull = 0;
+    if ((rw - rr) >= CHAN_SLOTS) { rfull = 1; }
+    chan_spin_unlock();
+    if (rfull == 1) { chan_wake_out(re); }
     return rlen;
+}
+
+# write#1 on a TERMINAL channel fd `fd` (endpoint se, already authorized): the back-pressure write. Takes what fits now;
+# a4 != 0 (O_NONBLOCK) returns that (0 when nothing fits — the pipe's convention); a4 == 0 waits for the rest
+# (chan_wr1_wait). -1: n <= 0, a bad buffer, the peer gone with nothing taken, a re-minted claim.
+fn chan_write_tty(fd, se, buf, n) {
+    var t = chan_queue_bp(se, chan_fd_cep(fd), buf, n);
+    if (t < 0) { return 0 - 1; }
+    if (t >= n) { return t; }
+    if (ksyscall_a4_get() != 0) { return t; }
+    return chan_wr1_wait(fd, buf, n, t);
+}
+# The key a write#1 on terminal fd `fd` would sleep on, or 0 = it would not block NOW (room, the peer gone, the claim no
+# longer the caller's). Side-effect free: it is also the C9 re-check after the arm. ⛔ chan_w is loaded BEFORE chan_r:
+# occupancy at the second load is then >= what the pair says, so "full" is never reported for an inbox that was not
+# full at that instant — the first drain after it sees `rfull` and wakes (chan_deliver).
+fn chan_wr_key(fd) {
+    var ke = chan_fd_endpoint(fd);
+    if (ke < 0) { return 0; }
+    var kp = ke ^ 1;
+    if (load64(&chan_end_open + kp * 8) != 1) { return 0; }
+    var kw = load64(&chan_w + kp * 8);
+    var kr = load64(&chan_r + kp * 8);
+    if ((kw - kr) < CHAN_SLOTS) { return 0; }
+    return WK_CHAN | CHAN_WKEY | kp;
+}
+# wr1_wait's mirror for a terminal channel: wait on WK_CHAN | CHAN_WKEY | pe until the rest of the write is taken,
+# re-deriving the endpoint from the fd on every pass (nothing kept across the sleep, R4). The whole buffer goes as
+# successive 64-byte records, waiting for room between them (a pipe, Linux tty_write/n_tty_write). Returns n; the
+# PARTIAL count when the peer went away — or the caller's claim did (CH_CLOSE, the owner's death) — after some bytes
+# were taken; -1 when that happens with nothing taken (EPIPE-shaped, no SIGPIPE: D3). Wakers, each AFTER its condition
+# store: chan_deliver of the full inbox (CH_RECV and read#5), CH_CLOSE and chan_release_pid (chan_wake_all). The 100 ms
+# backstop re-checks anyway. ABORT (S7 boundary D: SIGKILL) -> -1, never reaching ring 3 (B1); a STOP parks in
+# wq_signal_point and the loop re-arms. A context that cannot block keeps the short write.
+# ⛔ NO "is it still a terminal?" TEST IN THIS LOOP: the terminal end's chan_end_pty is cleared when its owner dies, so
+# such a test answered "a display channel now" exactly on the peer-death path and returned 0 instead of -1 (death-none
+# measured it). A write that began on a terminal finishes under the terminal's rule; chan_queue_bp decides peer-gone.
+fn chan_wr1_wait(fd, buf, n, done) {
+    if (wq_can_block() == 0) { return done; }
+    while (done < n) {
+        var wk = chan_wr_key(fd);
+        if (wk != 0) {
+            var wa = wq_arm(wk, wq_deadline_after_us(100000));
+            if (wa == 2) { return done; }
+            if (wa == 1) {
+                if (wq_signal_point() == 1) { return 0 - 1; }
+            } else {
+                if (chan_wr_key(fd) != wk) { wq_cancel(); }                 # the RE-CHECK after the arm
+                else { if (wq_sleep() == WR_SIGNAL) { if (wq_signal_point() == 1) { return 0 - 1; } } }
+            }
+        }
+        var we = chan_fd_endpoint(fd);
+        if (we < 0) {
+            if (done > 0) { return done; }
+            return 0 - 1;
+        }
+        var wn = chan_queue_bp(we, chan_fd_cep(fd), buf + done, n - done);
+        if (wn < 0) {
+            if (done > 0) { return done; }
+            return 0 - 1;
+        }
+        done = done + wn;
+    }
+    return done;
+}
+
+# epoll_wait#21's readiness of endpoint e (authorized by the caller — ep_scan re-derives that every pass). Lock-free
+# loads (a racy prefilter, as every ep_scan arm; the post-arm re-check plus the wakers above make it exact).
+#   EPOLLIN   the inbox is non-empty (chan_r loaded BEFORE chan_w: "empty" only when it was at the second load), or
+#             the peer is gone (a read answers EOF at once)
+#   EPOLLOUT  the peer's inbox has a free slot (chan_w BEFORE chan_r, chan_wr_key's order); a DISPLAY channel always
+#             (its write never waits: drop-oldest)
+#   peer gone EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP — neither a read (EOF) nor a write (-1) would wait: Linux
+#             unix_poll on a socketpair whose peer closed (EPOLLHUP | EPOLLRDHUP | EPOLLIN, writable)
+fn chan_ep_events(e) {
+    var pe = e ^ 1;
+    if (load64(&chan_end_open + pe * 8) != 1) { return EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP; }
+    var er = 0;
+    var ir = load64(&chan_r + e * 8);
+    if (load64(&chan_w + e * 8) != ir) { er = EPOLLIN; }
+    if (chan_is_tty(e) == 0) { return er | EPOLLOUT; }
+    var ow = load64(&chan_w + pe * 8);
+    if ((ow - load64(&chan_r + pe * 8)) < CHAN_SLOTS) { er = er | EPOLLOUT; }
+    return er;
 }
 
 # read(2)/write(2) on a channel fd: the authorized endpoint for `fd`, or -1 when `fd` is not a live
@@ -6603,7 +7094,9 @@ fn chan_release_pid(pid) {
                     store64(&chan_end_oepoch + e * 8, 0);
                     store64(&chan_end_pty + e * 8, 0);
                     store64(&chan_winsz + e * 8, 0);     # 1.57.17: the window size dies with the endpoint
-                    wq_wake(WK_CHAN | (e ^ 1));  # 1.57.8: the peer's blocked read sees PEER GONE (EOF)
+                    # 1.57.8: the peer's blocked read sees PEER GONE (EOF). 1.57.18: the whole channel — the peer's
+                    # blocked writers (-1 / partial), e's own other holders, and both ends' epoll_wait#21 watchers.
+                    chan_wake_all(e);
                 }
             }
         }
@@ -9388,6 +9881,18 @@ fn spawn_load_child(sp_a1, sp_a2, sp_a3, sp_a4, strict) {
         sp_plen = sc_argv_blob_ok(spp, sp_len);             # argv[0]'s length, or 0
         if (sp_plen < 1) { preempt_enable(); stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
     }
+    # ⭐ 1.57.18 — A RELATIVE PROGRAM PATH RESOLVES FROM THE CALLER'S WORKING DIRECTORY (chdir#112), as execve(2) resolves
+    # one — and there is NO search: `agnsh` from cwd /bin runs /bin/agnsh, from /home it is /home/agnsh or nothing
+    # (-SPAWN_E_NOENT). A PATH search is execvp's, in userland; the kernel never had one (a relative path was rooted at
+    # nothing and failed -4). The resolved path takes this CPU's ingress slot 0 (path_clean_join: a kernel copy, cleaned);
+    # argv (spp, sp_len) stays exactly what the caller wrote. The loader's path cap is unchanged — 255 bytes
+    # (vfs_file_size's vfs_sec_name_ok), now of the RESOLVED path: a longer one is refused here (-SPAWN_E_ARGS), never cut.
+    var sp_path = spp + sp_ps;
+    if (load8(sp_path) != 47) {
+        sp_plen = path_clean_join(proc_cwd_ptr(sp_me), proc_cwd_len_get(sp_me), sp_path, sp_plen, sc_path_buf(0));
+        if (sp_plen < 1 || sp_plen > 255) { preempt_enable(); stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        sp_path = sc_path_buf(0);
+    }
     # 1.44.19 per-process env — the #37 gate's twin: fault-proof page-walking copy into the DEDICATED
     # spawn_env_buf. FALLBACK-ONLY in the unflagged form (see the header); STRICT when any flag is set.
     var sp_eptr = sp_a3;
@@ -9416,7 +9921,7 @@ fn spawn_load_child(sp_a1, sp_a2, sp_a3, sp_a4, strict) {
     exec_env_src_set(sp_env);                    # 1.46.8: per-CPU, consumed-at-entry by the loader
     exec_env_len_set(sp_elen);
     exec_argv_nul_set(sp_argv);                  # 1.57.6: same rule — NUL-split only for SPAWN_F_ARGV
-    var sp_pid = elf_load_from_file(spp + sp_ps, sp_plen, spp, sp_len);
+    var sp_pid = elf_load_from_file(sp_path, sp_plen, spp, sp_len);
     if (sp_pid < 0) {
         # (restore the caller CR3 on EVERY path so the handler tail + SYSRET run under the caller's
         # mappings — skipping it reproduces the spawn#3 1.44.9 #UD/arena-fault class)
@@ -9444,6 +9949,10 @@ fn spawn_load_child(sp_a1, sp_a2, sp_a3, sp_a4, strict) {
         stack_canary_check(canary);
         return 0 - SPAWN_E_NOMEM;
     }
+    # (g) 1.57.18: the child's working directory — proc_create_user copied the creator's; a valid `PWD=` in the env it was
+    # given replaces it (spawn_seed_cwd: the precedence, and what an invalid one does). Still CLAIMING, under boot CR3
+    # (the lookup's disk I/O), inside the preempt bracket; sp_env is this CPU's kernel copy of the blob.
+    if (sp_env != 0) { spawn_seed_cwd(sp_pid, sp_env, sp_elen); }
     # The child is at state 3 (CLAIMING: never picked, never reused), ring-3 selectors, fd table shaped — the caller
     # publishes READY. ⚠ STATED ORDER CHANGE (1.57.7, DEP-5): READY is now published AFTER the caller's CR3 is back
     # (it used to precede this cr3_load). Safe: pd_audit walks through the direct map, not the live CR3; every child
@@ -9648,7 +10157,7 @@ fn sys_waitpid_block(t) {
 fn rd5_once(fd, buf, n) {
     var rep = chan_fd_endpoint(fd);
     if (rep >= 0) {
-        var cr = chan_deliver(rep, buf, n);
+        var cr = chan_deliver(rep, chan_fd_cep(fd), buf, n);
         if (cr >= 0) { return cr; }
         if (cr == 0 - CH_E_WOULDBLOCK) { return 0 - 2; }
         if (cr == 0 - CH_E_PEERGONE) { return 0; }
@@ -9880,7 +10389,7 @@ fn uptime_ms_now() {
 # net_tcp.cyr's tcp_ep_events.
 # The instance (a VFS_EPOLL fd): payload[0] = the watch count, [1] = the capacity (8 at #19; ONE growth to
 # EP_WATCH_MAX at the 9th watch), [2] = the list — 16-byte entries {u64 word0 = target | events << 32; u64 data}:
-#   target  0..31 = a VFS fd of the caller (signalfd / timerfd / VFS_SOCK) · EP_TCP | id = a TCP conn or listener id
+#   target  0..31 = a VFS fd of the caller (signalfd / timerfd / VFS_SOCK / 1.57.18 VFS_CHAN) · EP_TCP | id = a TCP conn or listener id
 #           0..7 (the ids #47 / #56 / #57 return — ring-3 sockets are not VFS fds, #57's row says why)
 #   events  0 = a LEGACY op-1 entry: EPOLLIN, reported as mask 1 — exactly the 1.41-1.57.16 poll · EP_EV_SET | the
 #           EPOLLIN / EPOLLOUT / EPOLLRDHUP interest of an op-3 entry (EPOLLERR / EPOLLHUP are always reported)
@@ -9921,8 +10430,13 @@ fn ep_ctl_set(cs_eb, cs_tg, cs_ev) {
     if (cs_tg < 0) { return 0 - 1; }
     if (cs_ev != 0) {
         if (cs_tg < 32) {
-            var cs_t = ktag(vfs_fd_table() + cs_tg * 32);
-            if (cs_t != VFS_SIGNALFD && cs_t != VFS_TIMERFD && cs_t != VFS_SOCK) { return 0 - 1; }
+            var cs_b = vfs_fd_table() + cs_tg * 32;
+            var cs_t = ktag(cs_b);
+            # 1.57.18: a #97 channel endpoint fd — only one the caller may USE (chan_auth: its owner, or a PTY descendant
+            # of the owner), so an inherited inert claim cannot watch someone else's channel. ep_scan re-derives it.
+            if (cs_t == VFS_CHAN) {
+                if (chan_auth(cs_b) < 0) { return 0 - 1; }
+            } elif (cs_t != VFS_SIGNALFD && cs_t != VFS_TIMERFD && cs_t != VFS_SOCK) { return 0 - 1; }
         } elif (cs_tg >= EP_TCP && cs_tg < EP_TCP + 8) {         # an exact range: no high bit may reach word0
             if (tcp_auth(cs_tg - EP_TCP) < 0) { return 0 - 1; }
         } else {
@@ -9966,7 +10480,8 @@ fn ep_ctl_set(cs_eb, cs_tg, cs_ev) {
 # 12 B — user memory the arm validated; AC is set in syscall context, and after a wq_sleep the switch restored the
 # slot's CR3 and RFLAGS.AC) and return how many were written. `sc_mode` 0: the side-effect-free PROBE — the re-check
 # after the arm: 1 at the first ready watch, else 0; it writes nothing. `sc_out` (16 B, or 0): +0 the TCP slots the
-# watches name (the WK_EPOLL key bits), +8 the earliest not-yet-due timerfd deadline on sched_clock_us (0 = none).
+# watches name (bits 0..7) and, 1.57.18, the channel endpoints (bits EP_CHAN_SHIFT + e) — the WK_EPOLL key bits, +8 the
+# earliest not-yet-due timerfd deadline on sched_clock_us (0 = none).
 # Mode 1 also runs net_poll ONCE, at the first socket watch (the legacy scan's tcp_readable polled per socket watch);
 # the probe never does (nothing but loads and the readiness locks after an arm).
 fn ep_scan(sc_wl, sc_wc, sc_evp, sc_max, sc_out, sc_mode) {
@@ -10002,6 +10517,12 @@ fn ep_scan(sc_wl, sc_wc, sc_evp, sc_max, sc_out, sc_mode) {
                     if (sc_poll == 1) { net_poll(); sc_poll = 0; }
                     var sc_o = tcp_fd_owner(sc_c);           # 1.57.7 S5: owner (or kernel-owned) only
                     if (sc_o >= 0) { sc_r = tcp_ep_events(sc_c, sc_o); }
+                }
+            } elif (sc_t == VFS_CHAN) {                   # 1.57.18: a #97 channel endpoint — authority re-derived EVERY pass
+                var sc_ce = chan_auth_as(sc_b, sc_me);       # an inert claim (inherited, endowed away, closed) reports nothing
+                if (sc_ce >= 0) {
+                    sc_bits = sc_bits | (1 << (EP_CHAN_SHIFT + sc_ce));
+                    sc_r = chan_ep_events(sc_ce);
                 }
             }
         } elif ((sc_tg & 0xFFFFFF00) == EP_TCP) {
@@ -10078,7 +10599,8 @@ fn ep_wait(wt_eb, wt_evp, wt_max, wt_tmo) {
             if (wt_sdl == 0 || wt_tdl < wt_sdl) { wt_sdl = wt_tdl; }
         }
         var wt_f = kbd_irq_save();
-        var wt_a = wq_arm(WK_EPOLL | (load64(&wt_out) & 0xFF), wt_sdl);
+        # bits 0..7 the TCP slots watched, 8..39 the channel endpoints (1.57.18, EP_CHAN_SHIFT) — wq_wake_anybit's match
+        var wt_a = wq_arm(WK_EPOLL | (load64(&wt_out) & 0xFFFFFFFFFF), wt_sdl);
         if (wt_a == 2) { kbd_irq_restore(wt_f); wt_r = 0; break; }
         if (wt_a == 1) {
             kbd_irq_restore(wt_f);
@@ -10102,6 +10624,650 @@ fn ep_wait(wt_eb, wt_evp, wt_max, wt_tmo) {
     }
     if (wt_blk == 1) { atomic_and64(&ep_waiters, 0 - 1 - (1 << wt_me)); }
     return wt_r;
+}
+
+# 1.57.18 — ksyscall's #97 arm, moved VERBATIM into its own function: the 1.57.18 merge (six tracks) took
+# ksyscall past cyrius's 1023-jump-target cap ("function exceeds 1023 jump targets (x86 LASE cap)"). The body
+# keeps its own canary (snapshot here, re-checked on each return, as in ksyscall); the arm calls it and checks
+# ksyscall's. It reads only a1..a3 and ksyscall_a4_get(), as the arm did.
+fn chan_op_sys(arg1, arg2, arg3) {
+    var canary = stack_canary_secret;
+    # chan_op(op, a1, a2, a3) -> 0 / negative CH_E_*
+    # CAPS(out_uva, out_len >= 16) -> 0. Layout: +0 op-support mask · +4 region pages ·
+    # +8 region reachable (1/0). ⛔ The reachability word is a LIVE probe run under the CALLER's
+    # CR3, not a boot-time cached answer — the claim being tested is that the region resolves from
+    # a spawned client's page tables, and a value stamped at boot under the kernel CR3 would say
+    # nothing about that. §9.9 makes it a kill criterion.
+    if (arg1 == CH_CAPS) {
+        if (arg3 < 16) { stack_canary_check(canary); return 0 - CH_E_OUTBUF; }
+        if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - CH_E_OUTBUF; }
+        if (chan_region_kva == 0) { stack_canary_check(canary); return 0 - CH_E_NOREGION; }
+        store32(arg2 + 0, CH_OP_SUPPORTED);
+        store32(arg2 + 4, CHAN_REGION_PAGES);
+        store64(arg2 + 8, chan_region_reachable());
+        stack_canary_check(canary);
+        return 0;
+    }
+    # MINT(out_uva) -> 0, writing two fds. ⛔ A channel is minted as a PAIR and has NO NAME: you get
+    # both ends or nothing. That deletes the entire unlink-before-bind race class AF_UNIX carries,
+    # and it is why `tcp_listen`'s "whoever binds 7700 first owns the display protocol and every
+    # keystroke on it" cannot be reproduced here.
+    if (arg1 == CH_MINT) {
+        if (chan_region_kva == 0) { stack_canary_check(canary); return 0 - CH_E_NOREGION; }
+        if (is_user_range(arg2, 16) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+        var c = 0;
+        var found = 0 - 1;
+        while (c < 16) {
+            if (load64(&chan_end_open + (c * 2) * 8) == 0) {
+                if (load64(&chan_end_open + (c * 2 + 1) * 8) == 0) { found = c; c = 16; }
+                else { c = c + 1; }
+            }
+            else { c = c + 1; }
+        }
+        if (found < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
+        var ea = found * 2;
+        var eb = ea + 1;
+        # ⛔ TAG THE FIRST FD BEFORE ALLOCATING THE SECOND. `vfs_alloc` FINDS a free slot; it does
+        # not CLAIM one — the slot only stops being free once `ktag_set` writes a non-FREE tag. Two
+        # back-to-back allocs therefore return the SAME fd, and a channel minted onto one fd is a
+        # channel whose two ends are the same end. `vfs_create_pipe` gets this right and is the
+        # reference; this code did not, and the selftest caught it as `MINT gave one fd`.
+        var fa = vfs_alloc();
+        if (fa < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
+        var ba = vfs_fd_table() + fa * 32;
+        ktag_set(ba, VFS_CHAN);
+        var fb = vfs_alloc();
+        if (fb < 0) { vfs_close(fa); stack_canary_check(canary); return 0 - CH_E_FULL; }
+        var bb = vfs_fd_table() + fb * 32;
+        ktag_set(bb, VFS_CHAN);
+        var me = proc_current_get();
+        var mye = proc_epoch_get(me);
+        # ⭐ 1.57.18: the epoch bump and the cursor / page reset run under chan_lock, so a writer or reader whose
+        # claim named the previous incarnation either finished its copy before the reset or sees the new epoch
+        # under the same lock and refuses (chan_queue / chan_queue_bp / chan_deliver re-check `cep`).
+        chan_spin_lock();
+        chan_epoch_next = chan_epoch_next + 1;
+        store64(&chan_epoch + found * 8, chan_epoch_next);
+        var z = 0;
+        while (z < 2) {
+            var ee = ea + z;
+            store64(&chan_end_open + ee * 8, 1);
+            store64(&chan_end_pty + ee * 8, 0);      # fresh endpoint: not a terminal until endowed as one
+            store64(&chan_winsz + ee * 8, 0);        # 1.57.17: and never sized — a recycled slot keeps no stale size
+            store64(&chan_end_owner + ee * 8, me);
+            store64(&chan_end_oepoch + ee * 8, mye);
+            store64(&chan_w + ee * 8, 0);
+            store64(&chan_r + ee * 8, 0);
+            memset(chan_page(ee), 0, 4096);   # never hand a new owner the last occupant's bytes
+            z = z + 1;
+        }
+        chan_spin_unlock();
+        ep_wake_chan(3 << ea);               # 1.57.18: a watch on an fd that now names this channel re-scans
+        kpayload_set(ba, 0, ea);
+        kpayload_set(ba, 1, chan_epoch_next);
+        kpayload_set(ba, 2, 0);
+        kpayload_set(bb, 0, eb);
+        kpayload_set(bb, 1, chan_epoch_next);
+        kpayload_set(bb, 2, 0);
+        store64(arg2 + 0, fa);
+        store64(arg2 + 8, fb);
+        stack_canary_check(canary);
+        return 0;
+    }
+    # SEND(fd, buf, len) — writes into the PEER's inbox. ⛔ Bounded-queue-with-DROP-OLDEST, not
+    # back-pressure: §3 measured the workload as "presents are idempotent overwrites; input is
+    # droppable", and a blocking send would starve the peer it waits on — the poison that made TCP
+    # toxic here. Drops are COUNTED (`chan_drops`); a silent drop is a lie.
+    if (arg1 == CH_SEND) {
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var sb = vfs_fd_table() + arg2 * 32;
+        var se = chan_auth(sb);
+        if (se < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        # ⚠ 1.57.18: CH_SEND keeps DROP-OLDEST on every channel, a terminal's included (the record op a compositor or
+        # an emulator uses where a lost record beats a stalled sender); write#1 is the terminal's back-pressure path.
+        var sr = chan_queue(se, kpayload(sb, 1), arg3, ksyscall_a4_get());
+        stack_canary_check(canary);
+        return sr;
+    }
+    # RECV(fd, buf, cap) -> len, or WOULDBLOCK / PEERGONE. ⛔ Those two are RESULTS, so a caller
+    # batching one per held channel never aborts the batch on "nothing here" (§9.4).
+    if (arg1 == CH_RECV) {
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var rb = vfs_fd_table() + arg2 * 32;
+        var re = chan_auth(rb);
+        if (re < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var rr2 = chan_deliver(re, kpayload(rb, 1), arg3, ksyscall_a4_get());
+        stack_canary_check(canary);
+        return rr2;
+    }
+    # ENDOW(fd) -> fd. Arms this endpoint for THIS PROCESS's next child — #43, #37 or #3 (1.57.6:
+    # per-process, see the ENDOWMENT banner; it said "the next #43 child"). ⛔ Authority is re-derived first:
+    # you can only endow what you currently own, so an inherited (inert) claim cannot be used to
+    # hand a channel onward — otherwise inert-by-construction would leak through the grant path.
+    if (arg1 == CH_ENDOW) {
+        # ⭐ 1.57.6: ENDOW(-1) DISARMS the caller's pending endowment and its PTY flag -> 0 (was
+        # -CH_E_BADFD). A caller whose spawn fails between arm and spawn can drop the arm itself.
+        if (arg2 == 0 - 1) {
+            endow_disarm(proc_current_get());
+            stack_canary_check(canary);
+            return 0;
+        }
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var nb = vfs_fd_table() + arg2 * 32;
+        var ne = chan_auth(nb);
+        if (ne < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        # ⛔⛔ ENDOWMENT REQUIRES REAL OWNERSHIP, NOT MERELY AUTHORITY TO USE. `chan_auth` now also
+        # answers yes to a DESCENDANT of a PTY endpoint's owner — correct for read/write, and
+        # catastrophic here, because `chan_endow_place` MOVES ownership. Without this gate any
+        # program agnsh launches could endow the terminal into a child of its own and agnsh would
+        # silently lose its own stdin/stdout. That is the exact hazard the banner above this block
+        # already names ("you can only endow what you currently own"); the PTY arm would have
+        # quietly widened it from a use-right into a transfer-right.
+        var nme = proc_current_get();
+        if (load64(&chan_end_owner + ne * 8) != nme) {
+            stack_canary_check(canary); return 0 - CH_E_BADFD;
+        }
+        var tfd = chan_endow_pick_fd(nme);
+        if (tfd < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
+        endow_arm_set(nme, ne);
+        endow_fd_set(nme, tfd);
+        # 1.57.6: the channel's incarnation NOW — placement refuses if the channel was re-minted.
+        endow_epoch_set(nme, load64(&chan_epoch + (ne >> 1) * 8));
+        # ⛔ AN EXACT SENTINEL, NOT `a4 != 0`. `ksyscall_a4` is shared staging: SEND and RECV use
+        # it as a LENGTH, and it is not cleared between ops. The first cut of this read `a4 != 0`
+        # and a selftest that had just done `ksyscall_a4_set(8)` for a SEND silently endowed in
+        # PTY mode — pty_mode came through as 8 — replacing an unrelated child's stdio.
+        # CH_ENDOW_STDIO is deliberately > CHAN_REC_BYTES so no legal length can ever collide.
+        var emode = 0;
+        if (ksyscall_a4_get() == CH_ENDOW_STDIO) { emode = 1; }
+        endow_stdio_set(nme, emode);
+        stack_canary_check(canary);
+        return tfd;                          # the fd the child will hold — announce it in its env
+    }
+    if (arg1 == CH_CLOSE) {
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var cb = vfs_fd_table() + arg2 * 32;
+        var ce = chan_auth(cb);
+        if (ce < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        # ⭐ 1.57.6: closing the endpoint the CALLER has armed for endowment disarms that arm — a
+        # closed endpoint can be re-minted to somebody else, and the arm must not follow the number.
+        # (Placement also re-checks owner + epoch; this makes the common case refuse nothing at all.)
+        if (endow_arm_get(proc_current_get()) == ce) { endow_disarm(proc_current_get()); }
+        store64(&chan_end_open + ce * 8, 0);
+        store64(&chan_end_pty + ce * 8, 0);
+        store64(&chan_winsz + ce * 8, 0);            # 1.57.17: the window size dies with the endpoint
+        store64(&chan_end_owner + ce * 8, 0);
+        store64(&chan_end_oepoch + ce * 8, 0);
+        # 1.57.8: the peer's blocked read sees PEER GONE (EOF). 1.57.18: the whole channel — the peer's blocked
+        # writers too (-1 / partial), this end's other holders, and both ends' epoll_wait#21 watchers (EPOLLHUP).
+        chan_wake_all(ce);
+        vfs_close(arg2);
+        stack_canary_check(canary);
+        return 0;
+    }
+    # ⭐ 1.57.17 — WINSZ_SET(fd, w): the EMULATOR sizes the terminal it endowed (or is about to endow). `fd` is the
+    # caller's OWN end — strict ownership, as CH_ENDOW requires, because chan_auth also answers yes to a PTY
+    # descendant — and NOT itself a terminal: the program inside a terminal holds the PTY-mode end and does not
+    # size its own window (Linux lets either side TIOCSWINSZ; here only the emulator knows the window, so only its
+    # end may). The size lands on the PEER, which must be a TERMINAL (a PTY-mode end) or an end the caller still
+    # owns (sized before CH_ENDOW hands it out) — never a DISPLAY client's end, nor the compositor's end seen from
+    # a display client. w = (xpix<<48)|(ypix<<32)|(cols<<16)|rows; the low half alone (`winsize`#60's packing)
+    # leaves the pixel size 0 = unknown, as Linux's ws_xpixel 0. cols and rows 1..65535 (0 would read back as
+    # "never set"). -> 0 · -CH_E_BADFD (not a channel fd; not the caller's own end; a terminal end; a peer that is
+    # neither a terminal nor the caller's) · -CH_E_ARG (cols or rows 0) · -CH_E_PEERGONE (the peer is closed).
+    if (arg1 == CH_WINSZ_SET) {
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var zse = chan_auth(vfs_fd_table() + arg2 * 32);
+        if (zse < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var zme = proc_current_get();
+        if (load64(&chan_end_owner + zse * 8) != zme) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        if (load64(&chan_end_pty + zse * 8) != 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        var zpe = zse ^ 1;
+        if (load64(&chan_end_open + zpe * 8) != 1) { stack_canary_check(canary); return 0 - CH_E_PEERGONE; }
+        if (load64(&chan_end_pty + zpe * 8) != 1) {
+            if (load64(&chan_end_owner + zpe * 8) != zme) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            if (load64(&chan_end_oepoch + zpe * 8) != proc_epoch_get(zme)) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+        }
+        if (((arg3 >> 16) & 0xFFFF) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+        if ((arg3 & 0xFFFF) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+        var zsr = chan_winsz_set(zpe, arg3);
+        stack_canary_check(canary);
+        return zsr;
+    }
+    # ⭐ 1.57.17 — WINSZ_GET(fd, sel): the window of the terminal `fd` is — sel 0 -> (cols<<16)|rows (`winsize`#60's
+    # packing), sel 1 -> (xpix<<16)|ypix (0 when the emulator gave none). -1 when `fd` is not a terminal end the
+    # caller may use (a closed or non-channel fd, an inert inherited copy, a DISPLAY channel, the emulator's own
+    # end) or when no size was ever set: ring 3's "is this fd a terminal?" for an `fd_kind`#111 5, as a failing
+    # TIOCGWINSZ is on Linux. Any other sel -> -CH_E_ARG (an exact selector, never a guess). Lock-free: one load of
+    # the one-qword size.
+    if (arg1 == CH_WINSZ_GET) {
+        if (arg3 != 0) { if (arg3 != 1) { stack_canary_check(canary); return 0 - CH_E_ARG; } }
+        var zge = chan_fd_endpoint(arg2);
+        if (zge < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&chan_end_pty + zge * 8) != 1) { stack_canary_check(canary); return 0 - 1; }
+        var zgw = load64(&chan_winsz + zge * 8);
+        if (zgw == 0) { stack_canary_check(canary); return 0 - 1; }
+        stack_canary_check(canary);
+        if (arg3 == 1) { return (zgw >> 32) & 0xFFFFFFFF; }
+        return zgw & 0xFFFFFFFF;
+    }
+    stack_canary_check(canary);
+    return 0 - CH_E_BADOP;
+}
+
+# 1.57.18 — ksyscall's #39 arm, moved VERBATIM into its own function: the 1.57.18 merge (six tracks) took
+# ksyscall past cyrius's 1023-jump-target cap ("function exceeds 1023 jump targets (x86 LASE cap)"). The body
+# keeps its own canary (snapshot here, re-checked on each return, as in ksyscall); the arm calls it and checks
+# ksyscall's. It reads only a1..a3 and ksyscall_a4_get(), as the arm did.
+fn blit_sys(arg1, arg2, arg3) {
+    var canary = stack_canary_secret;
+    # blit(src=arg1, w=arg2, h=arg3, dstxy=arg4) — copy a w×h block of 32bpp
+    # pixels from the ring-3 buffer `src` (tightly packed, w*4 bytes/row) into
+    # the framebuffer at (dst_x, dst_y) where arg4 = (dst_y<<16)|dst_x. The dest
+    #
+    # 1.53.7 SHADOW EXEMPT: writes the WC FB directly, NOT the fb_console shadow
+    # buffer. blit is the graphical-TAKEOVER path (doom/fbtest run full-screen +
+    # cli/loop — they never interleave with console text scroll), so mirroring
+    # every pixel into the shadow would tax doom's per-frame blit for zero benefit.
+    # CONSTRAINT: a future tool that blits INTO the live console region and then
+    # prints scrolling text would see the blit erased by the next scroll flush —
+    # such a tool must mirror here (add `store32(a + (fb_shadow - bl_fb), px)` when
+    # fb_shadow != 0) or paint via fb_putc instead.
+    # rect is CLIPPED to the FB bounds (off-screen rows/cols dropped), so both
+    # the src reads and the FB writes are provably in range. Pixels copy RAW (no
+    # format conversion) — the caller supplies fbinfo's reported byte order. The
+    # write goes straight to fb_phys, EXACTLY as fb_putc does from ring-3 stdout
+    # (the proven path): the handler runs in the same syscall context that already
+    # both reads user buffers (uname/sysinfo) and writes fb_phys (write#1→fb_putc),
+    # so no CR3 switch and no new mapping are needed. Returns 0 (incl. fully-clipped
+    # no-op) or -1 (bad src / no FB / bad geometry). arg4 read via ksyscall_a4.
+    var bl_w = arg2;
+    var bl_h = arg3;
+    if (bl_w < 1) { stack_canary_check(canary); return 0 - 1; }
+    if (bl_h < 1) { stack_canary_check(canary); return 0 - 1; }
+    if (bl_w > 8192) { stack_canary_check(canary); return 0 - 1; }   # sanity cap (w*h*4 can't overflow)
+    if (bl_h > 8192) { stack_canary_check(canary); return 0 - 1; }
+    if (is_user_range(arg1, bl_w * bl_h * 4) == 0) { stack_canary_check(canary); return 0 - 1; }
+    # 1.56.36: fb_draw_base(), NOT fb_fb_phys(). With the console redirected or the hardware pan armed
+    # the console no longer paints at the firmware surface, so this fallback would render into a buffer
+    # nothing is scanning — the same invisible-output class as the gpu_display_restore_console hazard.
+    # Identical to the old value whenever neither is active (fb_draw_base falls through to fb_fb_phys).
+    var bl_fb_direct = fb_draw_base();
+    if (bl_fb_direct == 0) { stack_canary_check(canary); return 0 - 1; }    # no framebuffer
+    # 1.55.x display arc: render into the DOUBLE-BUFFER's back buffer when the DCN pipe is ours (P0),
+    # so the finished frame can be swapped in during blank (tear-free) instead of being drawn straight
+    # into the live scanout. Falls back to the direct live-FB base — byte-identical legacy behaviour —
+    # whenever the GPU/DCN isn't usable (e.g. QEMU) or P0 never identified a pipe. Geometry/pitch are
+    # the console FB's, so every bound proven below still holds for the back buffer.
+    var bl_fb = gpu_blit_target(bl_fb_direct);
+    var bl_fw = fb_width();
+    var bl_fh = fb_height();
+    var bl_pitch = fb_pitch();
+    # Fail-closed on a malformed GOP: the in-bounds write proof needs
+    # pitch >= width*4 (UEFI guarantees PixelsPerScanLine >= HorizontalResolution,
+    # and gnoboot sets pitch = ppl*4 — not ring-3-reachable). Asserting it here
+    # makes the FB-write bound independent of the firmware invariant, so a quirky/
+    # spec-violating GOP can't spill the last clipped row past fb + pitch*height.
+    if (bl_pitch < bl_fw * 4) { stack_canary_check(canary); return 0 - 1; }
+    var bl_dstxy = ksyscall_a4_get();
+    var bl_dx = bl_dstxy & 0xFFFF;
+    var bl_dy = (bl_dstxy >> 16) & 0xFFFF;
+    # 1.44.20: a4 bits [39:32] = INTEGER SCALE (0 or 1 = the 1:1 path, byte-identical for
+    # every existing caller — doom's 4-arg syscall pins the full 64-bit a4 with yoff bits
+    # [23:16]=0; fbtest hand-emits mov r10,0; no shorter-arity blit caller exists). Each
+    # src pixel becomes a scale×scale block; the dst rect is (dx, dy, w*scale, h*scale),
+    # clipped exactly like 1:1. scale > 16 is a LOUD reject (catches a future garbage-r10
+    # caller at its first frame instead of silently misrendering — the env-a3/a4 class).
+    var bl_scale = (bl_dstxy >> 32) & 0xFF;
+    if (bl_scale == 0) { bl_scale = 1; }
+    if (bl_scale > 16) { stack_canary_check(canary); return 0 - 1; }
+    # THE memory-safety gate: fb_scale_rowbuf holds one EXPANDED SRC row (w*scale px).
+    # w<=8192 with scale<=16 would allow 512 KB — 16× the 32 KB buffer (a ring-3-reachable
+    # BSS smash) — so the EXPANDED width is capped to the buffer BEFORE any write. Never
+    # fires for scale<=1 (w<=8192 already enforced above): back-compat is exact.
+    if (bl_w * bl_scale > 8192) { stack_canary_check(canary); return 0 - 1; }
+    if (bl_dx >= bl_fw) { stack_canary_check(canary); return 0; }    # fully off-screen → no-op OK
+    if (bl_dy >= bl_fh) { stack_canary_check(canary); return 0; }
+    var bl_cw = bl_w * bl_scale;                                     # clip SCALED width to FB right edge
+    if (bl_dx + bl_cw > bl_fw) { bl_cw = bl_fw - bl_dx; }
+    var bl_ch = bl_h * bl_scale;                                     # clip SCALED height to FB bottom edge
+    if (bl_dy + bl_ch > bl_fh) { bl_ch = bl_fh - bl_dy; }
+    var bl_r = 0;
+    var bl_srow = 0;
+    var bl_drow = 0;
+    var bl_c = 0;
+    if (bl_scale <= 1) {
+        # 1:1 — the pre-1.44.20 loop VERBATIM (structural byte-identity for legacy callers;
+        # bl_cw/bl_ch equal the unscaled values when scale==1).
+        while (bl_r < bl_ch) {
+            bl_srow = arg1 + (bl_r * bl_w) * 4;                          # src row (packed w*4)
+            bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;     # dest row in FB
+            bl_c = 0;
+            while (bl_c < bl_cw) {
+                store32(bl_drow + bl_c * 4, load32(bl_srow + bl_c * 4));
+                bl_c = bl_c + 1;
+            }
+            bl_r = bl_r + 1;
+        }
+    } else {
+        # scale>=2 — src-major with the row buffer: expand each SRC row ONCE into
+        # fb_scale_rowbuf (cached RAM — per-pixel divides stay out of the hot loops), then
+        # copy the clipped row (cw*4 bytes, NEVER pitch — pitch slack would spill into the
+        # next row) to each of the `scale` dst rows, stopping at the clip. No FB read-back
+        # (the FB is WC-mapped). In-bounds: dx*4 + cw*4 <= fw*4 <= pitch (asserted above);
+        # src reads stay in [0, w) per row and [0, h) rows by construction.
+        # 1.56.51: the rowbuf is PER-CPU (see its banner) — the single-core IF=0 premise this
+        # comment used to assert is false under smp_sched_aps=1.
+        var bl_rowbuf = fb_scale_rowbuf_base();
+        if (bl_rowbuf == 0) { stack_canary_check(canary); return 0 - 1; }   # no staging region
+        var bl_s = 0;
+        while (bl_s < bl_h) {
+            if (bl_s * bl_scale >= bl_ch) { bl_s = bl_h; }           # rest fully clipped — done
+            else {
+                bl_srow = arg1 + (bl_s * bl_w) * 4;
+                var bl_x = 0;                                        # expand: each px scale times
+                var bl_o = 0;
+                while (bl_x < bl_w) {
+                    var bl_px = load32(bl_srow + bl_x * 4);
+                    var bl_k = 0;
+                    while (bl_k < bl_scale) {
+                        store32(bl_rowbuf + bl_o * 4, bl_px);
+                        bl_o = bl_o + 1;
+                        bl_k = bl_k + 1;
+                    }
+                    bl_x = bl_x + 1;
+                }
+                var bl_kr = 0;                                       # emit `scale` dst rows
+                while (bl_kr < bl_scale) {
+                    bl_r = bl_s * bl_scale + bl_kr;
+                    if (bl_r >= bl_ch) { bl_kr = bl_scale; }         # clipped — stop this block
+                    else {
+                        bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;
+                        bl_c = 0;
+                        while (bl_c < bl_cw) {
+                            store32(bl_drow + bl_c * 4, load32(bl_rowbuf + bl_c * 4));
+                            bl_c = bl_c + 1;
+                        }
+                        bl_kr = bl_kr + 1;
+                    }
+                }
+                bl_s = bl_s + 1;
+            }
+        }
+    }
+    # 1.55.x: the frame is complete in the back buffer — PRESENT it. Flips the pipe's scanout to it and
+    # blocks until the hardware takes it at the next blank: tear-free, and it vsync-paces the caller
+    # (a blit can therefore block up to one frame — that is the point). No-op on the direct path.
+    #
+    # P7 (2026-07-20): a4 bit40 = DEFER_PRESENT. A full-screen app (doom/fbtest) leaves it clear and each
+    # blit auto-presents, exactly as before — structural back-compat, every existing caller is bit-identical.
+    # A COMPOSITOR sets it: blit each window into the SAME back buffer with the bit set (no flip), then call
+    # present#84 ONCE when the whole frame is composited. Without this, N windows = N flips = the compositor
+    # sees partial composites. The back buffer is NOT swapped until the present, so deferred blits accumulate.
+    if ((bl_dstxy & 0x10000000000) == 0) {
+        gpu_blit_present(proc_current_get());
+    }
+    stack_canary_check(canary);
+    return 0;
+}
+
+# 1.57.18 — ksyscall's #99 arm, moved VERBATIM into its own function (the 1023-jump-target cap; see chan_op_sys).
+fn proclist_sys(arg1, arg2, arg3) {
+    var canary = stack_canary_secret;
+    # proclist(buf=arg1, max=arg2) — snapshot of the LIVE process table.
+    # Returns the number of records written, or -1 on a bad user range / max < 1.
+    #
+    # Record (64 B, little-endian), one per live slot:
+    #   +0   u64 pid
+    #   +8   u64 state      1=ready · 2=running · 3=claiming · 6=blocked in a kernel wait (1.57.7;
+    #                        4/5 are reserved for the lifecycle step) (0=dead is skipped)
+    #   +16  u64 ppid       0 = init
+    #   +24  u8  name[32]   NUL-terminated basename, from proc_set_name at ELF load
+    #   +56  u64 reserved   always 0 today. ⛔ SPLIT AS TWO u32 HALVES, DECIDED 1.56.59:
+    #                        low  32 bits (+56) = cpu ticks   (telemetry filing §4)
+    #                        high 32 bits (+60) = rss pages   (telemetry filing §5)
+    # ⛔⛔ THIS LINE PROMISED "room to add rss/utime" — TWO FIELDS FOR ONE SLOT. The record is
+    # exactly 64 bytes with name[32] spanning +24..+55, so +56 IS the final 8 bytes; there is no
+    # second slot to grow into, and whichever field shipped first would have taken the whole u64
+    # and forced the other to a NEW SYSCALL NUMBER. Split now, while the value is still 0 and
+    # NOTHING reads it, because after one consumer reads it as a u64 this is an ABI break.
+    # ⚠ A u64 zero-check still means "neither field present", so a consumer written against the
+    # old wording keeps working — that compatibility is why the split is free TODAY and not later.
+    # ⚠ u32 halves are deliberate and sufficient: 2^32 ticks at 100 Hz is ~1.36 years of CPU time,
+    # and 2^32 pages is 16 TiB of RSS. Neither is a ceiling this kernel can reach.
+    #
+    # ⭐ WHY THIS EXISTS. AGNOS had no procfs and no enumeration primitive at all —
+    # the ring-3 surface offered getpid/spawn/waitpid/kill and nothing that could
+    # answer "what is running?". A system monitor therefore could not exist here:
+    # chakshu's AGNOS build rendered a column header and zero rows, which is what
+    # blocked its v1.0 "ship as the AGNOS default monitor" milestone. Every field
+    # above already existed in the kernel; none of it was reachable from ring 3.
+    #
+    # ⚠ A SNAPSHOT, NOT A HANDLE. The table is copied under preempt_disable so the
+    # set cannot change mid-walk. Callers must not assume a pid is still live when
+    # they act on it — that race is inherent to any ps(1) and is the caller's to
+    # handle (chakshu re-probes before it signals).
+    #
+    # ⚠ RESERVED FIELD IS DELIBERATE. Per-process rss and cpu time are NOT tracked
+    # by this kernel today, so they are not invented here. When they are, they land
+    # at +56 and the record size does not change — consumers that zero-check the
+    # field keep working. Adding a field by widening the record would need a new
+    # syscall number; adding it here does not.
+    if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+    # ⛔ 1.56.51 SECURITY FIX. Was `is_user_range(arg1, arg2 * 64)`. `arg2` is the caller's
+    # record capacity, ring-3 chosen and checked only for `< 1`, so 2^58 wrapped the product to
+    # 0 and the validator passed on a zero-length window. The fill loop below is bounded by the
+    # PROCESS COUNT, not by arg2, so the spill is up to the whole process table written past the
+    # user ceiling — and unlike #81 the contents are kernel-side records, which makes the same
+    # bug a disclosure primitive as well as a write. See is_user_array above.
+    if (is_user_array(arg1, arg2, 64) == 0) { stack_canary_check(canary); return 0 - 1; }
+
+    if (proclist_called == 0) {
+        proclist_called = 1;
+        # ⛔ klug_append, NOT kprintln — THE CONSOLE IS SOMEBODY ELSE`S STDOUT. Filed by chakshu
+        # (the AGNOS system monitor) 2026-09-02: this one-shot landed INSIDE the monitor`s output,
+        # between its header and its process table. `shu -p` is its pipe-safe mode, so it corrupted
+        # any consumer parsing that stream and would scribble over a TUI frame. Since 1.56.58 it is
+        # worse, not better — the line now carries a `[   37.727698] ` uptime prefix too.
+        # ⚠ THE DIAGNOSTIC INTENT IS KEPT IN FULL, which is why this is a re-route and not a delete:
+        # the comment below still holds, and the line is still in the log ring, reachable with
+        # `run /bin/klug`. It just is not on the console any more. klug_append is the exact
+        # "emit to the kernel log ring rather than the console" the filing asked for.
+        klug_append("proclist: first call from ring 3\n", 33);
+    }
+
+    preempt_disable();
+    var pl_n = 0;
+    var pl_i = 0;
+    while (pl_i < 16) {
+        if (pl_n >= arg2) { pl_i = 16; }
+        else {
+            var pl_st = load64(&proc_table + pl_i * 176 + 8);
+            # ⭐ 1.57.7 (S7): an exited, UNREAPED child is listed as state 7 (report-only; the table cell stays 0),
+            # with its name, ppid and final ticks; RSS 0 (it no longer runs).
+            if (pl_st == 0) { if (proc_is_zombie(pl_i) == 1) { pl_st = PROC_ZOMBIE_REPORT; } }
+            if (pl_st != 0) {
+                var pl_pid = load64(&proc_table + pl_i * 176);
+                var pl_rec = arg1 + pl_n * 64;
+                store64(pl_rec + 0, pl_pid);
+                store64(pl_rec + 8, pl_st);
+                store64(pl_rec + 16, proc_get_ppid(pl_pid));
+                # ⭐ +56 IS TWO u32 HALVES (decided 1.56.59): low = cpu ticks (§4), high = rss
+                # pages (§5). Written as one store64 so the halves cannot tear against a consumer
+                # reading the slot as a u64 — which is exactly what a consumer written against the
+                # pre-split wording does.
+                # ⚠ CLAMPED, NOT MASKED. A tick count past 2^32 (~1.36 years of CPU) must pin at
+                # the maximum, not wrap to a small number: a monitor differencing two samples
+                # across a wrap computes a NEGATIVE delta and renders a nonsense CPU%. Saturating
+                # is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
+                # BOTH HALVES ARE LIVE AS OF 1.56.59: low u32 = cpu ticks (§4), high u32 = resident
+                # 4 KiB pages (§5). Written as ONE store64 so the halves cannot tear against a
+                # consumer reading the slot as a u64 — which is what a consumer written against the
+                # pre-split wording does.
+                # ⚠ BOTH CLAMPED, NOT MASKED. Past 2^32 a masked value WRAPS, and a monitor
+                # differencing two samples across a wrap computes a NEGATIVE delta and renders
+                # nonsense. Saturating is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
+                # (2^32 ticks is ~1.36 years of CPU; 2^32 pages is 16 TiB resident. Neither is
+                # reachable here — the clamps are for the shape of the guarantee, not the range.)
+                var pl_tk = load64(&proc_ticks + pl_i * 8);
+                if (pl_tk > 4294967295) { pl_tk = 4294967295; }
+                # BOTH HALVES LIVE AS OF 1.56.59: low u32 = cpu ticks (§4), high u32 = resident
+                # 4 KiB pages (§5). ONE store64 so the halves cannot tear against a consumer
+                # reading the slot as a u64 — which is what a consumer written against the
+                # pre-split wording does.
+                # ⚠ BOTH CLAMPED, NOT MASKED. Past 2^32 a mask WRAPS, and a monitor differencing
+                # across a wrap computes a NEGATIVE delta. Saturating is wrong-but-monotonic.
+                var pl_rs = 0;
+                if (pl_st != PROC_ZOMBIE_REPORT) { pl_rs = proc_rss_pages(pl_i); }
+                if (pl_rs > 4294967295) { pl_rs = 4294967295; }
+                store64(pl_rec + 56, (pl_rs << 32) | pl_tk);
+                # name: copy 32 bytes, NUL-padding the tail so ring 3 never reads
+                # a stale byte from a previous occupant of this slot.
+                var pl_src = proc_name_ptr(pl_pid);
+                var pl_k = 0;
+                var pl_done = 0;
+                while (pl_k < 32) {
+                    var pl_c = 0;
+                    if (pl_done == 0) {
+                        if (pl_src != 0) { pl_c = load8(pl_src + pl_k); }
+                        if (pl_c == 0) { pl_done = 1; }
+                    }
+                    store8(pl_rec + 24 + pl_k, pl_c);
+                    pl_k = pl_k + 1;
+                }
+                pl_n = pl_n + 1;
+            }
+            pl_i = pl_i + 1;
+        }
+    }
+    preempt_enable();
+    stack_canary_check(canary);
+    return pl_n;
+}
+
+# 1.57.18 — ksyscall's #35 arm, moved VERBATIM into its own function (the 1023-jump-target cap; see chan_op_sys).
+fn sysinfo_sys(arg1, arg2, arg3) {
+    var canary = stack_canary_secret;
+    # sysinfo(buf=arg1, len=arg2) — writes the 40-byte counters struct: 5x
+    # u64 LE at offsets 0/8/16/24/32 = uptime_secs / totalram / freeram /
+    # procs / cpus. Live volatile snapshot; single-core so no lock. The
+    # kernel does the unit conversion (ticks→sec at 100 Hz, pages→bytes at
+    # 4 KB) so userland never re-derives units. a3 unused.
+    # ⛔ ONE RANGE CHECK, BEFORE ANY STORE, SIZED TO WHAT THE CALLER ASKED FOR. The first shape of
+    # the 1.56.59 tail append validated the wider window INSIDE the extension block, after the base
+    # fields were already written — so a caller passing len>=104 with a buffer valid for only 40
+    # got 40 bytes written AND a -1 back. A partial write with an error return is a contract nobody
+    # can code against. Deciding the length up front makes the arm all-or-nothing again.
+    if (arg2 < 40) { stack_canary_check(canary); return 0 - 1; }
+    var si_len = 40;
+    if (arg2 >= 104) { si_len = 104; }
+    if (arg2 >= 200) { si_len = 200; }
+    if (arg2 >= 208) { si_len = 208; }
+    if (is_user_range(arg1, si_len) == 0) { stack_canary_check(canary); return 0 - 1; }
+    store64(arg1 +  0, timer_ticks / 100);            # uptime seconds (100 Hz)
+    store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
+    store64(arg1 + 16, pmm_free_count() * 4096);      # free RAM bytes
+    store64(arg1 + 24, proc_count);                   # proc-table high-water mark (1.44.x: ≥ live count — non-LIFO holes may make it over-report; cosmetic stat field, no control flow depends on it)
+    # cpu_count = ENUMERATED CPUs (BSP + APs that checked in via smp_start_aps).
+    # ⛔ 1.56.51 — THIS COMMENT DESCRIBED A KERNEL THAT NO LONGER EXISTS, and it was cited as
+    # evidence elsewhere. It used to read "1.44.18+ the APs are woken then PARK (IF=0 hlt) —
+    # exactly ONE CPU (the BSP) ever schedules — so this OVER-reports usable parallelism".
+    # The SMP arc that "actually unparks APs" SHIPPED: smp_sched_aps=1 (smp.cyr) and
+    # smp_wake_enabled=1 (main.cyr), so APs pull real ring-3 procs and cpu_count reports
+    # parallelism that is genuinely usable. The stale claim mattered because two shared-scratch
+    # buffers (sc_open_abs, fb_scale_rowbuf) justified themselves on it. Both are per-CPU now.
+    # Still a cosmetic stat: no scheduler decision reads this field.
+    store64(arg1 + 32, cpu_count);                    # online (enumerated) CPUs
+    # ── PER-CORE CPU ACCOUNTING, appended at +40 (1.56.59, telemetry filing §8) ──────────────
+    #
+    # ⭐ APPENDED HERE RATHER THAN MINTED AS A SYSCALL, AND THAT CHOICE IS THE POINT. This arm
+    # already takes a caller LENGTH, and this doc's own rule for the family is "future fields
+    # append at the tail and bump the minimum len; the existing offsets are frozen ABI the moment
+    # a consumer reads them" (agnos-userland-abi.md §4.4). Per-core ticks ARE system information.
+    # ⛔ IT WAS FIRST BUILT AS `cpustat`#106 AND THAT WAS A MISTAKE — a new syscall number is a
+    # cross-repo ask on the cyrius peer, i.e. a language-agent cycle, a cyrius release, and a
+    # re-pin of every sibling repo that wants one toolchain version. The extend-vs-mint test was
+    # applied correctly to `net_config`#61 (extended, no peer, shipped same day) and correctly
+    # ruled out for `blk_info`#79 (fixed arity, no length), then skipped here. It is applied now.
+    # ⚠⚠ AND ONE THING THIS IS *NOT*, corrected after an audit caught the claim: it is NOT free for
+    # a wrapper consumer. The cyrius peer is `fn sys_sysinfo(out)` — ARITY 1, with the length
+    # HARDCODED to 40 (cyrius/lib/sys.cyr:225-227). So +40..+103 is reachable today only by a raw
+    # `syscall(35, buf, 104)`, which is what tests/telemetry/tlm.cyr uses. A wrapper consumer needs
+    # a length-taking overload upstream — a NUMBER-FREE ask that touches no ABI-gate row, but not
+    # "no toolchain change at all", which is what three places here said until the audit.
+    # ⇒ The contrast with `net_config`#61 is real and worth keeping: its peer is
+    # `fn sys_net_config(field)`, which genuinely forwards an arbitrary id, so fields 8-11 shipped
+    # to consumers the same day with nothing upstream. #35 and #61 are NOT symmetric.
+    #
+    # Layout, 4 CPUs x 2 u64 = 64 bytes, minimum length 104:
+    #   +40 + cpu*16 + 0  u64  USER ticks   (interrupted CS was ring 3)
+    #   +40 + cpu*16 + 8  u64  KERNEL ticks (interrupted CS was ring 0)
+    #
+    # ⛔ THE LARGER RANGE IS VALIDATED ONLY WHEN THE CALLER ASKED FOR IT. A caller passing 40 must
+    # get BYTE-IDENTICAL behaviour — the same 40 bytes, the same `is_user_range(arg1, 40)`, no
+    # spurious -1 from validating a window it never offered. That is what makes this an append
+    # rather than an ABI break, and it is the one thing to preserve if this is ever touched again.
+    #
+    # ⛔⛔ NO `idle` FIELD, AND THE ABSENCE IS THE HONEST ANSWER. agnos has no single idle loop:
+    # `arch_wait()` (a bare `hlt`) is called from ~a dozen polling waits — DHCP retry, `sleep_ms`#41's legacy loop,
+    # `kbd_read_blocking`, the NIC drain — so a CPU halted inside a blocking syscall is
+    # INDISTINGUISHABLE at the tick boundary from one doing real kernel work. Both are ring 0.
+    # ⇒ The kernel field means "system + halted", NOT "busy-system". Compute utilisation as
+    # user/(user+kernel). Guessing idle from the saved RIP, or flagging one `arch_wait` site and not
+    # the other eleven, would be a plausible-looking wrong number.
+    if (si_len >= 104) {
+        var si_c = 0;
+        while (si_c < 4) {
+            store64(arg1 + 40 + si_c * 16 + 0, load64(&cpu_user_ticks + si_c * 8));
+            store64(arg1 + 40 + si_c * 16 + 8, load64(&cpu_kern_ticks + si_c * 8));
+            si_c = si_c + 1;
+        }
+    }
+    # ── PER-DEVICE DISK I/O, appended at +104 (1.56.59, telemetry filing §3) ────────────────────
+    #
+    # ⛔⛔ THIS WAS `blkstats`#105 AND THE NUMBER HAS BEEN WITHDRAWN. It was minted, filed upstream,
+    # and shipped as a cyrius peer in 6.5.44 before an extend-vs-mint audit of the whole syscall
+    # surface found it never needed a number: the tag space is a CLOSED 5-value enum over flat
+    # by-tag arrays, which is exactly a fixed-size tail block. Same filing, same cut, same consumer
+    # and the same shape as the per-core band directly above it. `blk_info`#79 was correctly ruled
+    # out (fixed arity, no length) and the test stopped there instead of continuing to #35.
+    # ⇒ Removed rather than left standing, because a needless syscall number is permanent surface:
+    # every consumer, every ABI gate and every peer carries it forever. The cyrius removal is filed.
+    #
+    # ⚠ INDEXED BY THE RAW `BLK_*` TAG, SLOT 0 DELIBERATELY WASTED. `blk_reads_by_tag[6]` reserves
+    # index 0 (BLK_NONE) and uses 1..5, so mirroring that exactly means a consumer reads
+    # `+104 + tag*16` with the SAME tag `blk_enum`#75 handed it — no -1 adjustment to get wrong.
+    # 16 bytes of padding is a cheap price for removing an off-by-one from every consumer.
+    #
+    #   +104 + tag*16 + 0  u64  cumulative sectors READ    (tag 1..5; slot 0 always 0)
+    #   +104 + tag*16 + 8  u64  cumulative sectors WRITTEN
+    #
+    # ⚠ SECTORS, NOT BYTES — this layer moves exactly one sector per call, and a byte figure needs
+    # the per-device LBA size, which can be 4096. Multiply by `blk_info`#79's reported size.
+    # ⚠ Monotonic since boot, never reset. An unregistered device legitimately reports 0.
+    if (si_len >= 200) {
+        var si_t = 0;
+        while (si_t < 6) {
+            store64(arg1 + 104 + si_t * 16 + 0, load64(&blk_reads_by_tag  + si_t * 8));
+            store64(arg1 + 104 + si_t * 16 + 8, load64(&blk_writes_by_tag + si_t * 8));
+            si_t = si_t + 1;
+        }
+    }
+    # ── RESCHEDULE IPIs, appended at +200 (1.57.9) ─────────────────────────────────────────────────
+    #   +200  u64  sched_kicks — 0xE1 reschedule kicks SENT since boot, all CPUs (sched.cyr: sched_kick_for's
+    #              wakes + sched_kick_target's #108 directed kicks). Linux's /proc/interrupts "RES" row is the
+    #              prior art (per CPU received there; one global sent-count here). A racy increment: diagnostic,
+    #              may under-count by a lost update, never over-counts. Monotonic, never reset.
+    # Why: the issue's gate ("two unrelated #44 idle loops ... sched_kicks must stay bounded") is measured from
+    # ring 3 (tests/ipcw); a 200-byte caller stays byte-identical (the tier rule above).
+    if (si_len >= 208) { store64(arg1 + 200, sched_kicks); }
+    stack_canary_check(canary);
+    return 0;
 }
 
 fn ksyscall(num, arg1, arg2, arg3) {
@@ -10145,9 +11311,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # ⚠ This does NOT smuggle stream semantics into the band: record boundaries still hold on
             # every `#97` path, and a reader still receives whole records. It only means a stream
             # writer's bytes arrive as several records — which is exactly what a tty does.
+            # ⭐ 1.57.18 — A TERMINAL HAS BACK-PRESSURE (chan_write_tty): on a channel either of whose ends was endowed in
+            # PTY mode, a full peer inbox is never overwritten — a4 == 0 takes the WHOLE buffer as successive 64-byte
+            # records, waiting for room between them; a4 != 0 takes what fits (0 when nothing does). A DISPLAY channel
+            # keeps the one-record drop-oldest short write below, byte for byte.
+            if (chan_is_tty(wep) == 1) { return chan_write_tty(arg1, wep, arg2, arg3); }
             var wlen = arg3;
             if (wlen > CHAN_REC_BYTES) { wlen = CHAN_REC_BYTES; }
-            var wr = chan_queue(wep, arg2, wlen);
+            var wr = chan_queue(wep, chan_fd_cep(arg1), arg2, wlen);
             if (wr < 0) { return 0 - 1; }        # peer gone / bad buffer — EPIPE-shaped
             return wr;
         }
@@ -10265,25 +11436,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # as the bare-name fallback. AO_DIRECTORY(0x800)→dir-fd (getdents);
         # AO_CREAT(0x100) creates if absent; AO_TRUNC(0x200) zeroes existing;
         # AO_NOFOLLOW(0x1000) refuses when the FINAL component is a symlink (1.56.53).
-        if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
-        # Normalize a RELATIVE name (no leading '/') to rooted-at-'/' — agnos has no
-        # CWD, so `touch foo` / `cmd > foo` land in the writable root FS instead of
-        # failing against the read-only initrd. Prepend '/' into a kernel scratch buffer
-        # + route THAT (the ext2 lookup needs the leading '/'). Absolute paths pass
-        # through untouched. (1.54.11: the redirect/touch-can't-create fix.)
-        var op_path = arg1;
-        var op_len  = arg2;
-        if (load8(arg1) != 47) {
-            # 1.57.12 (B6 review): a relative name of 255+ bytes is REFUSED — it was copied up to 254 and opened, so
-            # AO_CREAT made a DIFFERENT, truncated name (ext2 since 1.54.11; ZFS since B6). '/' + 254 fill the slice.
-            if (arg2 > 254) { return 0 - 1; }
-            var oabs = sc_open_abs_base();          # 1.56.51: THIS CPU's slice — see the banner
-            store8(oabs, 47);
-            var opi = 0;
-            while (opi < arg2) { store8(oabs + 1 + opi, load8(arg1 + opi)); opi = opi + 1; }
-            op_path = oabs;
-            op_len  = opi + 1;
-        }
+        # ⭐ 1.57.18 — the path through the ingress (sc_path_take): a kernel copy, a RELATIVE name resolved from the caller's
+        # working directory (chdir#112) — it was rooted at '/' (1.54.11, the `touch foo` fix) — and never truncated (one
+        # over CWD_MAX is -1; until 1.57.18 the bound was 254, the old rooting buffer's, since 1.57.12 B6).
+        # AO_MODE(0x4000, 1.57.18): bits 32..63 are a create's mode (sc_open_mode) — a field above 07777 is -1 here,
+        # before any backend; ext2 and ZFS read it from arg3 at their create, FAT / exFAT ignore it.
+        if (sc_open_mode(arg3) == 0 - 2) { return 0 - 1; }
+        var op_len  = sc_path_take(arg1, arg2, 0);
+        if (op_len < 0) { return 0 - 1; }
+        var op_path = sc_path_buf(0);
         # 1.57.2 — the kernel-owned /fonts namespace (core/kfont.cyr) is a PREFIX INTERCEPT, not a
         # mount: asked here, AFTER sc_path_ok + the relative→absolute normalisation and BEFORE
         # vfs_resolve_mount, so the two face names never reach the mount table (and never appear in
@@ -10347,7 +11508,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 8) { return arg1; }           # dup(fd) -> return same fd
     if (num == 9) {
         # mkdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
-        if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — a kernel copy, relative from the cwd
+        if (arg2 < 0) { return 0 - 1; }
+        arg1 = sc_path_buf(0);
         var be9 = vfs_resolve_mount(arg1, arg2);
         if (be9 == FS_ZFS) {
             # 1.57.12 B6 — ZFS (core/zfs_write.cyr zfs_wmkdir): a 512-byte microzap directory, mode 040755, in its own
@@ -10378,7 +11541,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 10) {
         # rmdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
-        if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — a kernel copy, relative from the cwd
+        if (arg2 < 0) { return 0 - 1; }
+        arg1 = sc_path_buf(0);
         var be10 = vfs_resolve_mount(arg1, arg2);
         if (be10 == FS_ZFS) {
             # 1.57.12 B7 — ZFS (core/zfs_write.cyr zfs_wrmdir): an EMPTY directory (SIZE == 2) out of its parent's ZAP
@@ -10420,6 +11585,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (zs12 != 0) { return 0 - 1; }
         return 0;
     }
+    if (num == 115) {
+        # fsync(fd) — 1.57.18: what ONE file holds made durable (sys_fsync_fd: ext2 the device flush — write-through, no
+        # sector written; ZFS its object's pending policy-B txg committed, another file's left pending; a FAT / exFAT
+        # write-back fd's buffer written + the flush). 0 / -1 (not a file or directory fd, a closed one, a failed flush
+        # or commit). sync#12 stays the whole-system barrier.
+        return sys_fsync_fd(arg1);
+    }
     if (num == 15) { return 0; }             # getuid (root)
     if (num == 24) { return 0; }             # umount
     # Tier 2: simple
@@ -10431,6 +11603,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # It now runs the real shutdown sequence, gated on the magic pair so the
         # garbage-argument callers the old nullary ABI left behind fail closed.
         return power_sys(arg1, arg2, arg3, ksyscall_a4_get());
+    }
+    if (num == 114) {                         # power_source() -> word (>= 0) — 1.57.18, beside reboot#13 (the other power arm)
+        # The answer the boot-time ACPI namespace scan cached (power.cyr psrc_scan): w & 0xFF = 0 cannot say · 1 mains ·
+        # 2 battery (reserved, never produced), PSRC_F_* bits above it. One global load: no pointer, no lock, no
+        # blocking, a1..a4 never read. The word is never negative, so -1 (an unknown number) means a pre-1.57.18 kernel.
+        return power_source_sys();
     }
     if (num == 14) {                          # pause — the refused-yield fallback (one hlt)
         # Ring-3 pause is handled in syscall_handler (#14 → sys_pause → sched_yield_or_halt, 1.57.7). It falls
@@ -10673,14 +11851,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
             return zgn;
         }
         if (ktag(gbase) != VFS_EXT2_DIR) { stack_canary_check(canary); return 0 - 1; }
+        # ⛔ 1.57.18: under fs_lock. ext2_getdents walks the shared ext2 scratch (ext2_inode_buf, ext2_dir_buf,
+        # ext2_gd_next) and ran with NO lock since 1.41.3 — the 1.46.x SMP sub-bite locked the ext2 path arms and
+        # missed this fd arm — so a listing on one CPU could rewrite ext2_inode_buf under another CPU's locked
+        # create or write. The position (an lseek#58 cookie since 1.57.18) is validated inside, under the lock.
+        fs_spin_lock();
         var gn = ext2_getdents(kpayload(gbase, 2), kpayload(gbase, 0), arg2, arg3);
         if (gn >= 0) { kpayload_set(gbase, 0, ext2_gd_next); }
+        fs_spin_unlock();
         stack_canary_check(canary);
         return gn;
     }
     if (num == 30) {
         # unlink(path=arg1, pathlen=arg2) — remove a file, mount-routed (1.41.3).
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — a kernel copy, relative from the cwd
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
         var be30 = vfs_resolve_mount(arg1, arg2);
         if (be30 == FS_ZFS) {
             # 1.57.12 B7 — ZFS (core/zfs_write.cyr zfs_wunlink): the name out of its parent's ZAP (micro or fat, B8), in
@@ -10731,8 +11917,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # rename(old=arg1, oldlen=arg2, new=arg3, newlen=a4) — within one
         # filesystem (a4=r10 via ksyscall_a4, 1.41.3).
         var a4r = ksyscall_a4_get();
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (sc_path_ok(arg3, a4r) == 0) { stack_canary_check(canary); return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — both names, slot 0 and slot 1
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
+        a4r = sc_path_take(arg3, a4r, 1);
+        if (a4r < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg3 = sc_path_buf(1);
         var beo = vfs_resolve_mount(arg1, arg2);
         var ro = vfs_mnt_reloff;
         var ben = vfs_resolve_mount(arg3, a4r);
@@ -10782,8 +11972,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # hard link, ext2-only (a4=r10 via ksyscall_a4, 1.41.3). FAT/exFAT → -1
         # (O4: no inodes/hard links).
         var a4l = ksyscall_a4_get();
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (sc_path_ok(arg3, a4l) == 0) { stack_canary_check(canary); return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — both names, slot 0 and slot 1
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
+        a4l = sc_path_take(arg3, a4l, 1);
+        if (a4l < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg3 = sc_path_buf(1);
         if (vfs_resolve_mount(arg1, arg2) == FS_ZFS && vfs_resolve_mount(arg3, a4l) == FS_ZFS) {
             # 1.57.12 B7 — ZFS (core/zfs_write.cyr zfs_wlink): a second name for a file or symlink (not followed; never a
             # directory) in the SAME dataset, in its own txg — LINKS + 1, PARENT := the new name's directory (FreeBSD's
@@ -10816,7 +12010,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # stat(path=arg1, pathlen=arg2, statbuf=arg3) — fills the 48-byte agnos
         # stat struct (§4.1). ext2 fully; FAT/exFAT degrade to -1 for now (O4's
         # ino=0+size/type fill is a follow-on). (1.41.3)
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — a kernel copy, relative from the cwd
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
         if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
         # 1.57.2 — /fonts prefix intercept (core/kfont.cyr), before the mount table; same shape as open#7.
         if (kfont_path_index(arg1, arg2) >= 0) { var kr33 = kfont_stat(arg1, arg2, arg3); stack_canary_check(canary); return kr33; }
@@ -10858,7 +12054,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
         if (arg2 > 4096) { stack_canary_check(canary); return 0 - 1; }            # one ext2 block max
         if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }   # target = link TEXT buffer
-        if (sc_path_ok(arg3, a4sl) == 0) { stack_canary_check(canary); return 0 - 1; }
+        # 1.57.18: the LINK path through the ingress (relative from the cwd); the target text above is never rewritten —
+        # a relative target is relative to the link's directory when it is FOLLOWED, as on Linux.
+        a4sl = sc_path_take(arg3, a4sl, 0);
+        if (a4sl < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg3 = sc_path_buf(0);
         var be63 = vfs_resolve_mount(arg3, a4sl);
         if (be63 == FS_ZFS) {
             # 1.57.12 B6 — ZFS (core/zfs_write.cyr zfs_wsymlink): the target text in the SA bonus (SYMLINK), mode
@@ -10888,18 +12088,21 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 70) {
         # readlink(path=arg1, pathlen=arg2, buf=arg3, buflen=a4) — the symlink-INTROSPECTION
         # peer of symlink#63: read the TEXT target of the symbolic link at `path` into `buf`,
-        # returning the target byte length (NOT NUL-terminated, ≤ buflen) or -1. The FINAL path
+        # copying AT MOST buflen bytes and returning how many (NOT NUL-terminated; 1.57.18 — a longer
+        # target is cut, Linux readlink_copy; it was -1: ext2_readlink / zfs_readlink_ref_copy) or -1. The FINAL path
         # component is resolved NO-FOLLOW (ext2_path_lookup_ex follow_last=0) — the whole point:
         # the following stat#33 lookup would resolve a trailing symlink to its target, and then
         # ext2_readlink would reject that (non-symlink) target. Returns -1 when: path not found,
-        # the final component is not a symlink (ext2_readlink's 0xA000 mode check), the target
-        # exceeds buflen, or the mount isn't ext2 (symlinks need inodes → FAT/exFAT never carry
+        # the final component is not a symlink (ext2_readlink's 0xA000 mode check), buflen < 1, the
+        # link is corrupt (longer than its format holds), or the mount isn't ext2 / ZFS (FAT/exFAT never carry
         # them). Validation shape mirrors stat#33; buf is a bounded user range like stat's statbuf.
         # This is the ring-3 primitive a symlink manager (hapi status/reconcile) needs to SEE an
         # existing link + byte-compare its target — impossible before (stat#33 always follows).
         # ⚠ TWO-SIDED like symlink#63: the cyrius `sys_readlink`#70 peer is the ring-3 half.
         var a4rl = ksyscall_a4_get();
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — a kernel copy, relative from the cwd
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
         if (is_user_range(arg3, a4rl) == 0) { stack_canary_check(canary); return 0 - 1; }
         var be70 = vfs_resolve_mount(arg1, arg2);
         if (be70 == FS_ZFS) {                                       # 1.57.11 — a ZFS symlink's text (SA, spill or data)
@@ -10931,222 +12134,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
     # ⛔ `#96` is `fork`'s. The operator assigned both on 2026-08-05; whichever lands first does NOT
     # take the other's number.
     if (num == 97) {
-        # chan_op(op, a1, a2, a3) -> 0 / negative CH_E_*
-        # CAPS(out_uva, out_len >= 16) -> 0. Layout: +0 op-support mask · +4 region pages ·
-        # +8 region reachable (1/0). ⛔ The reachability word is a LIVE probe run under the CALLER's
-        # CR3, not a boot-time cached answer — the claim being tested is that the region resolves from
-        # a spawned client's page tables, and a value stamped at boot under the kernel CR3 would say
-        # nothing about that. §9.9 makes it a kill criterion.
-        if (arg1 == CH_CAPS) {
-            if (arg3 < 16) { stack_canary_check(canary); return 0 - CH_E_OUTBUF; }
-            if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - CH_E_OUTBUF; }
-            if (chan_region_kva == 0) { stack_canary_check(canary); return 0 - CH_E_NOREGION; }
-            store32(arg2 + 0, CH_OP_SUPPORTED);
-            store32(arg2 + 4, CHAN_REGION_PAGES);
-            store64(arg2 + 8, chan_region_reachable());
-            stack_canary_check(canary);
-            return 0;
-        }
-        # MINT(out_uva) -> 0, writing two fds. ⛔ A channel is minted as a PAIR and has NO NAME: you get
-        # both ends or nothing. That deletes the entire unlink-before-bind race class AF_UNIX carries,
-        # and it is why `tcp_listen`'s "whoever binds 7700 first owns the display protocol and every
-        # keystroke on it" cannot be reproduced here.
-        if (arg1 == CH_MINT) {
-            if (chan_region_kva == 0) { stack_canary_check(canary); return 0 - CH_E_NOREGION; }
-            if (is_user_range(arg2, 16) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            var c = 0;
-            var found = 0 - 1;
-            while (c < 16) {
-                if (load64(&chan_end_open + (c * 2) * 8) == 0) {
-                    if (load64(&chan_end_open + (c * 2 + 1) * 8) == 0) { found = c; c = 16; }
-                    else { c = c + 1; }
-                }
-                else { c = c + 1; }
-            }
-            if (found < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
-            var ea = found * 2;
-            var eb = ea + 1;
-            # ⛔ TAG THE FIRST FD BEFORE ALLOCATING THE SECOND. `vfs_alloc` FINDS a free slot; it does
-            # not CLAIM one — the slot only stops being free once `ktag_set` writes a non-FREE tag. Two
-            # back-to-back allocs therefore return the SAME fd, and a channel minted onto one fd is a
-            # channel whose two ends are the same end. `vfs_create_pipe` gets this right and is the
-            # reference; this code did not, and the selftest caught it as `MINT gave one fd`.
-            var fa = vfs_alloc();
-            if (fa < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
-            var ba = vfs_fd_table() + fa * 32;
-            ktag_set(ba, VFS_CHAN);
-            var fb = vfs_alloc();
-            if (fb < 0) { vfs_close(fa); stack_canary_check(canary); return 0 - CH_E_FULL; }
-            var bb = vfs_fd_table() + fb * 32;
-            ktag_set(bb, VFS_CHAN);
-            chan_epoch_next = chan_epoch_next + 1;
-            store64(&chan_epoch + found * 8, chan_epoch_next);
-            var me = proc_current_get();
-            var mye = proc_epoch_get(me);
-            var z = 0;
-            while (z < 2) {
-                var ee = ea + z;
-                store64(&chan_end_open + ee * 8, 1);
-                store64(&chan_end_pty + ee * 8, 0);      # fresh endpoint: not a terminal until endowed as one
-                store64(&chan_winsz + ee * 8, 0);        # 1.57.17: and never sized — a recycled slot keeps no stale size
-                store64(&chan_end_owner + ee * 8, me);
-                store64(&chan_end_oepoch + ee * 8, mye);
-                store64(&chan_w + ee * 8, 0);
-                store64(&chan_r + ee * 8, 0);
-                memset(chan_page(ee), 0, 4096);   # never hand a new owner the last occupant's bytes
-                z = z + 1;
-            }
-            kpayload_set(ba, 0, ea);
-            kpayload_set(ba, 1, chan_epoch_next);
-            kpayload_set(ba, 2, 0);
-            kpayload_set(bb, 0, eb);
-            kpayload_set(bb, 1, chan_epoch_next);
-            kpayload_set(bb, 2, 0);
-            store64(arg2 + 0, fa);
-            store64(arg2 + 8, fb);
-            stack_canary_check(canary);
-            return 0;
-        }
-        # SEND(fd, buf, len) — writes into the PEER's inbox. ⛔ Bounded-queue-with-DROP-OLDEST, not
-        # back-pressure: §3 measured the workload as "presents are idempotent overwrites; input is
-        # droppable", and a blocking send would starve the peer it waits on — the poison that made TCP
-        # toxic here. Drops are COUNTED (`chan_drops`); a silent drop is a lie.
-        if (arg1 == CH_SEND) {
-            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var sb = vfs_fd_table() + arg2 * 32;
-            var se = chan_auth(sb);
-            if (se < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var sr = chan_queue(se, arg3, ksyscall_a4_get());
-            stack_canary_check(canary);
-            return sr;
-        }
-        # RECV(fd, buf, cap) -> len, or WOULDBLOCK / PEERGONE. ⛔ Those two are RESULTS, so a caller
-        # batching one per held channel never aborts the batch on "nothing here" (§9.4).
-        if (arg1 == CH_RECV) {
-            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var rb = vfs_fd_table() + arg2 * 32;
-            var re = chan_auth(rb);
-            if (re < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var rr2 = chan_deliver(re, arg3, ksyscall_a4_get());
-            stack_canary_check(canary);
-            return rr2;
-        }
-        # ENDOW(fd) -> fd. Arms this endpoint for THIS PROCESS's next child — #43, #37 or #3 (1.57.6:
-        # per-process, see the ENDOWMENT banner; it said "the next #43 child"). ⛔ Authority is re-derived first:
-        # you can only endow what you currently own, so an inherited (inert) claim cannot be used to
-        # hand a channel onward — otherwise inert-by-construction would leak through the grant path.
-        if (arg1 == CH_ENDOW) {
-            # ⭐ 1.57.6: ENDOW(-1) DISARMS the caller's pending endowment and its PTY flag -> 0 (was
-            # -CH_E_BADFD). A caller whose spawn fails between arm and spawn can drop the arm itself.
-            if (arg2 == 0 - 1) {
-                endow_disarm(proc_current_get());
-                stack_canary_check(canary);
-                return 0;
-            }
-            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var nb = vfs_fd_table() + arg2 * 32;
-            var ne = chan_auth(nb);
-            if (ne < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            # ⛔⛔ ENDOWMENT REQUIRES REAL OWNERSHIP, NOT MERELY AUTHORITY TO USE. `chan_auth` now also
-            # answers yes to a DESCENDANT of a PTY endpoint's owner — correct for read/write, and
-            # catastrophic here, because `chan_endow_place` MOVES ownership. Without this gate any
-            # program agnsh launches could endow the terminal into a child of its own and agnsh would
-            # silently lose its own stdin/stdout. That is the exact hazard the banner above this block
-            # already names ("you can only endow what you currently own"); the PTY arm would have
-            # quietly widened it from a use-right into a transfer-right.
-            var nme = proc_current_get();
-            if (load64(&chan_end_owner + ne * 8) != nme) {
-                stack_canary_check(canary); return 0 - CH_E_BADFD;
-            }
-            var tfd = chan_endow_pick_fd(nme);
-            if (tfd < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
-            endow_arm_set(nme, ne);
-            endow_fd_set(nme, tfd);
-            # 1.57.6: the channel's incarnation NOW — placement refuses if the channel was re-minted.
-            endow_epoch_set(nme, load64(&chan_epoch + (ne >> 1) * 8));
-            # ⛔ AN EXACT SENTINEL, NOT `a4 != 0`. `ksyscall_a4` is shared staging: SEND and RECV use
-            # it as a LENGTH, and it is not cleared between ops. The first cut of this read `a4 != 0`
-            # and a selftest that had just done `ksyscall_a4_set(8)` for a SEND silently endowed in
-            # PTY mode — pty_mode came through as 8 — replacing an unrelated child's stdio.
-            # CH_ENDOW_STDIO is deliberately > CHAN_REC_BYTES so no legal length can ever collide.
-            var emode = 0;
-            if (ksyscall_a4_get() == CH_ENDOW_STDIO) { emode = 1; }
-            endow_stdio_set(nme, emode);
-            stack_canary_check(canary);
-            return tfd;                          # the fd the child will hold — announce it in its env
-        }
-        if (arg1 == CH_CLOSE) {
-            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var cb = vfs_fd_table() + arg2 * 32;
-            var ce = chan_auth(cb);
-            if (ce < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            # ⭐ 1.57.6: closing the endpoint the CALLER has armed for endowment disarms that arm — a
-            # closed endpoint can be re-minted to somebody else, and the arm must not follow the number.
-            # (Placement also re-checks owner + epoch; this makes the common case refuse nothing at all.)
-            if (endow_arm_get(proc_current_get()) == ce) { endow_disarm(proc_current_get()); }
-            store64(&chan_end_open + ce * 8, 0);
-            store64(&chan_end_pty + ce * 8, 0);
-            store64(&chan_winsz + ce * 8, 0);            # 1.57.17: the window size dies with the endpoint
-            store64(&chan_end_owner + ce * 8, 0);
-            store64(&chan_end_oepoch + ce * 8, 0);
-            wq_wake(WK_CHAN | (ce ^ 1));         # 1.57.8: the peer's blocked read sees PEER GONE (EOF)
-            vfs_close(arg2);
-            stack_canary_check(canary);
-            return 0;
-        }
-        # ⭐ 1.57.17 — WINSZ_SET(fd, w): the EMULATOR sizes the terminal it endowed (or is about to endow). `fd` is the
-        # caller's OWN end — strict ownership, as CH_ENDOW requires, because chan_auth also answers yes to a PTY
-        # descendant — and NOT itself a terminal: the program inside a terminal holds the PTY-mode end and does not
-        # size its own window (Linux lets either side TIOCSWINSZ; here only the emulator knows the window, so only its
-        # end may). The size lands on the PEER, which must be a TERMINAL (a PTY-mode end) or an end the caller still
-        # owns (sized before CH_ENDOW hands it out) — never a DISPLAY client's end, nor the compositor's end seen from
-        # a display client. w = (xpix<<48)|(ypix<<32)|(cols<<16)|rows; the low half alone (`winsize`#60's packing)
-        # leaves the pixel size 0 = unknown, as Linux's ws_xpixel 0. cols and rows 1..65535 (0 would read back as
-        # "never set"). -> 0 · -CH_E_BADFD (not a channel fd; not the caller's own end; a terminal end; a peer that is
-        # neither a terminal nor the caller's) · -CH_E_ARG (cols or rows 0) · -CH_E_PEERGONE (the peer is closed).
-        if (arg1 == CH_WINSZ_SET) {
-            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var zse = chan_auth(vfs_fd_table() + arg2 * 32);
-            if (zse < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var zme = proc_current_get();
-            if (load64(&chan_end_owner + zse * 8) != zme) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            if (load64(&chan_end_pty + zse * 8) != 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var zpe = zse ^ 1;
-            if (load64(&chan_end_open + zpe * 8) != 1) { stack_canary_check(canary); return 0 - CH_E_PEERGONE; }
-            if (load64(&chan_end_pty + zpe * 8) != 1) {
-                if (load64(&chan_end_owner + zpe * 8) != zme) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-                if (load64(&chan_end_oepoch + zpe * 8) != proc_epoch_get(zme)) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            }
-            if (((arg3 >> 16) & 0xFFFF) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            if ((arg3 & 0xFFFF) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            var zsr = chan_winsz_set(zpe, arg3);
-            stack_canary_check(canary);
-            return zsr;
-        }
-        # ⭐ 1.57.17 — WINSZ_GET(fd, sel): the window of the terminal `fd` is — sel 0 -> (cols<<16)|rows (`winsize`#60's
-        # packing), sel 1 -> (xpix<<16)|ypix (0 when the emulator gave none). -1 when `fd` is not a terminal end the
-        # caller may use (a closed or non-channel fd, an inert inherited copy, a DISPLAY channel, the emulator's own
-        # end) or when no size was ever set: ring 3's "is this fd a terminal?" for an `fd_kind`#111 5, as a failing
-        # TIOCGWINSZ is on Linux. Any other sel -> -CH_E_ARG (an exact selector, never a guess). Lock-free: one load of
-        # the one-qword size.
-        if (arg1 == CH_WINSZ_GET) {
-            if (arg3 != 0) { if (arg3 != 1) { stack_canary_check(canary); return 0 - CH_E_ARG; } }
-            var zge = chan_fd_endpoint(arg2);
-            if (zge < 0) { stack_canary_check(canary); return 0 - 1; }
-            if (load64(&chan_end_pty + zge * 8) != 1) { stack_canary_check(canary); return 0 - 1; }
-            var zgw = load64(&chan_winsz + zge * 8);
-            if (zgw == 0) { stack_canary_check(canary); return 0 - 1; }
-            stack_canary_check(canary);
-            if (arg3 == 1) { return (zgw >> 32) & 0xFFFFFFFF; }
-            return zgw & 0xFFFFFFFF;
-        }
+        # chan_op(op, a1, a2, a3) -> 0 / negative CH_E_*  (body: chan_op_sys, 1.57.18)
+        var chanx_r = chan_op_sys(arg1, arg2, arg3);
         stack_canary_check(canary);
-        return 0 - CH_E_BADOP;
+        return chanx_r;
     }
     if (num == 71) { stack_canary_check(canary); return shm_create(arg1); }             # shm_create(size) -> id
     # 1.56.40 bite 1 — WARN ONLY on #72/#73. A cross-owner touch is counted and then ALLOWED, because
@@ -11186,6 +12177,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
     # directory listing (#81) — ring-3 readdir over the ext2 root; fills 64-byte {name,type} records.
     if (num == 81) {                                                                                         # readdir(path, buf, max) -> count
+        # 1.57.18: the NUL-terminated path through the ingress (sc_cpath_take): the backends below read a kernel copy,
+        # a relative one resolved from the cwd.
+        if (sc_cpath_take(arg1, 0) < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
         var zrd81 = zfs_readdir_sys(arg1, arg2, arg3, 0);           # 1.57.11 — a path on the ZFS mount; -99 = not ZFS
         stack_canary_check(canary);
         if (zrd81 != 0 - 99) { return zrd81; }
@@ -11198,6 +12193,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 101) {                                                                                        # readdir_at(path, buf, max, &cursor) -> count
         # 1.57.11 — on the ZFS mount the cursor is OPAQUE (0 starts, -1 exhausted, anything else is what the last
         # call returned): a ZAP has no byte offsets, so ext2's "byte offset into the directory file" does not exist.
+        if (sc_cpath_take(arg1, 0) < 0) { stack_canary_check(canary); return 0 - 1; }   # 1.57.18: the ingress, as #81
+        arg1 = sc_path_buf(0);
         var zrd101 = zfs_readdir_sys(arg1, arg2, arg3, ksyscall_a4_get());
         stack_canary_check(canary);
         if (zrd101 != 0 - 99) { return zrd101; }
@@ -11232,7 +12229,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # every current consumer. #102 is the next free number (101 is the previous high-water).
         # ⚠ Mid-path symlinks still resolve; only the FINAL component is left unresolved — matching
         # POSIX lstat and `readlink`#70, which introduced this exact lookup mode.
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — a kernel copy, relative from the cwd
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
         if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
         # 1.57.2 — /fonts prefix intercept (core/kfont.cyr). The face is a regular file, never a
         # symlink, so lstat and stat answer identically for it; before the mount table, as in #33.
@@ -11281,7 +12280,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # nearly made it file a phantom capability gap against a capability that shipped — which is the
         # cost of a stale comment stated exactly: not confusion, but work done twice in two repos.
         # ⚠ The ABI doc was correct throughout; only this comment drifted.
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        arg2 = sc_path_take(arg1, arg2, 0);                  # 1.57.18: the ingress — a kernel copy, relative from the cwd
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        arg1 = sc_path_buf(0);
         if (is_user_range(arg3, 32) == 0) { stack_canary_check(canary); return 0 - 1; }
         var be103 = vfs_resolve_mount(arg1, arg2);
         # ⚠ THE PATH MUST RESOLVE, ON EVERY BACKEND. Without it a statfs of a nonexistent path would
@@ -11470,121 +12471,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return 0;
     }
     if (num == 35) {
-        # sysinfo(buf=arg1, len=arg2) — writes the 40-byte counters struct: 5x
-        # u64 LE at offsets 0/8/16/24/32 = uptime_secs / totalram / freeram /
-        # procs / cpus. Live volatile snapshot; single-core so no lock. The
-        # kernel does the unit conversion (ticks→sec at 100 Hz, pages→bytes at
-        # 4 KB) so userland never re-derives units. a3 unused.
-        # ⛔ ONE RANGE CHECK, BEFORE ANY STORE, SIZED TO WHAT THE CALLER ASKED FOR. The first shape of
-        # the 1.56.59 tail append validated the wider window INSIDE the extension block, after the base
-        # fields were already written — so a caller passing len>=104 with a buffer valid for only 40
-        # got 40 bytes written AND a -1 back. A partial write with an error return is a contract nobody
-        # can code against. Deciding the length up front makes the arm all-or-nothing again.
-        if (arg2 < 40) { stack_canary_check(canary); return 0 - 1; }
-        var si_len = 40;
-        if (arg2 >= 104) { si_len = 104; }
-        if (arg2 >= 200) { si_len = 200; }
-        if (arg2 >= 208) { si_len = 208; }
-        if (is_user_range(arg1, si_len) == 0) { stack_canary_check(canary); return 0 - 1; }
-        store64(arg1 +  0, timer_ticks / 100);            # uptime seconds (100 Hz)
-        store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
-        store64(arg1 + 16, pmm_free_count() * 4096);      # free RAM bytes
-        store64(arg1 + 24, proc_count);                   # proc-table high-water mark (1.44.x: ≥ live count — non-LIFO holes may make it over-report; cosmetic stat field, no control flow depends on it)
-        # cpu_count = ENUMERATED CPUs (BSP + APs that checked in via smp_start_aps).
-        # ⛔ 1.56.51 — THIS COMMENT DESCRIBED A KERNEL THAT NO LONGER EXISTS, and it was cited as
-        # evidence elsewhere. It used to read "1.44.18+ the APs are woken then PARK (IF=0 hlt) —
-        # exactly ONE CPU (the BSP) ever schedules — so this OVER-reports usable parallelism".
-        # The SMP arc that "actually unparks APs" SHIPPED: smp_sched_aps=1 (smp.cyr) and
-        # smp_wake_enabled=1 (main.cyr), so APs pull real ring-3 procs and cpu_count reports
-        # parallelism that is genuinely usable. The stale claim mattered because two shared-scratch
-        # buffers (sc_open_abs, fb_scale_rowbuf) justified themselves on it. Both are per-CPU now.
-        # Still a cosmetic stat: no scheduler decision reads this field.
-        store64(arg1 + 32, cpu_count);                    # online (enumerated) CPUs
-        # ── PER-CORE CPU ACCOUNTING, appended at +40 (1.56.59, telemetry filing §8) ──────────────
-        #
-        # ⭐ APPENDED HERE RATHER THAN MINTED AS A SYSCALL, AND THAT CHOICE IS THE POINT. This arm
-        # already takes a caller LENGTH, and this doc's own rule for the family is "future fields
-        # append at the tail and bump the minimum len; the existing offsets are frozen ABI the moment
-        # a consumer reads them" (agnos-userland-abi.md §4.4). Per-core ticks ARE system information.
-        # ⛔ IT WAS FIRST BUILT AS `cpustat`#106 AND THAT WAS A MISTAKE — a new syscall number is a
-        # cross-repo ask on the cyrius peer, i.e. a language-agent cycle, a cyrius release, and a
-        # re-pin of every sibling repo that wants one toolchain version. The extend-vs-mint test was
-        # applied correctly to `net_config`#61 (extended, no peer, shipped same day) and correctly
-        # ruled out for `blk_info`#79 (fixed arity, no length), then skipped here. It is applied now.
-        # ⚠⚠ AND ONE THING THIS IS *NOT*, corrected after an audit caught the claim: it is NOT free for
-        # a wrapper consumer. The cyrius peer is `fn sys_sysinfo(out)` — ARITY 1, with the length
-        # HARDCODED to 40 (cyrius/lib/sys.cyr:225-227). So +40..+103 is reachable today only by a raw
-        # `syscall(35, buf, 104)`, which is what tests/telemetry/tlm.cyr uses. A wrapper consumer needs
-        # a length-taking overload upstream — a NUMBER-FREE ask that touches no ABI-gate row, but not
-        # "no toolchain change at all", which is what three places here said until the audit.
-        # ⇒ The contrast with `net_config`#61 is real and worth keeping: its peer is
-        # `fn sys_net_config(field)`, which genuinely forwards an arbitrary id, so fields 8-11 shipped
-        # to consumers the same day with nothing upstream. #35 and #61 are NOT symmetric.
-        #
-        # Layout, 4 CPUs x 2 u64 = 64 bytes, minimum length 104:
-        #   +40 + cpu*16 + 0  u64  USER ticks   (interrupted CS was ring 3)
-        #   +40 + cpu*16 + 8  u64  KERNEL ticks (interrupted CS was ring 0)
-        #
-        # ⛔ THE LARGER RANGE IS VALIDATED ONLY WHEN THE CALLER ASKED FOR IT. A caller passing 40 must
-        # get BYTE-IDENTICAL behaviour — the same 40 bytes, the same `is_user_range(arg1, 40)`, no
-        # spurious -1 from validating a window it never offered. That is what makes this an append
-        # rather than an ABI break, and it is the one thing to preserve if this is ever touched again.
-        #
-        # ⛔⛔ NO `idle` FIELD, AND THE ABSENCE IS THE HONEST ANSWER. agnos has no single idle loop:
-        # `arch_wait()` (a bare `hlt`) is called from ~a dozen polling waits — DHCP retry, `sleep_ms`#41's legacy loop,
-        # `kbd_read_blocking`, the NIC drain — so a CPU halted inside a blocking syscall is
-        # INDISTINGUISHABLE at the tick boundary from one doing real kernel work. Both are ring 0.
-        # ⇒ The kernel field means "system + halted", NOT "busy-system". Compute utilisation as
-        # user/(user+kernel). Guessing idle from the saved RIP, or flagging one `arch_wait` site and not
-        # the other eleven, would be a plausible-looking wrong number.
-        if (si_len >= 104) {
-            var si_c = 0;
-            while (si_c < 4) {
-                store64(arg1 + 40 + si_c * 16 + 0, load64(&cpu_user_ticks + si_c * 8));
-                store64(arg1 + 40 + si_c * 16 + 8, load64(&cpu_kern_ticks + si_c * 8));
-                si_c = si_c + 1;
-            }
-        }
-        # ── PER-DEVICE DISK I/O, appended at +104 (1.56.59, telemetry filing §3) ────────────────────
-        #
-        # ⛔⛔ THIS WAS `blkstats`#105 AND THE NUMBER HAS BEEN WITHDRAWN. It was minted, filed upstream,
-        # and shipped as a cyrius peer in 6.5.44 before an extend-vs-mint audit of the whole syscall
-        # surface found it never needed a number: the tag space is a CLOSED 5-value enum over flat
-        # by-tag arrays, which is exactly a fixed-size tail block. Same filing, same cut, same consumer
-        # and the same shape as the per-core band directly above it. `blk_info`#79 was correctly ruled
-        # out (fixed arity, no length) and the test stopped there instead of continuing to #35.
-        # ⇒ Removed rather than left standing, because a needless syscall number is permanent surface:
-        # every consumer, every ABI gate and every peer carries it forever. The cyrius removal is filed.
-        #
-        # ⚠ INDEXED BY THE RAW `BLK_*` TAG, SLOT 0 DELIBERATELY WASTED. `blk_reads_by_tag[6]` reserves
-        # index 0 (BLK_NONE) and uses 1..5, so mirroring that exactly means a consumer reads
-        # `+104 + tag*16` with the SAME tag `blk_enum`#75 handed it — no -1 adjustment to get wrong.
-        # 16 bytes of padding is a cheap price for removing an off-by-one from every consumer.
-        #
-        #   +104 + tag*16 + 0  u64  cumulative sectors READ    (tag 1..5; slot 0 always 0)
-        #   +104 + tag*16 + 8  u64  cumulative sectors WRITTEN
-        #
-        # ⚠ SECTORS, NOT BYTES — this layer moves exactly one sector per call, and a byte figure needs
-        # the per-device LBA size, which can be 4096. Multiply by `blk_info`#79's reported size.
-        # ⚠ Monotonic since boot, never reset. An unregistered device legitimately reports 0.
-        if (si_len >= 200) {
-            var si_t = 0;
-            while (si_t < 6) {
-                store64(arg1 + 104 + si_t * 16 + 0, load64(&blk_reads_by_tag  + si_t * 8));
-                store64(arg1 + 104 + si_t * 16 + 8, load64(&blk_writes_by_tag + si_t * 8));
-                si_t = si_t + 1;
-            }
-        }
-        # ── RESCHEDULE IPIs, appended at +200 (1.57.9) ─────────────────────────────────────────────────
-        #   +200  u64  sched_kicks — 0xE1 reschedule kicks SENT since boot, all CPUs (sched.cyr: sched_kick_for's
-        #              wakes + sched_kick_target's #108 directed kicks). Linux's /proc/interrupts "RES" row is the
-        #              prior art (per CPU received there; one global sent-count here). A racy increment: diagnostic,
-        #              may under-count by a lost update, never over-counts. Monotonic, never reset.
-        # Why: the issue's gate ("two unrelated #44 idle loops ... sched_kicks must stay bounded") is measured from
-        # ring 3 (tests/ipcw); a 200-byte caller stays byte-identical (the tier rule above).
-        if (si_len >= 208) { store64(arg1 + 200, sched_kicks); }
+        # sysinfo(buf=arg1, len=arg2) — writes the 40-byte counters struct: 5x  (body: sysinfo_sys, 1.57.18)
+        var six_r = sysinfo_sys(arg1, arg2, arg3);
         stack_canary_check(canary);
-        return 0;
+        return six_r;
     }
     if (num == 36) {
         # klug(buf=arg1, len=arg2) — copy the unified klug log ring (core/klug.cyr)
@@ -11680,154 +12570,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return 0;
     }
     if (num == 39) {
-        # blit(src=arg1, w=arg2, h=arg3, dstxy=arg4) — copy a w×h block of 32bpp
-        # pixels from the ring-3 buffer `src` (tightly packed, w*4 bytes/row) into
-        # the framebuffer at (dst_x, dst_y) where arg4 = (dst_y<<16)|dst_x. The dest
-        #
-        # 1.53.7 SHADOW EXEMPT: writes the WC FB directly, NOT the fb_console shadow
-        # buffer. blit is the graphical-TAKEOVER path (doom/fbtest run full-screen +
-        # cli/loop — they never interleave with console text scroll), so mirroring
-        # every pixel into the shadow would tax doom's per-frame blit for zero benefit.
-        # CONSTRAINT: a future tool that blits INTO the live console region and then
-        # prints scrolling text would see the blit erased by the next scroll flush —
-        # such a tool must mirror here (add `store32(a + (fb_shadow - bl_fb), px)` when
-        # fb_shadow != 0) or paint via fb_putc instead.
-        # rect is CLIPPED to the FB bounds (off-screen rows/cols dropped), so both
-        # the src reads and the FB writes are provably in range. Pixels copy RAW (no
-        # format conversion) — the caller supplies fbinfo's reported byte order. The
-        # write goes straight to fb_phys, EXACTLY as fb_putc does from ring-3 stdout
-        # (the proven path): the handler runs in the same syscall context that already
-        # both reads user buffers (uname/sysinfo) and writes fb_phys (write#1→fb_putc),
-        # so no CR3 switch and no new mapping are needed. Returns 0 (incl. fully-clipped
-        # no-op) or -1 (bad src / no FB / bad geometry). arg4 read via ksyscall_a4.
-        var bl_w = arg2;
-        var bl_h = arg3;
-        if (bl_w < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (bl_h < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (bl_w > 8192) { stack_canary_check(canary); return 0 - 1; }   # sanity cap (w*h*4 can't overflow)
-        if (bl_h > 8192) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg1, bl_w * bl_h * 4) == 0) { stack_canary_check(canary); return 0 - 1; }
-        # 1.56.36: fb_draw_base(), NOT fb_fb_phys(). With the console redirected or the hardware pan armed
-        # the console no longer paints at the firmware surface, so this fallback would render into a buffer
-        # nothing is scanning — the same invisible-output class as the gpu_display_restore_console hazard.
-        # Identical to the old value whenever neither is active (fb_draw_base falls through to fb_fb_phys).
-        var bl_fb_direct = fb_draw_base();
-        if (bl_fb_direct == 0) { stack_canary_check(canary); return 0 - 1; }    # no framebuffer
-        # 1.55.x display arc: render into the DOUBLE-BUFFER's back buffer when the DCN pipe is ours (P0),
-        # so the finished frame can be swapped in during blank (tear-free) instead of being drawn straight
-        # into the live scanout. Falls back to the direct live-FB base — byte-identical legacy behaviour —
-        # whenever the GPU/DCN isn't usable (e.g. QEMU) or P0 never identified a pipe. Geometry/pitch are
-        # the console FB's, so every bound proven below still holds for the back buffer.
-        var bl_fb = gpu_blit_target(bl_fb_direct);
-        var bl_fw = fb_width();
-        var bl_fh = fb_height();
-        var bl_pitch = fb_pitch();
-        # Fail-closed on a malformed GOP: the in-bounds write proof needs
-        # pitch >= width*4 (UEFI guarantees PixelsPerScanLine >= HorizontalResolution,
-        # and gnoboot sets pitch = ppl*4 — not ring-3-reachable). Asserting it here
-        # makes the FB-write bound independent of the firmware invariant, so a quirky/
-        # spec-violating GOP can't spill the last clipped row past fb + pitch*height.
-        if (bl_pitch < bl_fw * 4) { stack_canary_check(canary); return 0 - 1; }
-        var bl_dstxy = ksyscall_a4_get();
-        var bl_dx = bl_dstxy & 0xFFFF;
-        var bl_dy = (bl_dstxy >> 16) & 0xFFFF;
-        # 1.44.20: a4 bits [39:32] = INTEGER SCALE (0 or 1 = the 1:1 path, byte-identical for
-        # every existing caller — doom's 4-arg syscall pins the full 64-bit a4 with yoff bits
-        # [23:16]=0; fbtest hand-emits mov r10,0; no shorter-arity blit caller exists). Each
-        # src pixel becomes a scale×scale block; the dst rect is (dx, dy, w*scale, h*scale),
-        # clipped exactly like 1:1. scale > 16 is a LOUD reject (catches a future garbage-r10
-        # caller at its first frame instead of silently misrendering — the env-a3/a4 class).
-        var bl_scale = (bl_dstxy >> 32) & 0xFF;
-        if (bl_scale == 0) { bl_scale = 1; }
-        if (bl_scale > 16) { stack_canary_check(canary); return 0 - 1; }
-        # THE memory-safety gate: fb_scale_rowbuf holds one EXPANDED SRC row (w*scale px).
-        # w<=8192 with scale<=16 would allow 512 KB — 16× the 32 KB buffer (a ring-3-reachable
-        # BSS smash) — so the EXPANDED width is capped to the buffer BEFORE any write. Never
-        # fires for scale<=1 (w<=8192 already enforced above): back-compat is exact.
-        if (bl_w * bl_scale > 8192) { stack_canary_check(canary); return 0 - 1; }
-        if (bl_dx >= bl_fw) { stack_canary_check(canary); return 0; }    # fully off-screen → no-op OK
-        if (bl_dy >= bl_fh) { stack_canary_check(canary); return 0; }
-        var bl_cw = bl_w * bl_scale;                                     # clip SCALED width to FB right edge
-        if (bl_dx + bl_cw > bl_fw) { bl_cw = bl_fw - bl_dx; }
-        var bl_ch = bl_h * bl_scale;                                     # clip SCALED height to FB bottom edge
-        if (bl_dy + bl_ch > bl_fh) { bl_ch = bl_fh - bl_dy; }
-        var bl_r = 0;
-        var bl_srow = 0;
-        var bl_drow = 0;
-        var bl_c = 0;
-        if (bl_scale <= 1) {
-            # 1:1 — the pre-1.44.20 loop VERBATIM (structural byte-identity for legacy callers;
-            # bl_cw/bl_ch equal the unscaled values when scale==1).
-            while (bl_r < bl_ch) {
-                bl_srow = arg1 + (bl_r * bl_w) * 4;                          # src row (packed w*4)
-                bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;     # dest row in FB
-                bl_c = 0;
-                while (bl_c < bl_cw) {
-                    store32(bl_drow + bl_c * 4, load32(bl_srow + bl_c * 4));
-                    bl_c = bl_c + 1;
-                }
-                bl_r = bl_r + 1;
-            }
-        } else {
-            # scale>=2 — src-major with the row buffer: expand each SRC row ONCE into
-            # fb_scale_rowbuf (cached RAM — per-pixel divides stay out of the hot loops), then
-            # copy the clipped row (cw*4 bytes, NEVER pitch — pitch slack would spill into the
-            # next row) to each of the `scale` dst rows, stopping at the clip. No FB read-back
-            # (the FB is WC-mapped). In-bounds: dx*4 + cw*4 <= fw*4 <= pitch (asserted above);
-            # src reads stay in [0, w) per row and [0, h) rows by construction.
-            # 1.56.51: the rowbuf is PER-CPU (see its banner) — the single-core IF=0 premise this
-            # comment used to assert is false under smp_sched_aps=1.
-            var bl_rowbuf = fb_scale_rowbuf_base();
-            if (bl_rowbuf == 0) { stack_canary_check(canary); return 0 - 1; }   # no staging region
-            var bl_s = 0;
-            while (bl_s < bl_h) {
-                if (bl_s * bl_scale >= bl_ch) { bl_s = bl_h; }           # rest fully clipped — done
-                else {
-                    bl_srow = arg1 + (bl_s * bl_w) * 4;
-                    var bl_x = 0;                                        # expand: each px scale times
-                    var bl_o = 0;
-                    while (bl_x < bl_w) {
-                        var bl_px = load32(bl_srow + bl_x * 4);
-                        var bl_k = 0;
-                        while (bl_k < bl_scale) {
-                            store32(bl_rowbuf + bl_o * 4, bl_px);
-                            bl_o = bl_o + 1;
-                            bl_k = bl_k + 1;
-                        }
-                        bl_x = bl_x + 1;
-                    }
-                    var bl_kr = 0;                                       # emit `scale` dst rows
-                    while (bl_kr < bl_scale) {
-                        bl_r = bl_s * bl_scale + bl_kr;
-                        if (bl_r >= bl_ch) { bl_kr = bl_scale; }         # clipped — stop this block
-                        else {
-                            bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;
-                            bl_c = 0;
-                            while (bl_c < bl_cw) {
-                                store32(bl_drow + bl_c * 4, load32(bl_rowbuf + bl_c * 4));
-                                bl_c = bl_c + 1;
-                            }
-                            bl_kr = bl_kr + 1;
-                        }
-                    }
-                    bl_s = bl_s + 1;
-                }
-            }
-        }
-        # 1.55.x: the frame is complete in the back buffer — PRESENT it. Flips the pipe's scanout to it and
-        # blocks until the hardware takes it at the next blank: tear-free, and it vsync-paces the caller
-        # (a blit can therefore block up to one frame — that is the point). No-op on the direct path.
-        #
-        # P7 (2026-07-20): a4 bit40 = DEFER_PRESENT. A full-screen app (doom/fbtest) leaves it clear and each
-        # blit auto-presents, exactly as before — structural back-compat, every existing caller is bit-identical.
-        # A COMPOSITOR sets it: blit each window into the SAME back buffer with the bit set (no flip), then call
-        # present#84 ONCE when the whole frame is composited. Without this, N windows = N flips = the compositor
-        # sees partial composites. The back buffer is NOT swapped until the present, so deferred blits accumulate.
-        if ((bl_dstxy & 0x10000000000) == 0) {
-            gpu_blit_present(proc_current_get());
-        }
+        # blit(src=arg1, w=arg2, h=arg3, dstxy=arg4) — copy a w×h block of 32bpp  (body: blit_sys, 1.57.18)
+        var blitx_r = blit_sys(arg1, arg2, arg3);
         stack_canary_check(canary);
-        return 0;
+        return blitx_r;
     }
     if (num == 84) {
         # gpu_present() — P7: flip the accumulated back buffer to the scanout, tear-free, vsync-paced. The
@@ -12190,135 +12936,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
 
     if (num == 99) {
-        # proclist(buf=arg1, max=arg2) — snapshot of the LIVE process table.
-        # Returns the number of records written, or -1 on a bad user range / max < 1.
-        #
-        # Record (64 B, little-endian), one per live slot:
-        #   +0   u64 pid
-        #   +8   u64 state      1=ready · 2=running · 3=claiming · 6=blocked in a kernel wait (1.57.7;
-        #                        4/5 are reserved for the lifecycle step) (0=dead is skipped)
-        #   +16  u64 ppid       0 = init
-        #   +24  u8  name[32]   NUL-terminated basename, from proc_set_name at ELF load
-        #   +56  u64 reserved   always 0 today. ⛔ SPLIT AS TWO u32 HALVES, DECIDED 1.56.59:
-        #                        low  32 bits (+56) = cpu ticks   (telemetry filing §4)
-        #                        high 32 bits (+60) = rss pages   (telemetry filing §5)
-        # ⛔⛔ THIS LINE PROMISED "room to add rss/utime" — TWO FIELDS FOR ONE SLOT. The record is
-        # exactly 64 bytes with name[32] spanning +24..+55, so +56 IS the final 8 bytes; there is no
-        # second slot to grow into, and whichever field shipped first would have taken the whole u64
-        # and forced the other to a NEW SYSCALL NUMBER. Split now, while the value is still 0 and
-        # NOTHING reads it, because after one consumer reads it as a u64 this is an ABI break.
-        # ⚠ A u64 zero-check still means "neither field present", so a consumer written against the
-        # old wording keeps working — that compatibility is why the split is free TODAY and not later.
-        # ⚠ u32 halves are deliberate and sufficient: 2^32 ticks at 100 Hz is ~1.36 years of CPU time,
-        # and 2^32 pages is 16 TiB of RSS. Neither is a ceiling this kernel can reach.
-        #
-        # ⭐ WHY THIS EXISTS. AGNOS had no procfs and no enumeration primitive at all —
-        # the ring-3 surface offered getpid/spawn/waitpid/kill and nothing that could
-        # answer "what is running?". A system monitor therefore could not exist here:
-        # chakshu's AGNOS build rendered a column header and zero rows, which is what
-        # blocked its v1.0 "ship as the AGNOS default monitor" milestone. Every field
-        # above already existed in the kernel; none of it was reachable from ring 3.
-        #
-        # ⚠ A SNAPSHOT, NOT A HANDLE. The table is copied under preempt_disable so the
-        # set cannot change mid-walk. Callers must not assume a pid is still live when
-        # they act on it — that race is inherent to any ps(1) and is the caller's to
-        # handle (chakshu re-probes before it signals).
-        #
-        # ⚠ RESERVED FIELD IS DELIBERATE. Per-process rss and cpu time are NOT tracked
-        # by this kernel today, so they are not invented here. When they are, they land
-        # at +56 and the record size does not change — consumers that zero-check the
-        # field keep working. Adding a field by widening the record would need a new
-        # syscall number; adding it here does not.
-        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
-        # ⛔ 1.56.51 SECURITY FIX. Was `is_user_range(arg1, arg2 * 64)`. `arg2` is the caller's
-        # record capacity, ring-3 chosen and checked only for `< 1`, so 2^58 wrapped the product to
-        # 0 and the validator passed on a zero-length window. The fill loop below is bounded by the
-        # PROCESS COUNT, not by arg2, so the spill is up to the whole process table written past the
-        # user ceiling — and unlike #81 the contents are kernel-side records, which makes the same
-        # bug a disclosure primitive as well as a write. See is_user_array above.
-        if (is_user_array(arg1, arg2, 64) == 0) { stack_canary_check(canary); return 0 - 1; }
-
-        if (proclist_called == 0) {
-            proclist_called = 1;
-            # ⛔ klug_append, NOT kprintln — THE CONSOLE IS SOMEBODY ELSE`S STDOUT. Filed by chakshu
-            # (the AGNOS system monitor) 2026-09-02: this one-shot landed INSIDE the monitor`s output,
-            # between its header and its process table. `shu -p` is its pipe-safe mode, so it corrupted
-            # any consumer parsing that stream and would scribble over a TUI frame. Since 1.56.58 it is
-            # worse, not better — the line now carries a `[   37.727698] ` uptime prefix too.
-            # ⚠ THE DIAGNOSTIC INTENT IS KEPT IN FULL, which is why this is a re-route and not a delete:
-            # the comment below still holds, and the line is still in the log ring, reachable with
-            # `run /bin/klug`. It just is not on the console any more. klug_append is the exact
-            # "emit to the kernel log ring rather than the console" the filing asked for.
-            klug_append("proclist: first call from ring 3\n", 33);
-        }
-
-        preempt_disable();
-        var pl_n = 0;
-        var pl_i = 0;
-        while (pl_i < 16) {
-            if (pl_n >= arg2) { pl_i = 16; }
-            else {
-                var pl_st = load64(&proc_table + pl_i * 176 + 8);
-                # ⭐ 1.57.7 (S7): an exited, UNREAPED child is listed as state 7 (report-only; the table cell stays 0),
-                # with its name, ppid and final ticks; RSS 0 (it no longer runs).
-                if (pl_st == 0) { if (proc_is_zombie(pl_i) == 1) { pl_st = PROC_ZOMBIE_REPORT; } }
-                if (pl_st != 0) {
-                    var pl_pid = load64(&proc_table + pl_i * 176);
-                    var pl_rec = arg1 + pl_n * 64;
-                    store64(pl_rec + 0, pl_pid);
-                    store64(pl_rec + 8, pl_st);
-                    store64(pl_rec + 16, proc_get_ppid(pl_pid));
-                    # ⭐ +56 IS TWO u32 HALVES (decided 1.56.59): low = cpu ticks (§4), high = rss
-                    # pages (§5). Written as one store64 so the halves cannot tear against a consumer
-                    # reading the slot as a u64 — which is exactly what a consumer written against the
-                    # pre-split wording does.
-                    # ⚠ CLAMPED, NOT MASKED. A tick count past 2^32 (~1.36 years of CPU) must pin at
-                    # the maximum, not wrap to a small number: a monitor differencing two samples
-                    # across a wrap computes a NEGATIVE delta and renders a nonsense CPU%. Saturating
-                    # is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
-                    # BOTH HALVES ARE LIVE AS OF 1.56.59: low u32 = cpu ticks (§4), high u32 = resident
-                    # 4 KiB pages (§5). Written as ONE store64 so the halves cannot tear against a
-                    # consumer reading the slot as a u64 — which is what a consumer written against the
-                    # pre-split wording does.
-                    # ⚠ BOTH CLAMPED, NOT MASKED. Past 2^32 a masked value WRAPS, and a monitor
-                    # differencing two samples across a wrap computes a NEGATIVE delta and renders
-                    # nonsense. Saturating is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
-                    # (2^32 ticks is ~1.36 years of CPU; 2^32 pages is 16 TiB resident. Neither is
-                    # reachable here — the clamps are for the shape of the guarantee, not the range.)
-                    var pl_tk = load64(&proc_ticks + pl_i * 8);
-                    if (pl_tk > 4294967295) { pl_tk = 4294967295; }
-                    # BOTH HALVES LIVE AS OF 1.56.59: low u32 = cpu ticks (§4), high u32 = resident
-                    # 4 KiB pages (§5). ONE store64 so the halves cannot tear against a consumer
-                    # reading the slot as a u64 — which is what a consumer written against the
-                    # pre-split wording does.
-                    # ⚠ BOTH CLAMPED, NOT MASKED. Past 2^32 a mask WRAPS, and a monitor differencing
-                    # across a wrap computes a NEGATIVE delta. Saturating is wrong-but-monotonic.
-                    var pl_rs = 0;
-                    if (pl_st != PROC_ZOMBIE_REPORT) { pl_rs = proc_rss_pages(pl_i); }
-                    if (pl_rs > 4294967295) { pl_rs = 4294967295; }
-                    store64(pl_rec + 56, (pl_rs << 32) | pl_tk);
-                    # name: copy 32 bytes, NUL-padding the tail so ring 3 never reads
-                    # a stale byte from a previous occupant of this slot.
-                    var pl_src = proc_name_ptr(pl_pid);
-                    var pl_k = 0;
-                    var pl_done = 0;
-                    while (pl_k < 32) {
-                        var pl_c = 0;
-                        if (pl_done == 0) {
-                            if (pl_src != 0) { pl_c = load8(pl_src + pl_k); }
-                            if (pl_c == 0) { pl_done = 1; }
-                        }
-                        store8(pl_rec + 24 + pl_k, pl_c);
-                        pl_k = pl_k + 1;
-                    }
-                    pl_n = pl_n + 1;
-                }
-                pl_i = pl_i + 1;
-            }
-        }
-        preempt_enable();
+        # proclist(buf=arg1, max=arg2) — snapshot of the LIVE process table.  (body: proclist_sys, 1.57.18)
+        var plx_r = proclist_sys(arg1, arg2, arg3);
         stack_canary_check(canary);
-        return pl_n;
+        return plx_r;
     }
     if (num == 43) {
         # spawn_path(path, len | flags, env, envlen in r10) — NON-BLOCKING from-disk spawn -> pid / -SPAWN_E_*.
@@ -12396,11 +13017,32 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # 1.57.7 (S5): the connection is OWNED by the caller's incarnation (pid + epoch, stamped in the claim); any
         # 127/8 destination works (source 127.0.0.1, reply from the address dialled); every -1 exit after the claim
         # releases the slot (no held slot is left behind).
+        # ⭐ 1.57.18 — A CALLER DEADLINE (issue 2026-11-06-no-readiness-wait-on-one-fd, "Related": a turn to a blackholed
+        # address took 8.7 s where thoth asked for 3 s). `SC_TIMED` = bit 32 of src_port (a3) opts in, and then a4 is the
+        # caller's timeout in ms: > 0 bounds the wait at min(a4 ms, the ~8 s ceiling), measured ONCE from entry and never
+        # re-armed by a wake (the #109 / EPW_TIMED rule); < 0 = the ~8 s ceiling alone; 0 = a NON-BLOCKING connect — the
+        # SYN goes out and the id comes back at once (SYN_SENT; epoll_wait#21 on EP_TCP | id reports EPOLLOUT when it is
+        # ESTABLISHED, EPOLLERR | EPOLLHUP when it was refused or exhausted — close it with #50 then). The low 32 bits are
+        # src_port exactly as before (<= 0 or > 65535 = auto). WITHOUT the bit a4 is never read (a 3-argument caller's
+        # r10 is stale — the #100 rule) and a3 is today's src_port byte for byte: any a3 whose bits 63..32 are not exactly
+        # 1 (a negative a3, a3 > 65535 with other high bits) keeps meaning "auto port", as it always did. A spent deadline
+        # is -1 with the slot RELEASED (tcp_connect_wait's timeout exit closes it; no half-open is left behind) — Linux
+        # leaves a timed-out connect in progress (EINPROGRESS); agnos has eight slots and its caller has no fd to close.
+        var sc_bud = TCP_CONNECT_US;
+        var sc_sp = arg3;
+        if ((arg3 >> 32) == 1) {
+            sc_sp = arg3 & 0xFFFFFFFF;
+            var sc_ms = ksyscall_a4_get();
+            if (sc_ms == 0) { sc_bud = 0; }
+            if (sc_ms > 0) {
+                if (sc_ms < (TCP_CONNECT_US / 1000)) { sc_bud = sc_ms * 1000; }
+            }
+        }
         if (arg2 <= 0) { stack_canary_check(canary); return 0 - 1; }      # dst_port low
         if (arg2 > 65535) { stack_canary_check(canary); return 0 - 1; }   # dst_port high
         fb_dbg_beacon(3);                    # 1.45.16 canary: TCP connect stage
         var sc_w = net_sys_window_open();   # pre-scheduler callers only (net_tcp.cyr)
-        var sc_cid = tcp_connect_owned(arg1, arg2, arg3, tcp_caller_tag());
+        var sc_cid = tcp_connect_ex(arg1, arg2, sc_sp, tcp_caller_tag(), sc_bud);
         net_sys_window_close(sc_w);
         stack_canary_check(canary);
         return sc_cid;
@@ -12674,6 +13316,25 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 > 2) { stack_canary_check(canary); return 0 - 1; }
         var lk_base = vfs_fd_table() + arg1 * 32;
+        # ⭐ 1.57.18 — A DIRECTORY FD REPOSITIONS (issue 2026-11-08-readdir-cuts-a-long-name-and-says-nothing, ask 3):
+        # telldir = lseek(fd, 0, SEEK_CUR), seekdir = lseek(fd, cookie, SEEK_SET), so a tree walk can close a level's fd
+        # and resume getdents#29 later (one fd per level would need up to 127 of the 32). The position is an OPAQUE
+        # COOKIE — VFS_EXT2_DIR the byte offset into the directory file, VFS_ZFS_DIR the zfs_dir_next cursor — and it
+        # stays valid across close and reopen of the same directory (NFS readdir cookies, the prior art). SEEK_SET and
+        # SEEK_CUR only; SEEK_END is refused (a directory's end is no cookie: ext4 answers it with a hash EOF, ZFS has
+        # none). A negative result is refused (Linux vfs_setpos: EINVAL). Any other value is accepted and VALIDATED
+        # WHERE IT IS USED, under fs_lock: getdents snaps an ext2 offset to the next record boundary (ext2_dir_snap,
+        # Linux ext2_validate_entry), and a ZFS cursor resumes at the next genuine entry (zfs_dir_next, OpenZFS
+        # zap_cursor_init_serialized). Past the end of the directory, getdents answers 0.
+        if (ktag(lk_base) == VFS_EXT2_DIR || ktag(lk_base) == VFS_ZFS_DIR) {
+            if (arg3 == 2) { stack_canary_check(canary); return 0 - 1; }
+            var ld_new = arg2;
+            if (arg3 == 1) { ld_new = kpayload(lk_base, 0) + arg2; }
+            if (ld_new < 0) { stack_canary_check(canary); return 0 - 1; }
+            kpayload_set(lk_base, 0, ld_new);
+            stack_canary_check(canary);
+            return ld_new;
+        }
         # 1.57.11 — a VFS_ZFS_FILE seeks the same way. 1.57.12 B5: its SEEK_END reads the object's SIZE from the SA
         # under fs_lock (zfs_fd_size — the generation checked, design § f.4; never a cached size, which a write through
         # another fd would leave stale), and a position past the end is legal: the next write leaves holes.
@@ -12754,6 +13415,21 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var fk_r = fd_kind_sys(arg1);
         stack_canary_check(canary);
         return fk_r;
+    }
+    if (num == 112) {
+        # chdir(path=arg1, pathlen=arg2) -> 0 / -1 — 1.57.18 (sys_chdir above). The caller's working directory: a relative
+        # path joins the current one, the result is cleaned lexically and must name an existing directory; -1 changes
+        # nothing. a3/a4 never read.
+        var cd_r = sys_chdir(arg1, arg2);
+        stack_canary_check(canary);
+        return cd_r;
+    }
+    if (num == 113) {
+        # getcwd(buf=arg1, cap=arg2) -> length (the NUL not counted) / -1 — 1.57.18 (sys_getcwd above). cap < length + 1 is -1
+        # with nothing written (ERANGE, never cut). a3/a4 never read.
+        var gc_r = sys_getcwd(arg1, arg2);
+        stack_canary_check(canary);
+        return gc_r;
     }
     if (num == 61) {
         # net_config(field=arg1) — return a kernel network-config datum in rax, or

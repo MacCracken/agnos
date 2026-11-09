@@ -20,6 +20,8 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.18] — 2026-11-08
+
 ## [1.57.17] — 2026-11-04 — repairs: ext2 rename-replace, a terminal's window size, closed-state RST, epoll that waits, the ZFS full lane
 
 The repair minor's consumer cut (operator, 2026-11-04: "include the other items filed in docs/development/issues/ as

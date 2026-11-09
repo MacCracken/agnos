@@ -477,7 +477,12 @@ sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 # ✅ 1.57.16 — DROPPED. The pin is cyrius 6.7.18, whose lib/syscalls_x86_64_agnos.cyr carries #109-#111: the gate reads
 # "kernel 111 · abi-doc 111 · cyrius 111" against the PINNED lib too (SIBLINGS_ROOT=/nonexistent, as CI sees it), so the
 # row has no reason to be red and any red in it is a real one.
-run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
+# ⭐ 1.57.18 — KNOWN RED BY DESIGN: the syscall ABI gate reads kernel 115 against cyrius 111 until cyrius's SysNrAgnos peers
+# carry #112-#115 (chdir/getcwd, power_source, fsync — filed in cyrius 2026-11-08). The signature admits ONLY that gate's
+# FAIL lines, so any other red inside check.sh is a new red and gets the normal attempts.
+run_gate "baseline check.sh (build/test/version/size)" "" "CHECK" "" \
+    "by design: the syscall ABI gate is red until cyrius's SysNrAgnos peers carry #112-#115 (filed in cyrius 2026-11-08)" \
+    'syscall ABI \(kernel/doc/cyrius agree\)|syscall\(s\) the kernel implements are absent from cyrius'
 # ⭐ 1.57.12 — THE KTEST BOOT SELF-TESTS AND THE IN-KERNEL SUITE. scripts/ktest.sh had no row anywhere (sweep, check.sh,
 # test.sh, CI), so the KTEST self-tests the 1.57.12 rebuild made runnable again (syscall, context switch, VFS/initrd,
 # userland exec), the NVMe round-trips that must write outside the GPT and put it back, and ktest.sh's scoring of all
@@ -514,7 +519,10 @@ run_gate "1.57.11/1.57.12 ZFS read + write gate: seven OpenZFS-built pools, ever
 # forge (units allocated AND deferred: zfs-damage.py pre-defer) on the upgraded pool and on a second one-slot full
 # pool — fifteen boots, six pools verified. Needs KVM; ~13.3 min measured at B3b.
 run_gate "1.57.12 ZFS write: the op list on eight OpenZFS-built rw pools (creates, file data, removals/renames, fat ZAPs, snapshotted datasets, log hygiene, policy B; + torn-slot / grown-partition / AHCI / USB variants, write-error path, four crash-cut lanes), host audits h1-h9 + OpenZFS verify (zdb/rewinds/import/scrub/round trip/destroy); v28 + mirror + makefs refused, raidz no pool, byte-identical" "ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 ZFS_WRITE_OPS=1" "zfs-write-smoke.sh"
-run_gate "1.57.11 ZFS ring 3: zfsx exec'd from the pool (open/read/lseek/stat/getdents/readdir_at/statfs/mountlist; writes refused)" "" "zfs-ring3-smoke.sh"
+run_gate "1.57.11 ZFS ring 3: zfsx exec'd from the pool (open/read/lseek/stat/getdents/readdir_at/statfs/mountlist; writes; 1.57.18 AO_MODE creates + the fsync#115 child, a crash cut that loses one pending file), OpenZFS verify" "" "zfs-ring3-smoke.sh"
+# ⭐ 1.57.18 — fs listing (issues 2026-11-06-readlink-refuses-a-buffer-shorter-than-the-target, 2026-11-08-readdir-cuts-a-
+# long-name-and-says-nothing): ext2 root + the zfsx-payload ZFS fixture (shared with zfs-smoke / zfs-ring3).
+run_gate "1.57.18 fs listing: readlink#70 cuts at buflen (ext2 fast/slow, ZFS; the follower never follows a cut target), readdir#81/#101 RD_CUT + UTF-8 cut, lseek#58 on directory fds (resume across close, snapped/hostile cookies), ext2 + ZFS, -smp 1 + 4" "" "fs-listing-smoke.sh"
 # 1.57.2 — the ONLY gate that presents a MULTI-NODE FAT chain cycle (A -> B -> A, both in range):
 # fat-smoke / exfat-smoke prove GOOD chains read, and nothing else in the tree ever hands the kernel
 # a chain that never ends. One kernel carries both selftests and one disk carries both cycles (a
@@ -597,6 +605,9 @@ run_gate "1.57.3 AP stacks in region 7 (-smp 4, rodata intact after wake)" ""   
 # ⚠ Group `exclusive` (1.57.9 PSWEEP): T1-T10 are ratios against wall time (tick period within 1-3%, calibration
 # agreement within 2%) — under N parallel QEMUs they measure the host. Runs alone, main tree, after the parallel phase.
 run_gate "1.57.6/1.57.7 TSC + LAPIC tick on the ACPI PM timer (acpi-pm tiers, tick rate BSP+AP, FADT purity, uptime_us#95 IF=0; q35 -smp 1 + 4, pc)" "TSC_SELFTEST=1" "tsc-smoke.sh" "exclusive"
+# ⭐ 1.57.18 — power_source#114 (issue 2026-11-06-no-way-to-read-the-power-source, operator ruling 2026-11-08: a namespace
+# scan, no AML interpreter): plain kernel, crafted SSDTs built with iasl into the smoke's own work dir.
+run_gate "1.57.18 power_source#114 (ACPI namespace scan: no battery or every battery constant-absent = mains; a battery, no tables or a malformed table = cannot say; q35 + pc + acpi=off + 11 crafted SSDTs -smp 1, q35 -smp 4; ring-3 probe)" "" "power-source-smoke.sh"
 # 1.57.6 — spawn_path#43: distinct failure codes, the per-process #62 / CH_ENDOW arms cleared on EVERY
 # failure kind (they were per-CPU and leaked into other processes' children), SPAWN_F_ARGV,
 # SPAWN_F_CLEANFD capture (stdout+stderr, 2>&1, an explicitly passed fd, daimon's full shape), execwait#37
@@ -606,6 +617,9 @@ run_gate "1.57.6/1.57.7 TSC + LAPIC tick on the ACPI PM timer (acpi-pm tiers, ti
 # the -smp 4 boot is what caught do_context_switch leaving an AP on a reaped proc's freed page tables.
 # Builds its own kernels, so no buildenv here.
 run_gate "1.57.6 spawn: #43 codes, per-process arms, ARGV/CLEANFD, pipe lifetime (-smp 1 + 4)" "" "spawn-smoke.sh"
+# ⭐ 1.57.18 — the kernel working directory (issue 2026-11-06-a-relative-path-has-no-working-directory, operator ruling
+# 2026-11-08): ext2 + the ZFS fixture pool + the ESP FAT, tests/cwd.
+run_gate "1.57.18 working directory: chdir#112/getcwd#113, every path arm relative to the cwd (ext2, ZFS /mnt/zfs, FAT /mnt/fat, across mounts), inheritance #43/#37/#96 + PWD= seed, relative program path, overlong refused (-smp 1 + 4)" "" "cwd-smoke.sh"
 # 1.57.7 (S7) — the process lifecycle (docs/architecture/process-lifecycle.md): kill#16 ends (9), stops (19) and
 # continues (18) a child and its descendants (KILL_TREE 0x100) through the claim / tick / B1 / wait boundaries; the wait
 # status; #99 states 5 and 7; orphans reap themselves. tests/lifecycle (lifex as /bin/agnsh, spinner) on a PLAIN
@@ -698,6 +712,12 @@ run_gate "1.53.10 ring-3 block write path + capability gate (unarmed #78 refused
 # refuse to emit a binary, and nothing ran it for the next 25 pins. Found by a static arity scan in the
 # 6.6.6 pin audit (1.57.5), fixed there, and this row is what keeps the next one from hiding.
 run_gate "1.41.3 FS syscalls (mkdir/open/stat/rename/getdents/unlink/rmdir/sync via ksyscall)" "FS_SYSCALL_SELFTEST=1" "fssys-smoke.sh"
+# ⭐ 1.57.18 — symlink-smoke had NO row (1.57.18 T3 found it while changing readlink#70 under it): the on-agnos symlink#63
+# round trip through the cyrius sys_symlink peer. A documented gate nothing runs reads as coverage.
+run_gate "1.51.x symlink#63 round trip on agnos (tests/symlink, the cyrius sys_symlink peer; readlink#70 / open through the link)" "SYMLINK_SELFTEST=1" "symlink-smoke.sh"
+# ⭐ 1.57.18 — a create mode on open#7 and a per-file fsync#115 (issue 2026-11-06-open-has-no-create-mode): tests/fsmode as
+# /bin/agnsh, a crash cut after fsync, the disk read back by debugfs + e2fsck.
+run_gate "1.57.18 open#7 AO_MODE + fsync#115 on ext2: tests/fsmode ring 3 -smp 1/4 (0600/0640/0755/04755/01644, the default, an existing file kept, a bad field refused; fsync file/rdonly/dir 0 and no sector, non-file -1; sync#12's superblock measured), a crash cut after fsync, debugfs + e2fsck" "" "fs-create-mode-smoke.sh"
 
 # --- 1.40.x exec-from-disk: load + ring-3 run + ENOEXEC + subdir + clean return ---
 run_gate "1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)" "EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1" "exec-smoke.sh"
@@ -805,6 +825,9 @@ run_gate "1.57.8/1.57.9 blocking pipe/channel reads + blocking pipe writes, #108
 # channel-has-no-window-size): tests/chan/ptyws as /bin/agnsh on the plain kernel — GET only on a terminal end, SIGWINCH only to
 # the terminal's watching holders, an unchanged size silent, and a holder blocked in epoll_wait#21 woken by the resize.
 run_gate "1.57.17 terminal channel window size: #97 CH_WINSZ_SET/GET, SIGWINCH to the terminal's watching holders only, wakes a blocked epoll_wait (-smp 1 + 4)" "" "pty-winsize-smoke.sh"
+# ⭐ 1.57.18 — a terminal channel has back-pressure (issue 2026-11-06-a-channel-write-drops-the-oldest-record-and-nobody-is-told),
+# epoll waits on a channel and #47 takes a caller deadline (issue 2026-11-06-no-readiness-wait-on-one-fd). Plain kernel, no NIC.
+run_gate "1.57.18 terminal channel back-pressure (write#1 on a PTY-mode end waits for room; display + CH_SEND drop-oldest), epoll_wait#21 on #97 channels (EPOLLIN/OUT/HUP, authority re-derived), #47 SC_TIMED deadline + non-blocking connect (-smp 1 + 4)" "" "pty-backpressure-smoke.sh"
 # 1.57.9 ENDFIX (end review PIPEW-E1) — an agnsh PIPELINE whose consumer stops early (`grep . cert.pem | echo`, and a
 # stage 2 that fails to spawn) must return to the prompt now that a full pipe BLOCKS its writer. Drives the staged
 # agnsh (build/rootfs) by sendkey, one boot per case, -smp 1 + 4. ⛔ RED with the agnsh staged at 1.57.9: the shell
@@ -862,6 +885,9 @@ run_gate "1.53.x naad-ring3 (real DSP library f64 in ring 3, arc end-proof)" "NA
 # once diagnosed from a serial log and ruled "working as intended". Only the fb has a cursor to corrupt.
 # ⚠ Plain production build (no selftest env): the stimulus is a real USB mouse one-shot, not a hook.
 run_gate "1.56.45 console live line (async log vs. the typed prompt, FB oracle)" "" "console-line-smoke.sh"
+# ⭐ 1.57.18 — the console as a terminal (issue 2026-11-06-the-console-is-short-of-a-terminal): FB oracle by screendump, the
+# tests/waits probe (group waits: it builds tests/waits).
+run_gate "1.57.18 console as a terminal: EL/ED (bce), UTF-8 cells + U+FFFD, drawn cursor (?25), 32 CSI params, SGR 7/27, OSC/DCS/APC/PM/SOS swallowed, Tab, pending wrap, ?7, PAT1=WC, #110 CM_NOSERIAL (FB oracle, -smp 1 + 4)" "" "console-ansi-smoke.sh" "waits"
 
 # ⭐ 1.56.60 — SHUTDOWN. THIS SMOKE EXISTED SINCE THE 1.55.x ARC AND NOTHING HAS EVER RUN IT:
 # `grep -rn shutdown-smoke` over scripts/, scripts/check.sh and .github/workflows/ returned exactly

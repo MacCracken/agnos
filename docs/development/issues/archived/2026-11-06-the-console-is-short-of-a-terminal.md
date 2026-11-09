@@ -1,6 +1,14 @@
 # 2026-11-06 — The console draws ASCII and three sequences, so a full-screen program brings its own terminal
 
-**Status:** 🟡 OPEN.
+**Status:** ✅ **RESOLVED in agnos 1.57.18** (2026-11-08, asks 1–5; the alternate screen stays out, as the issue allows). EL
+0/1/2 and ED 0/1 in the active background; UTF-8 decoded across writes, a kashi CP437 glyph where one exists and one U+FFFD
+cell where not (wide = 2 cells, combining = 0); a drawn underline cursor with `ESC[?25h/l`; 32 CSI parameters, SGR 7/27,
+OSC / DCS / APC / PM / SOS swallowed whole (bounded at 4096); Tab; last-column pending wrap and `?7`. A scroll at 2048x2048
+under KVM went from 194,321 µs to ~2,000–2,400 µs: the cause was PAT entry 1 — the framebuffer's "WC" mapping — being
+write-through, now programmed WC on every CPU. **`console_mode`#110 `CM_NOSERIAL` = 4** keeps one process's console writes
+off COM1 (a 128x64 frame: 35 ms opted out, ~225 ms mirrored). Gate `scripts/smoke/console-ansi-smoke.sh`. ABI § 4.11 (the
+escape table), row 110. thoth's filter rows that can come out are filed
+(`thoth/docs/development/issues/2026-11-08-agnos-console-terminal.md`).
 *(Filed from thoth **0.55.2**, whose TUI runs on the console through a filter that stands in for all of this.)*
 **Checked against:** agnos **94145d95** (1.57.17), `kernel/arch/x86_64/fb_console.cyr`, `serial_putc`.
 **Severity:** feature gap, low. Nothing is lost. Each full-screen program on the console has to solve it again: cyim, chakshu and thoth all have.

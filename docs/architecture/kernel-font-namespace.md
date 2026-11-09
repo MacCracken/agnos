@@ -119,7 +119,7 @@ that has no such file, which is the right answer to "how big is the volume under
 nothing while `open("/fonts/default.ttf")` succeeds. A client opens the face **by name**.
 
 Two consequences a client must know: the fd is a `VFS_MEMFILE`, so **`write`#1 is -1** (no memfile
-arm in `vfs_write`) and **`lseek`#58 is -1** (`#58` repositions `VFS_EXT2_FILE` only) — the face is
+arm in `vfs_write`) and **`lseek`#58 is -1** (`#58` repositions ext2 / ZFS files and, since 1.57.18, directory fds — never a `VFS_MEMFILE`) — the face is
 read front-to-back in one pass, and a rewind is a re-open. `read`#5 returns 0 at EOF, never -2.
 
 ## Invariant 5 — the image grew 410 KB, the AP stacks were under it, and 1.57.3 moved them out

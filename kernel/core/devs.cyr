@@ -73,24 +73,25 @@ fn serial_dev_write(buf, count) {
     # dumping the ~16-20 KB boot log) silently truncated to the first 4 KB — the caller
     # saw a full-looking short return and did not loop. Chunking keeps whatever per-call
     # bound the 4096 was for while emitting everything.
-    # ⛔⛔ RAISE THE RAW FLAG AROUND THE WHOLE WRITE — THIS IS WHAT KEEPS THE 1.56.58 LOG TIMESTAMP OFF
-    # USERLAND OUTPUT. Everything below is RING-3 bytes (fd 1/2), and kprint is shared with the kernel
-    # emitters, so without this every `ls`, every pipe stage, every harness-parsed program line would
-    # gain a "[    4.123456] " prefix — and the chunking makes it worse than one stray prefix: a write
-    # larger than 4096 would take a fresh prefix every chunk, mid-stream.
-    # ⚠ AROUND THE LOOP, NOT INSIDE IT. A per-chunk raise/lower would leave klog_at_bol correct but
-    # re-decorate at each chunk boundary, which is the same bug in a smaller disguise.
-    # ⚠ A COUNTER, NOT A BOOLEAN: fault_kill_current and the recovery shell can reach console output
-    # while a ring-3 write is in flight, and a boolean would be cleared by the inner exit.
-    klog_raw_depth = klog_raw_depth + 1;
+    # ⛔⛔ kprint_user, NEVER kprint — THIS IS WHAT KEEPS THE 1.56.58 LOG TIMESTAMP OFF USERLAND OUTPUT.
+    # Everything below is RING-3 bytes (fd 1/2): through kprint every `ls`, every pipe stage, every
+    # harness-parsed program line would gain a "[    4.123456] " prefix, and a write larger than 4096 a
+    # fresh prefix every chunk, mid-stream. (Until 1.57.18 kprint was called here with a GLOBAL counter,
+    # klog_raw_depth, raised around the loop outside the console lock — racy across CPUs; kprint.cyr.)
+    # ⭐ 1.57.18 — console_mode#110 CM_NOSERIAL: a process that set it for itself has its bytes drawn but not mirrored
+    # to COM1 (a full-screen program repainting a 128x64 frame is ~8.7 KB of serial per frame). Read per write, from
+    # the WRITER's own cell (proc.cyr proc_con_noser — scrubbed when its slot is reused, so it dies with it); the
+    # kernel's own lines go through kprint / kprintln and never look at it.
+    var mirror = 1;
+    var sw_me = proc_current_get();
+    if (sw_me >= 0 && sw_me < 16) { if (load64(&proc_con_noser + sw_me * 8) != 0) { mirror = 0; } }
     var off = 0;
     while (off < count) {
         var chunk = count - off;
         if (chunk > 4096) { chunk = 4096; }
-        kprint(buf + off, chunk);
+        kprint_user(buf + off, chunk, mirror);
         off = off + chunk;
     }
-    klog_raw_depth = klog_raw_depth - 1;
     return count;
 }
 

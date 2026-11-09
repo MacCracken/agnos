@@ -235,9 +235,24 @@ try:
     ink_after = 0
     for c in range(ncols):
         if cell_ink(aw, ah, ad, ra, c, sc): ink_after = c + 1
-    p(f"prompt occupies {P} cells; the post-typing row carries ink out to {ink_after}")
+    # ⭐ 1.57.18 — THE CURSOR IS DRAWN (fb_console.cyr's cursor banner: Linux fbcon's underline, the cell's bottom 2 font
+    # rows inverted). On the virgin prompt its bar is the last inked cell, right after `[ASSIST] > `; after the typing
+    # it has moved on. That cell is the ONE intended difference, so the prompt is measured without it — and the bar
+    # must BE there: agnsh's prompt gets the cursor too (issue 2026-11-06-the-console-is-short-of-a-terminal).
+    def cell_is_cursor(w, h, data, r, c, s_):
+        cb = cell_bytes(w, h, data, r, c, s_)
+        split = (CELL_H * s_ - 2 * s_) * cw * 3
+        return not any(cb[:split]) and cb[split:] == b"\xff" * (len(cb) - split)
+    cursor_at = P - 1 if P > 0 and cell_is_cursor(bw, bh, bd, rb, P - 1, sc) else -1
+    if cursor_at >= 0:
+        P = cursor_at
+        while P > 0 and not cell_ink(bw, bh, bd, rb, P - 1, sc): P -= 1   # the prompt's trailing space
+    p(f"prompt occupies {P} cells (cursor bar at cell {cursor_at}); the post-typing row carries ink out to {ink_after}")
     if P < 4:
         p("INCONCLUSIVE: no prompt found on the virgin row — the shell was not at a prompt"); sys.exit(2)
+    if cursor_at < 0:
+        p("FAIL: no cursor is drawn after the virgin prompt (the last inked cell is not the underline bar)")
+        rc = 1; sys.exit(1)
 
     mismatch = -1
     for c in range(P):

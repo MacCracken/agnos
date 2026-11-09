@@ -932,6 +932,9 @@ fn tcp_connect_start(cs_dst, cs_dport, cs_sport, cs_own, cs_snap) {
 # ⭐ sock_connect#47's body (1.57.7 S6). The deadline is computed ONCE, here, from entry, and never recomputed by a
 # wake (M-S3). An auto port (sport <= 0 or > 65535) takes tcp_ephemeral_next (S4, under the lock) and, when it
 # collides with a live 4-tuple (S5's refusal), tries the next one (8 tries).
+# ⭐ 1.57.18: `ce_budget` 0 = NON-BLOCKING (#47 SC_TIMED with a4 0): the SYN is sent, ONE net_poll lets a loopback
+# handshake complete in place, and the id is returned in whatever state it reached (SYN_SENT, ESTABLISHED, or the held
+# state 0 of a refused SYN) — the caller's epoll_wait#21 on EP_TCP | id finishes it (Linux's EINPROGRESS + POLLOUT).
 fn tcp_connect_ex(ce_dst, ce_dport, ce_sport, ce_own, ce_budget) {
     var ce_snap[24];                                    # function-local: 24 BYTES (+0 tag, +8 epoch, +16 gen)
     var ce_dl = wq_deadline_after_us(ce_budget);
@@ -948,6 +951,7 @@ fn tcp_connect_ex(ce_dst, ce_dport, ce_sport, ce_own, ce_budget) {
         ce_tries = ce_tries + 1;
     }
     if (ce_id < 0) { return 0 - 1; }
+    if (ce_budget == 0) { net_poll(); return ce_id; }
     return tcp_connect_wait(ce_id, load64(&ce_snap), load64(&ce_snap + 8), load64(&ce_snap + 16), ce_dl);
 }
 # Wait for the handshake. EVERY decision is made in one tcp_tab_lock hold against the (tag, epoch, gen) snapshot

@@ -199,6 +199,24 @@ fn exfat_statfs_path_ok(name, namelen) {
     return 1;
 }
 
+# 1.57.18 — chdir#112 / the PWD= seed (syscall.cyr sc_path_is_dir): 1 when the mount-relative `name` is the mount root
+# or a DIRECTORY (the 0x85 set's FileAttributes bit 0x10 — the exfat_rmdir test), 0 otherwise. fs_lock held by the caller.
+fn exfat_path_is_dir(name, namelen) {
+    if (exfat_active == 0) { return 0; }
+    var only_sl = 1;
+    var si = 0;
+    while (si < namelen) { if (load8(name + si) != 47) { only_sl = 0; } si = si + 1; }
+    if (only_sl == 1) { return 1; }                       # the mount point (exfat_statfs_path_ok's rule)
+    var res[24];
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0; }
+    if (exfat_leaf_len == 0) { return 1; }
+    if (exfat_find_in_dir(dir_clus, name + exfat_leaf_off, exfat_leaf_len, &res) != 1) { return 0; }
+    if (exfat_blk_read(exfat_set_sec, &exfat_dir_buf) != 0) { return 0; }
+    if ((load8(&exfat_dir_buf + exfat_set_slot * 32 + 4) & 0x10) == 0) { return 0; }
+    return 1;
+}
+
 # 1.56.57 — statfs#103 exFAT fill (§4.7). f_bsize is the CLUSTER size, matching the FAT arm and the
 # unit contract ext2 uses with its blocks. ⚠ exFAT has no reservation, so f_bavail == f_bfree.
 fn exfat_fill_statfs(buf) {

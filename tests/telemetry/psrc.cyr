@@ -1,0 +1,100 @@
+# psrc — agnos ring-3 probe for power_source#114 (1.57.18, issue 2026-11-06-no-way-to-read-the-power-source).
+#
+# Seeded as /bin/agnsh by scripts/smoke/power-source-smoke.sh, so it runs where daimon runs (an IF=1 scheduled
+# process on a PLAIN kernel). It prints the word #114 returns and decodes it; the smoke compares the word with the
+# kernel's own `power: source ... word 0x<hex>` boot line and with the outcome each QEMU scenario was built for.
+# The contract it checks here, in ring 3, whatever the scenario:
+#   PSRC-SUPPORTED   the word is >= 0 (-1 = an unknown number = a pre-1.57.18 kernel: the probe a caller uses)
+#   PSRC-ARGS-IGNORED a1..a4 are never read: garbage in rdi/rsi/rdx/r10 returns the same word
+#   PSRC-CACHED      100,000 calls return the same word (a cached answer, not a re-scan or a racing one)
+#   PSRC-SHAPE       state <= 1 (2 = battery is reserved and never produced this cut), no bit outside the
+#                    defined 0x3FFF, MAINS carries INFERRED and TABLES and neither MALFORMED nor PRESENT, and a
+#                    "cannot say" never carries INFERRED
+# ⚠ #114 IS ISSUED BY RAW NUMBER ON PURPOSE (the tests/readdir/rdat.cyr rule): this is the ABI exerciser, and the
+# cyrius peer (SYS_POWER_SOURCE, filed cyrius/docs/development/issues/2026-11-08-agnos-sys-power-source-114-peer.md)
+# does not exist yet.
+# ⚠ Exits 0 on every path (a non-zero exit drops kybernet into the emergency shell); the verdict is in the lines.
+
+fn _emit_hex(n) {
+    var b[24];
+    var i = 0;
+    if (n == 0) { sys_write(1, "0", 1); return 0; }
+    while (n != 0) {
+        var d = n & 0xF;
+        if (d < 10) { store8(&b + i, 48 + d); } else { store8(&b + i, 87 + d); }
+        n = n >> 4;
+        i = i + 1;
+    }
+    while (i > 0) { i = i - 1; sys_write(1, &b + i, 1); }
+    return 0;
+}
+
+fn _emit_bit(name, nlen, w, bit) {
+    sys_write(1, " ", 1);
+    sys_write(1, name, nlen);
+    if ((w & bit) != 0) { sys_write(1, "=1", 2); } else { sys_write(1, "=0", 2); }
+    return 0;
+}
+
+fn main(): i64 {
+    sys_write(1, "PSRC-ALIVE\n", 11);
+    var w = syscall(114);
+    sys_write(1, "PSRC word=0x", 12);
+    if (w < 0) { sys_write(1, "-", 1); _emit_hex(0 - w); } else { _emit_hex(w); }
+    sys_write(1, "\n", 1);
+    if (w < 0) {
+        sys_write(1, "PSRC-UNSUPPORTED (#114 answered -1: a kernel without power_source)\n", 67);
+        sys_write(1, "PSRC-DONE\n", 10);
+        return 0;
+    }
+    sys_write(1, "PSRC-SUPPORTED\n", 15);
+
+    # a1..a4: every argument register loaded with garbage, twice, differently.
+    var g1 = syscall(114, 0 - 1, 0x4141414141414141, 7, 0x200000);
+    var g2 = syscall(114, 0x7FFFFFFFFFFFFFFF, 0, 0 - 2, 0 - 1);
+    if (g1 == w) {
+        if (g2 == w) { sys_write(1, "PSRC-ARGS-IGNORED\n", 18); }
+        else { sys_write(1, "PSRC-ARGS-READ (second garbage call differed)\n", 46); }
+    } else { sys_write(1, "PSRC-ARGS-READ (first garbage call differed)\n", 45); }
+
+    var i = 0;
+    var diff = 0;
+    while (i < 100000) {
+        if (syscall(114) != w) { diff = diff + 1; }
+        i = i + 1;
+    }
+    if (diff == 0) { sys_write(1, "PSRC-CACHED calls=100000\n", 25); }
+    else { sys_write(1, "PSRC-NOT-CACHED (a call returned a different word)\n", 51); }
+
+    var st = w & 0xFF;
+    sys_write(1, "PSRC state=", 11);
+    _emit_hex(st);
+    _emit_bit("tables", 6, w, 0x100);
+    _emit_bit("battery", 7, w, 0x200);
+    _emit_bit("present", 7, w, 0x400);
+    _emit_bit("ac", 2, w, 0x800);
+    _emit_bit("inferred", 8, w, 0x1000);
+    _emit_bit("malformed", 9, w, 0x2000);
+    sys_write(1, "\n", 1);
+
+    var shape = 1;
+    if (st > 1) { shape = 0; }                                       # 2 is reserved; >2 undefined
+    if ((w & (0 - 0x4000)) != 0) { shape = 0; }                      # no bit above the defined 0x3FFF
+    if ((w & 0xFC) != 0) { shape = 0; }                              # state bits 2-7 unused
+    if (st == 1) {
+        if ((w & 0x1000) == 0) { shape = 0; }                        # every MAINS is INFERRED this cut
+        if ((w & 0x100) == 0) { shape = 0; }                         # ... and needs the tables
+        if ((w & 0x2000) != 0) { shape = 0; }                        # ... and no failed bound check
+        if ((w & 0x400) != 0) { shape = 0; }                         # ... and no battery that may be present
+    }
+    if (st == 0) {
+        if ((w & 0x1000) != 0) { shape = 0; }                        # INFERRED qualifies a state; "cannot say" has none
+    }
+    if (shape == 1) { sys_write(1, "PSRC-SHAPE ok\n", 14); }
+    else { sys_write(1, "PSRC-SHAPE BAD\n", 15); }
+    sys_write(1, "PSRC-DONE\n", 10);
+    return 0;
+}
+
+fn _entry(): i64 { var rc = main(); syscall(SYS_EXIT, rc); return 0; }
+_entry();

@@ -5854,6 +5854,44 @@ fn zfs_wp_close(base) {
     }
     return 0;
 }
+# (1.57.18) fsync#115 of a ZFS file or directory fd (syscall.cyr sys_fsync_fd, fs_lock held) — OpenZFS zfs_fsync:
+# zil_commit(zilog, zp->z_id) makes THAT znode's changes stable and nothing else's; with no ZIL its equivalent is
+# txg_wait_synced of the txg holding the file's dirty data. agnos writes no ZIL and holds at most ONE pending txg, of ONE
+# object (zfs_wp_ref), so: the fd's object IS the pending one -> commit it ("fsync": two device flushes inside, durable
+# on return); any other -> nothing of this file is dirty (every commit already flushed), and another file's pending
+# writes stay pending — only the age bound every ZFS entry applies (zfs_wp_obs) may commit an aged one. Any access mode
+# (POSIX fsync needs no write access; a read-only fd commits writes another fd of the same file left). -1 when the
+# commit fails, when the fd's file is gone or another object holds its number now (zfs_fd_size: D11, as read / write —
+# checked FIRST, so a recycled number never commits a stranger's writes), and once for a file whose pending commit
+# failed earlier (zfs_wp_eref — POSIX's deferred EIO, as close#6 reports it). A directory is never pending (every
+# directory op commits its own txg): 0, or -1 once it is gone.
+fn zfs_wp_fsync(base) {
+    var ref = kpayload(base, 2);
+    if (ktag(base) == VFS_ZFS_FILE) {
+        if (zfs_fd_size(base) < 0) { return zfs_wno("fsync: the fd's object is gone or is another one (generation, D11)"); }
+    } else {
+        var dg = kpayload(base, 1);
+        if (dg != 0) {
+            var ddn = zfs_dnslot(4);
+            if (zfs_ref_dn(ref, ddn) != 0 || zfs_fd_live(zfs_ref_di(ref), ddn, dg) == 0) { return zfs_wno("fsync: the directory is gone"); }
+        }
+    }
+    if (zfs_wp_ref != 0) {
+        if (zfs_wp_ref == ref) {
+            if (zfs_wp_flush_why("fsync") != 0) {
+                zfs_wp_eref = 0;                          # reported here, once
+                return 0 - 1;
+            }
+        } elif (zfs_wp_aged() == 1) {
+            zfs_wp_flush_why("age");                      # another file's: its failure is that file's (zfs_wp_eref)
+        }
+    }
+    if (zfs_wp_eref != 0 && zfs_wp_eref == ref) {
+        zfs_wp_eref = 0;
+        return 0 - 1;
+    }
+    return 0;
+}
 # sync#12 and power_flush: the pending txg committed — every commit flushes the device twice, so nothing ZFS holds is
 # volatile after it. -1 when it failed, or an earlier hook's commit did (zfs_wp_eref, reported once).
 fn zfs_wp_sync() {
@@ -6409,13 +6447,16 @@ fn zfs_wtrunc(ref, len) {
 #     CTIME CRTIME LINKS [PROJID] DACL_COUNT DACL_ACES, a symlink's SYMLINK last (zfs_symlink's sa_update adds it) — the
 #     numbers by NAME from the dataset's REGISTRY (zfs_wc_regs: one not registered is refused, a REGISTRY add is not
 #     built), the layout the dataset's LAYOUTS already holds for exactly that array — (B8) or a NEW one registered in the
-#     same txg (zfs_wc_layout: sa_add_layout_entry's count + 2, a fat-ZAP add). Values: MODE 0100644 / 040755 / 0120755 (no mode argument in the ABI — FreeBSD's
-#     defaults under umask 022, the fixtures' own objects), SIZE 0 / 2 / the target's length, GEN = T (D11), UID 0, GID
+#     same txg (zfs_wc_layout: sa_add_layout_entry's count + 2, a fat-ZAP add). Values: MODE 0100644 / 040755 / 0120755 (FreeBSD's
+#     defaults under umask 022, the fixtures' own objects) — (1.57.18) a file's 0100000 | perm when open#7 carried
+#     AO_MODE (perm 0..07777 as given: zfs_acl_ids_create keeps S_ISGID for a privileged caller, and every agnos process
+#     is uid 0) — SIZE 0 / 2 / the target's length, GEN = T (D11), UID 0, GID
 #     the parent's (zfs_acl_ids_create), PARENT, FLAGS = ARCHIVE | AV_MODIFIED | the ACL hints (TRIVIAL, + AUTO_INHERIT
 #     for a directory, + NO_EXECS_DENIED when every class may execute — zfs_mode_compute) | PROJID where project quota
 #     is enabled (files and directories) | PROJINHERIT from the parent; the four times {now, 0}; LINKS 1 / 2 / 1 (mknode
 #     0 / 1, then zfs_link_create + 1); PROJID the parent's under PROJINHERIT, else 0; the trivial ACL zfs_acl_chmod
-#     gives the mode (zfs_wc_aces: owner@ / group@ / everyone@ ALLOW, 3 ACEs, 24 bytes) — bytes equal to the fixtures'
+#     gives the mode (zfs_wc_aces: owner@ / group@ / everyone@ ALLOW, 3 ACEs, 24 bytes — (1.57.18) after allow0 /
+#     deny1 / deny2 where the mode needs them, 4-6 ACEs) — bytes equal to the fixtures'
 #     own FreeBSD objects of the same kind (design § k.2; scripts/smoke/lib/zfs-sa-check.py holds every new object to
 #     such a twin)
 #   · the entry (zfs_link_create): name -> obj | DT << 60 in the parent's ZAP (zfs_wz_op, B8: a microzap's 64-byte chunk —
@@ -6431,15 +6472,14 @@ fn zfs_wtrunc(ref, len) {
 # (UTF-8 validation not built); a symlink target of 0 or 145+ bytes (spill creation not built) or holding a NUL byte (a
 # C string to FreeBSD's symlink(2): OpenZFS never writes one; B6 review); a dataset whose objset_phys OpenZFS grows in
 # memory (dse +104 bit 64: a 2 KiB objset on a project_quota pool — FreeBSD's create would carry PROJID and make the
-# projectused ZAP; B6 review); a mode whose trivial ACL needs zfs_acl_chmod's allow0 / deny entries (zfs_wc_trivok —
-# unreachable while the ABI has no mode argument); no layout; and the predicates: EDQUOT (the dataset's quotas,
+# projectused ZAP; B6 review); no layout; and the predicates: EDQUOT (the dataset's quotas,
 # zfs_wd_space; the owner's user / group / project BYTE and OBJECT quotas, zfs_acl_ids_overquota — zfs_wd_idq3) and
 # ENOSPC.
 enum ZfsWC {
     ZWC_NA     = 17;                    # the attributes a create may write (zfs_wc_names: zfs_mknode's bulk order) + B7's
     #   ZPL_XATTR, which only a removal reads (zfs_wu_drop)
     ZWC_FILE   = 0x81A4;                # S_IFREG | 0644 \
-    ZWC_DIR    = 0x41ED;                # S_IFDIR | 0755  } the modes agnos creates (no mode argument in the ABI)
+    ZWC_DIR    = 0x41ED;                # S_IFDIR | 0755  } the modes agnos creates by default (1.57.18: a file's AO_MODE overrides)
     ZWC_LNK    = 0xA1ED;                # S_IFLNK | 0755 /
     ZWC_TRIV   = 4;                     # znode flags (zfs_znode.h, zfs_acl.h): ZFS_ACL_TRIVIAL · ZFS_ACL_AUTO_INHERIT ·
     ZWC_AUTOI  = 0x40;                  #   ZFS_NO_EXECS_DENIED · ZFS_INHERIT_ACE · ZFS_XATTR · ZFS_PROJINHERIT · ZFS_PROJID
@@ -6648,29 +6688,79 @@ fn zfs_wc_mask(rwx, own) {
     if ((rwx & 1) != 0) { m = m | 0x20; }
     return m;
 }
-# Is perm's trivial ACL the three ALLOW entries alone? zfs_acl_chmod puts allow0 (owner@ ALLOW), deny1 (owner@ DENY) and
-# deny2 (group@ DENY) first whenever a class holds a bit the class before it lacks — other's over group's, or either's
-# over the owner's (acl_trivial_access_masks) — which zfs_wc_aces does not build: every bit of group within owner's,
-# every bit of other within group's. 0644 / 0755 qualify; a mode argument or chmod (k.55) would not always. 0 / -1 named.
-fn zfs_wc_trivok(perm) {
+# acl_trivial_access_masks's three leading masks for permission bits perm (acl_common.c:1543-1600, zfs_acl_chmod's
+# source): which 0 = allow0 (owner@ ALLOW: a bit the owner has, the group lacks and other has), 1 = deny1 (owner@ DENY:
+# a bit the owner lacks and the group or other has), 2 = deny2 (group@ DENY: a bit the group lacks and other has); each
+# bit as READ_DATA (r) / WRITE_DATA | APPEND_DATA (w) / EXECUTE (x). 0 when the mode needs no such entry.
+# (1.57.18) Until open#7 carried a mode (AO_MODE) every create was 0644 / 0755, whose classes nest (other within group
+# within owner), so only the three ALLOW entries were built and any other mode was refused by name; a mode now comes
+# from ring 3, so the full form is built — as zfs_mode_compute needs to read the mode back from the ACL (an everyone@
+# READ with no group@ DENY before it would give the group read too).
+fn zfs_wc_dmask(perm, which) {
     var u = (perm >> 6) & 7;
     var g = (perm >> 3) & 7;
     var o = perm & 7;
-    if ((g & (7 - u)) != 0 || (o & (7 - g)) != 0) { return zfs_wnon("a mode whose ACL needs DENY entries (zfs_acl_chmod's full form not built): ", u * 100 + g * 10 + o); }
-    return 0;
+    var m = 0;
+    var b = 4;
+    while (b > 0) {
+        var hit = 0;
+        if (which == 0 && (u & b) != 0 && (g & b) == 0 && (o & b) != 0) { hit = 1; }
+        if (which == 1 && (u & b) == 0 && ((g | o) & b) != 0) { hit = 1; }
+        if (which == 2 && (g & b) == 0 && (o & b) != 0) { hit = 1; }
+        if (hit == 1) {
+            if (b == 4) { m = m | 1; }
+            if (b == 2) { m = m | 6; }
+            if (b == 1) { m = m | 0x20; }
+        }
+        b = b >> 1;
+    }
+    return m;
 }
-# The trivial ACL of permission bits perm at p (24 bytes; zfs_wc_trivok passed): three zfs_ace_hdr_t {u16 type, u16
-# flags, u32 mask}, type ALLOW (0) — owner@ (ACE_OWNER 0x1000), group@ (ACE_GROUP | ACE_IDENTIFIER_GROUP 0x2040),
-# everyone@ (ACE_EVERYONE 0x4000). 0.
+# The number of ACEs zfs_acl_chmod gives permission bits perm: the three ALLOW entries + each non-zero leading mask (3..6).
+fn zfs_wc_acl_n(perm) {
+    var n = 3;
+    var w = 0;
+    while (w < 3) {
+        if (zfs_wc_dmask(perm, w) != 0) { n = n + 1; }
+        w = w + 1;
+    }
+    return n;
+}
+# The trivial ACL of permission bits perm at p — zfs_acl_chmod's entry order over an empty ACL (zfs_acl.c:1343-1440):
+# allow0 (owner@ ALLOW), deny1 (owner@ DENY), deny2 (group@ DENY) where non-zero, then always owner@ / group@ /
+# everyone@ ALLOW; each a zfs_ace_hdr_t {u16 type (ALLOW 0, DENY 1), u16 flags, u32 mask} — owner@ ACE_OWNER 0x1000,
+# group@ ACE_GROUP | ACE_IDENTIFIER_GROUP 0x2040, everyone@ ACE_EVERYONE 0x4000. Returns its length: 8 x zfs_wc_acl_n.
 fn zfs_wc_aces(p, perm) {
-    memset(p, 0, 24);
-    store16(p + 2, 0x1000);
-    store32(p + 4, zfs_wc_mask((perm >> 6) & 7, 1));
-    store16(p + 10, 0x2040);
-    store32(p + 12, zfs_wc_mask((perm >> 3) & 7, 0));
-    store16(p + 18, 0x4000);
-    store32(p + 20, zfs_wc_mask(perm & 7, 0));
-    return 0;
+    var nb = zfs_wc_acl_n(perm) * 8;
+    memset(p, 0, nb);
+    var q = p;
+    var a0 = zfs_wc_dmask(perm, 0);
+    if (a0 != 0) {
+        store16(q + 2, 0x1000);
+        store32(q + 4, a0);
+        q = q + 8;
+    }
+    var d1 = zfs_wc_dmask(perm, 1);
+    if (d1 != 0) {
+        store16(q, 1);
+        store16(q + 2, 0x1000);
+        store32(q + 4, d1);
+        q = q + 8;
+    }
+    var d2 = zfs_wc_dmask(perm, 2);
+    if (d2 != 0) {
+        store16(q, 1);
+        store16(q + 2, 0x2040);
+        store32(q + 4, d2);
+        q = q + 8;
+    }
+    store16(q + 2, 0x1000);
+    store32(q + 4, zfs_wc_mask((perm >> 6) & 7, 1));
+    store16(q + 10, 0x2040);
+    store32(q + 12, zfs_wc_mask((perm >> 3) & 7, 0));
+    store16(q + 18, 0x4000);
+    store32(q + 20, zfs_wc_mask(perm & 7, 0));
+    return nb;
 }
 fn zfs_wc_val(k) {
     if (k == 0) { return zfs_wc_m; }
@@ -6681,11 +6771,12 @@ fn zfs_wc_val(k) {
     if (k == 6) { return zfs_wc_fl; }
     if (k == 11) { return zfs_wc_ln; }
     if (k == 12) { return zfs_wc_pid; }
-    if (k == 13) { return 3; }
+    if (k == 13) { return zfs_wc_acl_n(zfs_wc_m & 0x1FF); }      # DACL_COUNT (1.57.18: 3..6, zfs_wc_aces)
     return 0;                                    # UID: agnos has no other user (crgetuid)
 }
 # The SA bonus of a new object at b (zeroed) in layout lay over the n attribute indices at kix (u64 each): the header —
-# SA_MAGIC, layout | (header bytes / 8) << 10, the variable lengths in layout order (DACL_ACES 24, then SYMLINK's) —
+# SA_MAGIC, layout | (header bytes / 8) << 10, the variable lengths in layout order (DACL_ACES 24 — 1.57.18: 8 per ACE,
+# 24..48 — then SYMLINK's) —
 # then each attribute 8-aligned (sa_build_layouts). Returns the bonus length: the last attribute's end, unrounded
 # (FreeBSD's symlink "hello.txt" is 176 + 9 = 185 bytes).
 fn zfs_wc_sa(b, lay, kix, n) {
@@ -6693,7 +6784,7 @@ fn zfs_wc_sa(b, lay, kix, n) {
     if (zfs_wc_tl > 0) { hs = 16; }
     store32(b, ZK_SAMAGIC);
     store16(b + 4, lay | ((hs >> 3) << 10));
-    store16(b + 6, 24);
+    store16(b + 6, zfs_wc_acl_n(zfs_wc_m & 0x1FF) * 8);
     if (zfs_wc_tl > 0) { store16(b + 8, zfs_wc_tl); }
     var off = hs;
     var end = hs;
@@ -6705,8 +6796,7 @@ fn zfs_wc_sa(b, lay, kix, n) {
             sz = 16;
             store64(b + off, zfs_wc_now);
         } elif (k == 14) {
-            sz = 24;
-            zfs_wc_aces(b + off, zfs_wc_m & 0x1FF);
+            sz = zfs_wc_aces(b + off, zfs_wc_m & 0x1FF);
         } elif (k == 15) {
             sz = zfs_wc_tl;
             memcpy(b + off, zfs_wc_tg, sz);
@@ -6748,8 +6838,8 @@ fn zfs_wname(di, nm, nl) {
 }
 # The create of kind (0 a file · 1 a directory · 2 a symlink, its target in zfs_wc_tg / zfs_wc_tl) named nm (nl bytes) in
 # directory object pobj of dataset slot di, DIRTIED in the open txg (the section header) — the caller commits, or drops
-# the txg on -1 (named).
-fn zfs_wc1(di, pobj, nm, nl, kind) {
+# the txg on -1 (named). perm (1.57.18): a file's permission bits 0..07777 (open#7's AO_MODE), or -1 for the default.
+fn zfs_wc1(di, pobj, nm, nl, kind, perm) {
     zfs_wc_lnote(0);
     if (zfs_rw != 1 || zfs_wmem == 0) { return zfs_wno("pool read-only"); }
     if (zfs_wp_own() != 0) { return 0 - 1; }         # (B11 review) a pending txg commits first, never dropped with a refusal
@@ -6835,6 +6925,7 @@ fn zfs_wc1(di, pobj, nm, nl, kind) {
     if (lay < 0) { return 0 - 1; }
     # --- the values ---
     zfs_wc_m = ZWC_FILE;
+    if (kind == 0 && perm >= 0) { zfs_wc_m = 0x8000 | (perm & 0xFFF); }   # (1.57.18) S_IFREG | open#7's AO_MODE bits
     zfs_wc_sz = 0;
     zfs_wc_ln = 1;
     var dt = 8;
@@ -6848,7 +6939,6 @@ fn zfs_wc1(di, pobj, nm, nl, kind) {
         zfs_wc_sz = zfs_wc_tl;
         dt = 10;
     }
-    if (zfs_wc_trivok(zfs_wc_m & 0x1FF) != 0) { return 0 - 1; }
     zfs_wc_gid = gid;
     zfs_wc_par = pobj;
     zfs_wc_pid = pid;
@@ -6900,8 +6990,8 @@ fn zfs_wc1(di, pobj, nm, nl, kind) {
 # The final component is never followed: a name that resolves at all (a dangling symlink, a graft) EXISTS — and nothing
 # is created unless this no-follow lookup says ABSENT (zfs_open sends every failed AO_CREAT lookup here for its name).
 # 0 / -1 named (nothing written, or a commit that failed: the pool then read-only, zfs_wfail). Caller holds
-# fs_spin_lock.
-fn zfs_wcreate(path, len, kind, tgt, tl) {
+# fs_spin_lock. perm (1.57.18): a file's permission bits from open#7's AO_MODE (0..07777), -1 = the default 0644.
+fn zfs_wcreate(path, len, kind, tgt, tl, perm) {
     if (zfs_wp_flush() != 0) { return 0 - 1; }       # (B11) a mutation: a pending policy-B txg commits first
     if (zfs_rw != 1 || zfs_wmem == 0) { return zfs_wno("pool read-only"); }
     path = zfs_upath(0, path, len);                  # read once (B7 review): every check and lookup below on the copy
@@ -6943,7 +7033,7 @@ fn zfs_wcreate(path, len, kind, tgt, tl) {
     if (pt != 2) { return zfs_wno("parent is not a directory"); }
     var di = zfs_ref_di(pr);
     if (di < 0 || di >= zfs_nds) { return zfs_wno("parent is a virtual directory (no dataset holds it)"); }
-    if (zfs_wc1(di, pr & ZK_MASK48, &nm, nl, kind) != 0) {
+    if (zfs_wc1(di, pr & ZK_MASK48, &nm, nl, kind, perm) != 0) {
         zfs_wf_drop();
         return 0 - 1;
     }
@@ -6953,13 +7043,13 @@ fn zfs_wcreate(path, len, kind, tgt, tl) {
 # mkdir#9 on the ZFS mount (the arm holds fs_lock): 0 / -1.
 fn zfs_wmkdir(path, len) {
     if (zfs_active == 0) { return 0 - 1; }
-    if (zfs_wcreate(path, len, 1, 0, 0) != 0) { return 0 - 1; }
+    if (zfs_wcreate(path, len, 1, 0, 0, 0 - 1) != 0) { return 0 - 1; }
     return 0;
 }
 # symlink#63 on the ZFS mount: the link at path whose text is the tl bytes at tgt (the arm validated the user range).
 fn zfs_wsymlink(tgt, tl, path, len) {
     if (zfs_active == 0) { return 0 - 1; }
-    if (zfs_wcreate(path, len, 2, tgt, tl) != 0) { return 0 - 1; }
+    if (zfs_wcreate(path, len, 2, tgt, tl, 0 - 1) != 0) { return 0 - 1; }
     return 0;
 }
 # --- B7: UNLINK / RMDIR / RENAME / LINK in microzap parents — (B8) and fat ones (design § a.1, § a.3, § e.2, § f.2-f.5)
@@ -10909,7 +10999,7 @@ fn zfs_wt_c(kind, path, tgt, want) {
     } else {
         var tl = 0;
         if (kind == 2) { tl = strlen(tgt); }
-        r = zfs_wcreate(path, strlen(path), kind, tgt, tl);
+        r = zfs_wcreate(path, strlen(path), kind, tgt, tl, 0 - 1);
     }
     r = zfs_wt_wend(op, path, rw, t0, r, 0, want);
     if (r == 0 && rw == 1) { zfs_wt_where(op, path); }

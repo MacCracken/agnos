@@ -261,6 +261,11 @@ var proc_wait_key[16];
 var proc_wait_deadline[16];
 var proc_wake_reason[16];
 var proc_sc_a4[16];
+# 1.57.18 — console_mode#110 CM_NOSERIAL, PER PROCESS (unlike the console's own NOECHO): 1 = this process's console
+# writes are drawn but not mirrored to COM1 (devs.cyr serial_dev_write). Written only by the process itself
+# (console_mode_sys, its own syscall) and by this scrub — so it dies with the process and a recycled slot never
+# inherits it; a fork / spawn child starts clear (its slot is scrubbed).
+var proc_con_noser[16];
 
 # Wait keys (the high byte names the class, the low bits the object) and wake reasons. Module-scope literals.
 var WK_SLEEP = 0x0100000000000000;
@@ -583,6 +588,73 @@ fn proc_clear_name(pid) {
     var b = proc_name_ptr(pid);
     if (b == 0) { return 0; }
     store8(b, 0);
+    return 0;
+}
+
+# ═══════════════ 1.57.18 — THE WORKING DIRECTORY (chdir#112 / getcwd#113; docs/architecture/working-directory.md) ═══════════════
+# Operator ruling 2026-11-08 (issue 2026-11-06-a-relative-path-has-no-working-directory): the kernel keeps a working
+# directory PER PROCESS, and every relative path a syscall takes resolves from it (syscall.cyr sc_path_take — the one
+# ingress). Until 1.57.18 "CWD is userland-owned" (ABI § 3.2) and a relative name was rooted at "/", so a program that
+# did not resolve its own operands against $PWD read the wrong file, silently (thoth's read_file jail read
+# /etc/secret.txt for "etc/secret.txt" from a project directory).
+# ⭐ A STRING, NOT AN INODE. Each cwd is a NORMALIZED ABSOLUTE PATH (no ".", "..", "//" or trailing "/" — syscall.cyr
+# path_clean_join), as Plan 9's dot carries its cname and a shell carries its LOGICAL $PWD: agnos routes a path by its
+# string across mounts (ext2 at "/", ZFS at /mnt/zfs, FAT at /mnt/fat, the /fonts intercept), so "cwd + name" is the
+# path to route. Linux holds a dentry (fs_struct->pwd) instead; the consequences of the difference are in the doc.
+# ⭐ LENGTH 0 MEANS "/" — the reset state, and the only one most processes ever have — so a process that never chdirs
+# never touches the cwd strings at all: proc_cwd_buf is ROOM slot 12 (core/room.cyr; 64 KB out of the image), and a
+# length-0 cwd needs no pointer. Every read of the room is behind `len > 0`, which only a chdir, a PWD seed or an
+# inheritance copy produces — all long after room_init.
+# ⚠ OWNERSHIP (no lock, on purpose): pid p's cwd is written only (a) by p itself (chdir#112, on the one CPU running it),
+# (b) by p's creator while p is CLAIMING (state 3 — proc_create_user / sys_fork / spawn_load_child's PWD seed), never
+# scheduled yet, and (c) by proc_alloc_slot when the slot is handed out again. It is read only by p itself (every path
+# syscall, getcwd) and by p's creator while p is CLAIMING. The READY publish (proc_set_state under the scheduler's
+# ordering) is what makes the creator's stores visible to the CPU that first runs p. No other process reads it today; a
+# future third-party reader (a /proc-like enumeration) must take a seqcount (Linux fs_struct->seq), since a length and
+# its bytes are not one atomic store.
+var CWD_MAX = 4095;                      # bytes in a cwd and in any resolved path (Linux PATH_MAX 4096 incl. the NUL)
+var CWD_SLOT = 4096;                     # bytes per pid in proc_cwd_buf (CWD_MAX + the NUL getcwd#113 writes)
+var proc_cwd_len[16];                    # per-pid cwd length; 0 = "/" (never reads the room)
+var proc_cwd_buf = 0xFFFFA00C00000000;   # ROOM slot 12 — 16 x 4096 B, pid p at p * CWD_SLOT (core/room.cyr)
+fn proc_cwd_len_get(pid) {
+    if (pid < 0) { return 0; }
+    if (pid >= 16) { return 0; }
+    return load64(&proc_cwd_len + pid * 8);
+}
+fn proc_cwd_ptr(pid) { return proc_cwd_buf + pid * CWD_SLOT; }
+# A slot handed out again starts at "/" (proc_alloc_slot): a recycled pid never inherits its last occupant's cwd.
+fn proc_cwd_reset(pid) {
+    if (pid < 0) { return 0; }
+    if (pid >= 16) { return 0; }
+    store64(&proc_cwd_len + pid * 8, 0);
+    return 0;
+}
+# Set pid's cwd to the n bytes at src — a normalized absolute path (path_clean_join's output): "/" stores length 0.
+fn proc_cwd_set(pid, src, n) {
+    if (pid < 0) { return 0 - 1; }
+    if (pid >= 16) { return 0 - 1; }
+    if (n < 1) { return 0 - 1; }
+    if (n > CWD_MAX) { return 0 - 1; }
+    if (n == 1) { store64(&proc_cwd_len + pid * 8, 0); return 0; }
+    memcpy(proc_cwd_ptr(pid), src, n);
+    store8(proc_cwd_ptr(pid) + n, 0);
+    store64(&proc_cwd_len + pid * 8, n);
+    return 0;
+}
+# The child starts where its creator is (Linux copy_fs, Plan 9 sysrfork's `p->dot = up->dot`): proc_create_user (spawn#3,
+# spawn_path#43, execwait#37, every kernel load) and sys_fork. The LENGTH is always stored — a root creator's 0 included
+# — so whatever the slot held before cannot survive into the child even if the alloc-time reset were skipped.
+fn proc_cwd_inherit(child, parent) {
+    if (child < 0) { return 0; }
+    if (child >= 16) { return 0; }
+    var ci_n = proc_cwd_len_get(parent);
+    if (ci_n > 0) {
+        if (child != parent) {
+            memcpy(proc_cwd_ptr(child), proc_cwd_ptr(parent), ci_n);
+            store8(proc_cwd_ptr(child) + ci_n, 0);
+        }
+    }
+    store64(&proc_cwd_len + child * 8, ci_n);
     return 0;
 }
 
@@ -1151,6 +1223,7 @@ fn proc_alloc_slot() {
     store64(&proc_wait_deadline + idx * 8, 0);
     store64(&proc_wake_reason + idx * 8, 0);
     store64(&proc_sc_a4 + idx * 8, 0);
+    store64(&proc_con_noser + idx * 8, 0);      # 1.57.18: nor the dead occupant's console_mode#110 CM_NOSERIAL
     # 1.57.7 (S8): nor the dead occupant's caps or high-arena cursor (a fresh incarnation starts uncapped at the
     # arena floor; proc_create_user / sys_fork then place the real caps). Unconditional: the only caller-slot case
     # is the unregistered boot pid 0, whose caps are 0, and proc_create_user read the creator's values already.
@@ -1170,6 +1243,7 @@ fn proc_alloc_slot() {
     # back against a live pid that happens to land on the same slot" — and `cyrius build` listed it as
     # DEAD CODE. A guarantee, a function written to provide it, and no edge between them.
     proc_clear_name(idx);
+    proc_cwd_reset(idx);                       # 1.57.18: a recycled slot starts at "/" (the creator's copy follows)
     # ⛔ 1.57.6 — A RECYCLED SLOT MUST NOT INHERIT THE PRIOR OCCUPANT'S SPAWN ARMS (redirect set, endowment,
     # placement record): a fresh process, fork#96 children included, starts with nothing armed.
     # ⛔⛔ BUT NEVER THE CALLER'S OWN SLOT. proc_create_user allocates the child BEFORE it places the
@@ -1345,6 +1419,7 @@ fn proc_create_user(entry, stack_top) {
     if (proc_birth_check(idx, proc_current_get()) == 0) { proc_slot_release_unborn(idx); return 0 - 1; }
     lim_caps_set(idx, lc_m, lc_c);   # 1.57.7 (S8): lim_eff inheritance (an arm can only lower)
     vfs_fd_inherit(idx, proc_current_get());
+    proc_cwd_inherit(idx, proc_current_get());   # 1.57.18: the creator's working directory (#43/#37 may then seed it from PWD=)
     # 1.56.40 bite 5 — place an armed channel endowment into the child (planning/ipc.md §9.6).
     # ⛔ THE HIGHEST-RISK LINE IN THE CUT: this sits on the birth path of EVERY user process, so a
     # defect here does not break the channel band, it breaks spawn. It is deliberately the LAST thing

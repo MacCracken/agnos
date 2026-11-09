@@ -1,0 +1,811 @@
+# rdlong — agnos 1.57.18 ring-3 exerciser for the fs-listing repairs (track T3).
+#
+# Issues: 2026-11-06-readlink-refuses-a-buffer-shorter-than-the-target (thoth 0.55.1) and
+#         2026-11-08-readdir-cuts-a-long-name-and-says-nothing (crab 0.11.3, H10).
+# Seeded as /bin/agnsh on a PLAIN kernel by scripts/smoke/fs-listing-smoke.sh, which builds the ext2 fixture below on
+# the host (and crafts /evil and /el4k with debugfs), puts the OpenZFS fixture's main pool on a third partition, and
+# maps the markers. Raw `syscall(N, a1, a2, a3, a4)` with explicit zeros (a 3-argument call passes a garbage r10).
+# Every check prints its raw values; a failure prints `RDL-FAIL-<name> v=...` and never its OK marker. The program
+# ALWAYS ends `RDL-DONE pass=P fail=F` and exits 0 (a non-zero exit drops kybernet into the emergency shell).
+#
+#   L  readdir#81 / readdir_at#101 records (ext2 /ln): the issue's five rows — `a` x 70, its 62-byte sibling, two
+#      66-byte names sharing 62, short.txt — plus four UTF-8 names whose 62-byte cut falls inside (or just after) a
+#      2-, 3- and 4-byte character, a 70-byte directory and a short one. Each record must hold exactly the bytes the
+#      boundary rule keeps (62 / 61 / 60 / 59), NUL-terminated, valid UTF-8, and byte 63 = RD_DIR(1) | RD_CUT(2) —
+#      RD_CUT clear on the exact-62 sibling. getdents#29 lists every name whole.
+#   R  readlink#70 copies at most cap bytes and returns the count (ext2 fast, ext2 slow, ZFS bonus / SA): the bytes
+#      match, nothing past the count is written, cap 0 is -1, and cyrius's is_symlink 8-byte probe shape succeeds on
+#      a link whose target is longer than 8 (and still fails on a file).
+#   F  THE KERNEL FOLLOWER NEVER FOLLOWS A CUT TARGET: /evil is a slow symlink whose i_size (5000) is larger than its
+#      one block and than the follower's 4096-byte buffer, and whose first 4096 bytes are "/etc/hostname" + slashes —
+#      a truncating follower resolves it to /etc/hostname. open / stat through it must fail, and readlink#70 must
+#      refuse it (a corrupt inode: the format bounds a slow target by its block). /el4k (i_size exactly 4096, the same
+#      block) is legal and IS followed; /sl (a 100-byte slow target) and /fl (fast) are followed.
+#   G  getdents#29 with a buffer too small for the next record answers -1, position unchanged — not 0 (end of dir).
+#   S  lseek#58 on an AO_DIRECTORY fd (ext2): a directory listed in 300-byte batches, the fd CLOSED and REOPENED
+#      between batches and repositioned with the cookie lseek(fd, 0, SEEK_CUR) returned, lists exactly what one pass
+#      lists; a whole tree walked that way (no fd held across a descent) visits exactly what a one-fd-per-level walk
+#      visits. A cookie + 1..12 (inside a header or a name) resumes at the NEXT record — never a garbage name;
+#      negative and SEEK_END are refused; past the end lists nothing. readdir_at#101's cursor + 4 snaps the same way.
+#   Z  the same on the ZFS mount: the /ln names created on agnostank/custom and listed (L), readlink on the pool's
+#      sym-short / sym-long (R), #81 of /mnt/zfs/agnostank (its 255-byte name the one cut record), dir3000 resumed
+#      across close/reopen, the whole agnostank tree walked both ways, and hostile cursors (-1, SEEK_END, a fat-ZAP
+#      position, past the ZAP, past the extras, 1) listing only genuine names.
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES (an agnos exec has ~12 KB of usable init stack: big buffers live here).
+var q_lb[32];            # 256 B the current output line
+var Q_LN = 0;
+var Q_PASS = 0;
+var Q_FAIL = 0;
+var q_rb[1100];          # 8800 B readlink buffer (cap up to 8192 + a sentinel tail)
+var q_tg[1100];          # 8800 B an expected target
+var q_rec[3200];         # 25600 B = 400 readdir records
+var q_gd[512];           # 4096 B getdents buffer
+var q_nm[64];            # 512 B a generated name
+var q_p[512];            # 4096 B a path
+var q_st[6];             # 48 B stat#33
+var q_ent[512];          # 512 u64 per-entry name hashes (S)
+var q_ccook[128];        # 128 u64 a batch's cookie (S)
+var q_cstart[128];       # 128 u64 a batch's first entry (S)
+var q_rah[512];          # 512 u64 readdir_at#101 name hashes (S)
+var q_wp[512];           # 4096 B the tree walk's path
+var q_wref[6144];        # 16 x 3072 B the one-fd-per-level walk's per-depth getdents buffers
+var q_wres[768];         # 16 x 384 B the resumed walk's per-depth batch buffers
+var q_seen[512];         # 4096 bits (Z: dir3000 names seen)
+var Q_ENT = 0;
+var Q_CALL = 0;
+var Q_H = 0;
+var Q_HN = 0;
+var Q_WERR = 0;
+
+# ── output (line-buffered, one write(1) per line) ──
+fn q_flush() { if (Q_LN > 0) { syscall(1, 1, &q_lb, Q_LN, 0); } Q_LN = 0; return 0; }
+fn q_putc(ch) {
+    if (Q_LN >= 250) { q_flush(); }
+    store8(&q_lb + Q_LN, ch);
+    Q_LN = Q_LN + 1;
+    if (ch == 10) { q_flush(); }
+    return 0;
+}
+fn q_out(s) { var i = 0; while (load8(s + i) != 0) { q_putc(load8(s + i)); i = i + 1; } return 0; }
+fn q_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { q_putc(45); n = 0 - n; }
+    if (n == 0) { q_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; q_putc(load8(&b + i)); }
+    return 0;
+}
+fn q_kv(k, v) { q_out(" "); q_out(k); q_out("="); q_num(v); return 0; }
+fn q_nl() { q_out("\n"); return 0; }
+fn q_ok(m) { q_out(m); q_nl(); Q_PASS = Q_PASS + 1; return 0; }
+fn q_fail(m, v) { q_out("RDL-FAIL-"); q_out(m); q_kv("v", v); q_nl(); Q_FAIL = Q_FAIL + 1; return 0; }
+fn q_len(s) { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn q_eq(a, b, n) { var i = 0; while (i < n) { if (load8(a + i) != load8(b + i)) { return 0; } i = i + 1; } return 1; }
+fn q_fill(p, ch, n) { var i = 0; while (i < n) { store8(p + i, ch); i = i + 1; } return n; }
+fn q_cpy(d, s, n) { var i = 0; while (i < n) { store8(d + i, load8(s + i)); i = i + 1; } return n; }
+
+# ── syscalls ──
+fn q_open(p, fl) { return syscall(7, p, q_len(p), fl, 0); }
+fn q_openl(p, l, fl) { return syscall(7, p, l, fl, 0); }
+fn q_close(fd) { return syscall(6, fd, 0, 0, 0); }
+fn q_lseek(fd, off, wh) { return syscall(58, fd, off, wh, 0); }
+fn q_gdn(fd, b, sz) { return syscall(29, fd, b, sz, 0); }
+fn q_rl(p, b, cap) { return syscall(70, p, q_len(p), b, cap); }
+
+# ── a sequence hash (FNV-1a over every name and its type) ──
+fn q_hreset() { Q_H = 0x84222325; Q_HN = 0; return 0; }
+fn q_hb(b) { Q_H = (Q_H ^ (b & 0xFF)) * 0x100000001b3; return 0; }
+fn q_hmix(p, n, t) {
+    var i = 0;
+    while (i < n) { q_hb(load8(p + i)); i = i + 1; }
+    q_hb(t + 0x30);
+    q_hb(10);
+    Q_HN = Q_HN + 1;
+    return 0;
+}
+fn q_nhash(p, n) { var h = 0x2325; var i = 0; while (i < n) { h = (h ^ load8(p + i)) * 0x100000001b3; i = i + 1; } return h; }
+fn q_isdot(p, n) {
+    if (n == 1 && load8(p) == 46) { return 1; }
+    if (n == 2 && load8(p) == 46 && load8(p + 1) == 46) { return 1; }
+    return 0;
+}
+
+# 1 when the n bytes at p are valid UTF-8 (RFC 3629: no overlongs, no surrogates, <= U+10FFFF).
+fn q_utf8(p, n) {
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        var k = 0;
+        var lo = 0x80;
+        var hi = 0xBF;
+        if (c < 0x80) { k = 0; }
+        elif (c >= 0xC2 && c <= 0xDF) { k = 1; }
+        elif (c >= 0xE0 && c <= 0xEF) { k = 2; if (c == 0xE0) { lo = 0xA0; } if (c == 0xED) { hi = 0x9F; } }
+        elif (c >= 0xF0 && c <= 0xF4) { k = 3; if (c == 0xF0) { lo = 0x90; } if (c == 0xF4) { hi = 0x8F; } }
+        else { return 0; }
+        if (i + k >= n) { return 0; }                # the sequence runs past the end: cut inside a character
+        var j = 1;
+        while (j <= k) {
+            var cc = load8(p + i + j);
+            if (j == 1) { if (cc < lo || cc > hi) { return 0; } }
+            elif ((cc & 0xC0) != 0x80) { return 0; }
+            j = j + 1;
+        }
+        i = i + 1 + k;
+    }
+    return 1;
+}
+
+# ═══ The /ln fixture: the same eleven names on ext2 (seeded by the smoke) and on ZFS (created here) ═══
+# 0 a x70 · 1 a x62 · 2 b x62 "-one" · 3 b x62 "-two" · 4 short.txt · 5 c x61 é x5 · 6 d x60 € zz · 7 e x59 😀 q ·
+# 8 f x60 é y x4 · 9 g x70 (a directory) · 10 sub (a directory)
+fn ln_name(i, o) {
+    if (i == 0) { return q_fill(o, 97, 70); }
+    if (i == 1) { return q_fill(o, 97, 62); }
+    if (i == 2) { q_fill(o, 98, 62); q_cpy(o + 62, "-one", 4); return 66; }
+    if (i == 3) { q_fill(o, 98, 62); q_cpy(o + 62, "-two", 4); return 66; }
+    if (i == 4) { return q_cpy(o, "short.txt", 9); }
+    if (i == 5) { q_fill(o, 99, 61); store8(o + 61, 0xC3); store8(o + 62, 0xA9); q_fill(o + 63, 120, 5); return 68; }
+    if (i == 6) { q_fill(o, 100, 60); store8(o + 60, 0xE2); store8(o + 61, 0x82); store8(o + 62, 0xAC); q_fill(o + 63, 122, 2); return 65; }
+    if (i == 7) { q_fill(o, 101, 59); store8(o + 59, 0xF0); store8(o + 60, 0x9F); store8(o + 61, 0x98); store8(o + 62, 0x80); store8(o + 63, 113); return 64; }
+    if (i == 8) { q_fill(o, 102, 60); store8(o + 60, 0xC3); store8(o + 61, 0xA9); q_fill(o + 62, 121, 4); return 66; }
+    if (i == 9) { return q_fill(o, 103, 70); }
+    return q_cpy(o, "sub", 3);
+}
+fn ln_keep(i) {
+    if (i == 4) { return 9; }
+    if (i == 5) { return 61; }
+    if (i == 6) { return 60; }
+    if (i == 7) { return 59; }
+    if (i == 10) { return 3; }
+    return 62;
+}
+fn ln_flags(i) {
+    if (i == 1 || i == 4) { return 0; }
+    if (i == 9) { return 3; }
+    if (i == 10) { return 1; }
+    return 2;
+}
+fn ln_body(i) {
+    if (i == 0) { return "LONG-70"; }
+    if (i == 1) { return "SIBLING-62"; }
+    if (i == 2) { return "B-ONE"; }
+    if (i == 3) { return "B-TWO"; }
+    if (i == 4) { return "SHORT"; }
+    if (i == 5) { return "U2"; }
+    if (i == 6) { return "U3"; }
+    if (i == 7) { return "U4"; }
+    return "U1";
+}
+var LN_N = 11;
+
+# n readdir records at q_rec against the eleven: each must be exactly one unmatched entry's kept bytes, its length,
+# its flags, NUL-terminated and valid UTF-8. 0 / a code (the first record that matched nothing, +100).
+fn ln_match(n) {
+    if (n != LN_N) { return 1; }
+    var m = 0;
+    var r = 0;
+    while (r < n) {
+        var rec = &q_rec + r * 64;
+        var l = 0;
+        while (l < 63 && load8(rec + l) != 0) { l = l + 1; }
+        var fl = load8(rec + 63);
+        if (l > 62) { return 200 + r; }
+        if (q_utf8(rec, l) == 0) { return 300 + r; }
+        var found = 0 - 1;
+        var i = 0;
+        while (i < LN_N && found < 0) {
+            if (((m >> i) & 1) == 0 && l == ln_keep(i) && fl == ln_flags(i)) {
+                ln_name(i, &q_nm);
+                if (q_eq(rec, &q_nm, l) == 1) { found = i; }
+            }
+            i = i + 1;
+        }
+        if (found < 0) {
+            q_out("RDL-REC"); q_kv("r", r); q_kv("len", l); q_kv("flags", fl); q_kv("b0", load8(rec)); q_nl();
+            return 100 + r;
+        }
+        m = m | (1 << found);
+        r = r + 1;
+    }
+    return 0;
+}
+# getdents#29 of dir p: ".", "..", and every one of the eleven names WHOLE. 0 / a code.
+fn ln_whole(p) {
+    var fd = q_open(p, 0x800);
+    if (fd < 0) { return 1; }
+    var m = 0;
+    var dots = 0;
+    var other = 0;
+    var g = q_gdn(fd, &q_gd, 4096);
+    while (g > 0) {
+        var o = 0;
+        while (o < g) {
+            var rl = load16(&q_gd + o);
+            var nl = load8(&q_gd + o + 3);
+            var nm = &q_gd + o + 8;
+            if (q_isdot(nm, nl) == 1) { dots = dots + 1; }
+            else {
+                var hit = 0;
+                var i = 0;
+                while (i < LN_N) {
+                    var fl = ln_name(i, &q_nm);
+                    if (fl == nl && q_eq(nm, &q_nm, nl) == 1) { m = m | (1 << i); hit = 1; }
+                    i = i + 1;
+                }
+                if (hit == 0) { other = other + 1; }
+            }
+            if (rl < 8) { q_close(fd); return 2; }
+            o = o + rl;
+        }
+        g = q_gdn(fd, &q_gd, 4096);
+    }
+    q_close(fd);
+    if (g < 0) { return 3; }
+    if (dots != 2 || other != 0) { return 4; }
+    if (m != 0x7FF) { return 5; }
+    return 0;
+}
+# The backend's name in a marker: z 0 ext2 / 1 ZFS.
+fn q_be(z) { if (z == 0) { return "EXT2"; } return "ZFS"; }
+fn q_okz(a, z, b) { q_out(a); q_out(q_be(z)); q_out(b); q_nl(); Q_PASS = Q_PASS + 1; return 0; }
+fn q_failz(a, z, v) { q_out("RDL-FAIL-"); q_out(a); q_out(q_be(z)); q_kv("v", v); q_nl(); Q_FAIL = Q_FAIL + 1; return 0; }
+fn q_b(c) { if (c) { return 1; } return 0; }
+
+# #81 and #101 (paged 3 at a time) of the directory pc (a C string) against the eleven, then #29 whole.
+fn ph_list(pc, z) {
+    var n = syscall(81, pc, &q_rec, 64, 0);
+    var r = ln_match(n);
+    q_out("RDL-L-"); q_out(q_be(z)); q_kv("n81", n); q_kv("r", r); q_nl();
+    if (r == 0) { q_okz("RDL-L81-", z, "-OK"); } else { q_failz("L81-", z, r); }
+    # readdir_at#101, 3 records a call — the cut name and its sibling land in different batches somewhere
+    var cur[8];
+    store64(&cur, 0);
+    var tot = 0;
+    var guard = 0;
+    var bad = 0;
+    while (load64(&cur) != (0 - 1) && guard < 20 && bad == 0) {
+        var k = syscall(101, pc, &q_rec + tot * 64, 3, &cur);
+        if (k < 0 || k > 3) { bad = 1; } else { tot = tot + k; }
+        guard = guard + 1;
+    }
+    r = 900;
+    if (bad == 0) { r = ln_match(tot); }
+    q_out("RDL-L-"); q_out(q_be(z)); q_kv("n101", tot); q_kv("r", r); q_nl();
+    if (r == 0) { q_okz("RDL-L101-", z, "-OK"); } else { q_failz("L101-", z, r); }
+    # every name whole through getdents#29 (the ABI's answer for a name over 62 bytes)
+    r = ln_whole(pc);
+    if (r == 0) { q_okz("RDL-L29-", z, "-OK"); } else { q_failz("L29-", z, r); }
+    return 0;
+}
+
+# ═══ R — readlink#70 ═══
+# readlink p with cap; want ret; the bytes must be target[0..ret) and nothing at or past ret may be written.
+fn rl_one(p, cap, want, tgt, name) {
+    q_fill(&q_rb, 0xEE, cap + 16);
+    var r = q_rl(p, &q_rb, cap);
+    var ok = 1;
+    if (r != want) { ok = 0; }
+    if (ok == 1 && r > 0) { if (q_eq(&q_rb, tgt, r) == 0) { ok = 0; } }
+    var t = 0;
+    if (r > 0) { t = r; }
+    var j = t;
+    while (ok == 1 && j < cap + 16) { if (load8(&q_rb + j) != 0xEE) { ok = 0; } j = j + 1; }
+    if (ok == 0) {
+        q_out("RDL-RL "); q_out(p); q_kv("cap", cap); q_kv("ret", r); q_kv("want", want); q_nl();
+        q_fail(name, r);
+        return 1;
+    }
+    return 0;
+}
+fn tg_sl() { q_cpy(&q_tg, "/etc", 4); q_fill(&q_tg + 4, 47, 88); q_cpy(&q_tg + 92, "hostname", 8); return 100; }
+fn tg_4k() { q_cpy(&q_tg, "/etc/hostname", 13); q_fill(&q_tg + 13, 47, 4083); return 4096; }
+fn tg_zlong() {
+    var o = 0;
+    var i = 0;
+    while (i < 49) {
+        q_cpy(&q_tg + o, "seg-", 4);
+        store8(&q_tg + o + 4, 48 + i / 100);
+        store8(&q_tg + o + 5, 48 + (i / 10) % 10);
+        store8(&q_tg + o + 6, 48 + i % 10);
+        store8(&q_tg + o + 7, 47);
+        o = o + 8;
+        i = i + 1;
+    }
+    q_cpy(&q_tg + o, "target00", 8);
+    return o + 8;
+}
+fn ph_readlink() {
+    var bad = 0;
+    # ext2 FAST (13 bytes, inline)
+    q_cpy(&q_tg, "/etc/hostname", 13);
+    bad = bad + rl_one("/fl", 8, 8, &q_tg, "RL-EXT2-FAST-8");
+    bad = bad + rl_one("/fl", 12, 12, &q_tg, "RL-EXT2-FAST-12");
+    bad = bad + rl_one("/fl", 13, 13, &q_tg, "RL-EXT2-FAST-13");
+    bad = bad + rl_one("/fl", 64, 13, &q_tg, "RL-EXT2-FAST-64");
+    bad = bad + rl_one("/fl", 1, 1, &q_tg, "RL-EXT2-FAST-1");
+    if (bad == 0) { q_ok("RDL-RL-EXT2-FAST-OK"); }
+    # ext2 SLOW (100 bytes, one data block)
+    var b2 = 0;
+    tg_sl();
+    b2 = b2 + rl_one("/sl", 8, 8, &q_tg, "RL-EXT2-SLOW-8");
+    b2 = b2 + rl_one("/sl", 99, 99, &q_tg, "RL-EXT2-SLOW-99");
+    b2 = b2 + rl_one("/sl", 100, 100, &q_tg, "RL-EXT2-SLOW-100");
+    b2 = b2 + rl_one("/sl", 4096, 100, &q_tg, "RL-EXT2-SLOW-4096");
+    if (b2 == 0) { q_ok("RDL-RL-EXT2-SLOW-OK"); }
+    # ext2 SLOW at the format's bound: i_size == the 4096-byte block
+    var b3 = 0;
+    tg_4k();
+    b3 = b3 + rl_one("/el4k", 8, 8, &q_tg, "RL-EXT2-4K-8");
+    b3 = b3 + rl_one("/el4k", 8192, 4096, &q_tg, "RL-EXT2-4K-8192");
+    if (b3 == 0) { q_ok("RDL-RL-EXT2-4K-OK"); }
+    # cap 0 is refused (Linux: EINVAL); a non-link is -1 at any cap
+    var c0 = q_rl("/fl", &q_rb, 0);
+    var nl8 = q_rl("/etc/hostname", &q_rb, 8);
+    q_out("RDL-RL0"); q_kv("cap0", c0); q_kv("file8", nl8); q_nl();
+    if (c0 == 0 - 1 && nl8 == 0 - 1) { q_ok("RDL-RL-REFUSALS-OK"); } else { q_fail("RL-REFUSALS", c0); }
+    # ⭐ cyrius lib/fs.cyr is_symlink: `sys_readlink(path, n, &lbuf, 8) >= 0` — a link with a 100-byte target answers
+    var b8[8];
+    var s1 = syscall(70, "/sl", 3, &b8, 8);
+    var s2 = syscall(70, "/fl", 3, &b8, 8);
+    q_out("RDL-ISLINK"); q_kv("sl", s1); q_kv("fl", s2); q_nl();
+    if (s1 >= 0 && s2 >= 0) { q_ok("RDL-ISLINK-PROBE-OK"); } else { q_fail("ISLINK-PROBE", s1); }
+    return 0;
+}
+
+# ═══ F — the kernel follower ═══
+fn f_reads_hostname(p) {
+    var fd = q_open(p, 0);
+    if (fd < 0) { return 0 - 1; }
+    var b[4];
+    var n = syscall(5, fd, &b, 32, 0);
+    q_close(fd);
+    if (n != 12) { return 0 - 2; }
+    if (q_eq(&b, "archaemenid\n", 12) == 0) { return 0 - 3; }
+    return 0;
+}
+fn ph_follow() {
+    var eo = q_open("/evil", 0);
+    if (eo >= 0) { q_close(eo); }
+    var es = syscall(33, "/evil", 5, &q_st, 0);
+    var er = q_rl("/evil", &q_rb, 8192);
+    var er8 = q_rl("/evil", &q_rb, 8);
+    q_out("RDL-EVIL"); q_kv("open", eo); q_kv("stat", es); q_kv("rl8192", er); q_kv("rl8", er8); q_nl();
+    if (eo < 0 && es != 0) { q_ok("RDL-FOLLOW-REFUSED-OK"); } else { q_fail("FOLLOW-REFUSED", eo); }
+    if (er == 0 - 1 && er8 == 0 - 1) { q_ok("RDL-EVIL-READLINK-REFUSED-OK"); } else { q_fail("EVIL-READLINK-REFUSED", er); }
+    var a = f_reads_hostname("/el4k");
+    var b = f_reads_hostname("/sl");
+    var c = f_reads_hostname("/fl");
+    q_out("RDL-FOLLOWS"); q_kv("el4k", a); q_kv("sl", b); q_kv("fl", c); q_nl();
+    if (a == 0 && b == 0 && c == 0) { q_ok("RDL-FOLLOW-LEGAL-OK"); } else { q_fail("FOLLOW-LEGAL", a); }
+    return 0;
+}
+
+# ═══ G — getdents#29 never answers "end" for a buffer too small ═══
+fn ph_small(p, z) {
+    var fd = q_open(p, 0x800);
+    if (fd < 0) { q_failz("G-OPEN-", z, fd); return 0; }
+    var g = 1;
+    var calls = 0;
+    var pos = 0;
+    while (g > 0 && calls < 64) { pos = q_lseek(fd, 0, 1); g = q_gdn(fd, &q_gd, 16); calls = calls + 1; }
+    var after = q_lseek(fd, 0, 1);
+    var big = q_gdn(fd, &q_gd, 4096);
+    var nl = 0;
+    if (big > 0) { nl = load8(&q_gd + 3); }
+    q_close(fd);
+    q_out("RDL-G-"); q_out(q_be(z)); q_kv("g", g); q_kv("calls", calls); q_kv("pos", pos); q_kv("after", after);
+    q_kv("big", big); q_kv("nl", nl); q_nl();
+    if (g == 0 - 1 && after == pos && big > 0 && nl > 8) { q_okz("RDL-G-", z, "-OK"); } else { q_failz("G-", z, g); }
+    return 0;
+}
+
+# ═══ S — lseek#58 on a directory fd ═══
+# One pass, the fd held, 4096-byte getdents: the sequence hash of path's entries (dots included). Count / -1.
+fn s_single(p, pl) {
+    q_hreset();
+    var fd = q_openl(p, pl, 0x800);
+    if (fd < 0) { return 0 - 1; }
+    var g = q_gdn(fd, &q_gd, 4096);
+    while (g > 0) {
+        var o = 0;
+        while (o < g) {
+            var rl = load16(&q_gd + o);
+            q_hmix(&q_gd + o + 8, load8(&q_gd + o + 3), load8(&q_gd + o + 2));
+            if (rl < 8) { q_close(fd); return 0 - 1; }
+            o = o + rl;
+        }
+        g = q_gdn(fd, &q_gd, 4096);
+    }
+    q_close(fd);
+    if (g < 0) { return 0 - 1; }
+    return Q_HN;
+}
+# The same in batch-byte getdents calls, CLOSING the fd after each and reopening + lseek(cookie) before the next.
+# When idx == 1, every batch's cookie and first entry, and every entry's name hash, are recorded (q_ccook, q_cstart,
+# q_ent). Count / -1 (a refused or wrong lseek: -2).
+fn s_resumed(p, pl, batch, idx) {
+    q_hreset();
+    var ck = 0;
+    Q_ENT = 0;
+    Q_CALL = 0;
+    var guard = 0;
+    while (guard < 4000) {
+        var fd = q_openl(p, pl, 0x800);
+        if (fd < 0) { return 0 - 1; }
+        if (q_lseek(fd, ck, 0) != ck) { q_close(fd); return 0 - 2; }
+        var g = q_gdn(fd, &q_gd, batch);
+        if (g > 0) { var nck = q_lseek(fd, 0, 1); if (idx == 1 && Q_CALL < 128) { store64(&q_ccook + Q_CALL * 8, ck); store64(&q_cstart + Q_CALL * 8, Q_ENT); } ck = nck; Q_CALL = Q_CALL + 1; }
+        q_close(fd);
+        if (g < 0) { return 0 - 1; }
+        if (g == 0) { return Q_HN; }
+        var o = 0;
+        while (o < g) {
+            var rl = load16(&q_gd + o);
+            var nl = load8(&q_gd + o + 3);
+            q_hmix(&q_gd + o + 8, nl, load8(&q_gd + o + 2));
+            if (idx == 1 && Q_ENT < 512) { store64(&q_ent + Q_ENT * 8, q_nhash(&q_gd + o + 8, nl)); }
+            Q_ENT = Q_ENT + 1;
+            if (rl < 8) { return 0 - 1; }
+            o = o + rl;
+        }
+        guard = guard + 1;
+    }
+    return 0 - 1;
+}
+# From cookie ck (+ whatever), list path to the end with the fd held and compare every entry's name hash to q_ent
+# from index s on. 0 when exactly q_ent[s..Q_ENT) came back, else a code.
+fn s_from(p, pl, ck, s) {
+    var fd = q_openl(p, pl, 0x800);
+    if (fd < 0) { return 1; }
+    if (q_lseek(fd, ck, 0) != ck) { q_close(fd); return 2; }
+    var j = s;
+    var g = q_gdn(fd, &q_gd, 4096);
+    while (g > 0) {
+        var o = 0;
+        while (o < g) {
+            var rl = load16(&q_gd + o);
+            var h = q_nhash(&q_gd + o + 8, load8(&q_gd + o + 3));
+            if (j >= Q_ENT || j >= 512) { q_close(fd); return 3; }
+            if (load64(&q_ent + j * 8) != h) { q_close(fd); return 4; }
+            j = j + 1;
+            if (rl < 8) { q_close(fd); return 5; }
+            o = o + rl;
+        }
+        g = q_gdn(fd, &q_gd, 4096);
+    }
+    q_close(fd);
+    if (g < 0) { return 6; }
+    if (j != Q_ENT) { return 7; }
+    return 0;
+}
+
+# The tree walks. q_wp[0..pl) is the directory; every entry below it is mixed as its full path + type.
+# One fd per level, held across the descent (the reference).
+fn w_ref(pl, d) {
+    if (d >= 16) { Q_WERR = Q_WERR + 1; return 0; }
+    var fd = q_openl(&q_wp, pl, 0x800);
+    if (fd < 0) { q_hmix(&q_wp, pl, 33); return 0; }
+    var b = &q_wref + d * 3072;
+    var g = q_gdn(fd, b, 3072);
+    while (g > 0) {
+        var o = 0;
+        while (o < g) {
+            var rl = load16(b + o);
+            var ty = load8(b + o + 2);
+            var nl = load8(b + o + 3);
+            if (q_isdot(b + o + 8, nl) == 0) {
+                store8(&q_wp + pl, 47);
+                q_cpy(&q_wp + pl + 1, b + o + 8, nl);
+                var cl = pl + 1 + nl;
+                q_hmix(&q_wp, cl, ty);
+                if (ty == 2) { w_ref(cl, d + 1); }
+            }
+            if (rl < 8) { Q_WERR = Q_WERR + 1; q_close(fd); return 0; }
+            o = o + rl;
+        }
+        g = q_gdn(fd, b, 3072);
+    }
+    if (g < 0) { q_hmix(&q_wp, pl, 69); }
+    q_close(fd);
+    return 0;
+}
+# NO fd held across a descent: open, lseek(cookie), one small batch, lseek(fd, 0, SEEK_CUR) for the next cookie,
+# close — then the batch's entries, descending into each directory.
+fn w_res(pl, d) {
+    if (d >= 16) { Q_WERR = Q_WERR + 1; return 0; }
+    var ck = 0;
+    var b = &q_wres + d * 384;
+    var guard = 0;
+    while (guard < 4000) {
+        var fd = q_openl(&q_wp, pl, 0x800);
+        if (fd < 0) { if (ck == 0) { q_hmix(&q_wp, pl, 33); } else { Q_WERR = Q_WERR + 1; } return 0; }
+        if (q_lseek(fd, ck, 0) != ck) { Q_WERR = Q_WERR + 1; q_close(fd); return 0; }
+        var g = q_gdn(fd, b, 300);
+        if (g > 0) { ck = q_lseek(fd, 0, 1); }
+        q_close(fd);
+        if (g < 0) { q_hmix(&q_wp, pl, 69); return 0; }
+        if (g == 0) { return 0; }
+        var o = 0;
+        while (o < g) {
+            var rl = load16(b + o);
+            var ty = load8(b + o + 2);
+            var nl = load8(b + o + 3);
+            if (q_isdot(b + o + 8, nl) == 0) {
+                store8(&q_wp + pl, 47);
+                q_cpy(&q_wp + pl + 1, b + o + 8, nl);
+                var cl = pl + 1 + nl;
+                q_hmix(&q_wp, cl, ty);
+                if (ty == 2) { w_res(cl, d + 1); }
+            }
+            if (rl < 8) { Q_WERR = Q_WERR + 1; return 0; }
+            o = o + rl;
+        }
+        guard = guard + 1;
+    }
+    Q_WERR = Q_WERR + 1;
+    return 0;
+}
+# Walk root (a C string) both ways: 0 when the two visit the same sequence, else a code. Prints the count.
+fn s_walks(root, tag) {
+    var rl = q_len(root);
+    q_cpy(&q_wp, root, rl);
+    Q_WERR = 0;
+    q_hreset();
+    w_ref(rl, 0);
+    var h1 = Q_H;
+    var n1 = Q_HN;
+    var e1 = Q_WERR;
+    q_cpy(&q_wp, root, rl);
+    Q_WERR = 0;
+    q_hreset();
+    w_res(rl, 0);
+    q_out("RDL-TW-"); q_out(tag); q_kv("n", n1); q_kv("nres", Q_HN); q_kv("same", q_b(h1 == Q_H)); q_kv("err", e1 + Q_WERR); q_nl();
+    if (e1 != 0 || Q_WERR != 0) { return 1; }
+    if (n1 != Q_HN) { return 2; }
+    if (h1 != Q_H) { return 3; }
+    if (n1 < 2) { return 4; }
+    return 0;
+}
+
+fn ph_seek_ext2() {
+    var mp = "/tw/many";
+    var ml = q_len(mp);
+    # resume across close/reopen == one pass
+    var n1 = s_single(mp, ml);
+    var h1 = Q_H;
+    var n2 = s_resumed(mp, ml, 300, 1);
+    q_out("RDL-S-EXT2"); q_kv("single", n1); q_kv("resumed", n2); q_kv("calls", Q_CALL); q_kv("same", q_b(h1 == Q_H)); q_nl();
+    if (n1 > 300 && n1 == n2 && h1 == Q_H && Q_CALL > 4) { q_ok("RDL-S-EXT2-RESUME-OK"); } else { q_fail("S-EXT2-RESUME", n2); }
+    # a cookie + 1..12 (inside the record's header or name) resumes at the NEXT record; + 0 at the record itself
+    var k = Q_CALL / 2;
+    var ck = load64(&q_ccook + k * 8);
+    var st = load64(&q_cstart + k * 8);
+    var d0 = s_from(mp, ml, ck, st);
+    var bad = 0;
+    var dl = 1;
+    while (dl <= 12) {
+        var rr = s_from(mp, ml, ck + dl, st + 1);
+        if (rr != 0) { q_out("RDL-S-SNAP"); q_kv("delta", dl); q_kv("r", rr); q_nl(); bad = bad + 1; }
+        dl = dl + 1;
+    }
+    q_out("RDL-S-SNAP"); q_kv("call", k); q_kv("cookie", ck); q_kv("start", st); q_kv("d0", d0); q_kv("bad", bad); q_nl();
+    if (d0 == 0 && bad == 0) { q_ok("RDL-S-EXT2-SNAP-OK"); } else { q_fail("S-EXT2-SNAP", bad); }
+    # refusals: negative (SEEK_SET and SEEK_CUR), SEEK_END; the position unchanged by each; past the end lists nothing
+    var fd = q_openl(mp, ml, 0x800);
+    var a = q_lseek(fd, 32, 0);
+    var b = q_lseek(fd, 0 - 8, 0);
+    var c = q_lseek(fd, 0 - 64, 1);
+    var e = q_lseek(fd, 0, 2);
+    var cur = q_lseek(fd, 0, 1);
+    # still 32 (inside m000-'s record, 24..40): snapped to 40, one 16-byte record. Were a negative position accepted,
+    # ext2_getdents refuses it (-1) — the second wall
+    var gn = q_gdn(fd, &q_gd, 16);
+    var f = q_lseek(fd, 0x10000000000, 0);
+    var g = q_gdn(fd, &q_gd, 4096);
+    var h = q_lseek(fd, 8, 1);
+    q_close(fd);
+    q_out("RDL-S-REF"); q_kv("set32", a); q_kv("neg", b); q_kv("curneg", c); q_kv("end", e); q_kv("cur", cur);
+    q_kv("g32", gn); q_kv("far", f); q_kv("gfar", g); q_kv("cur8", h); q_nl();
+    if (a == 32 && b == 0 - 1 && c == 0 - 1 && e == 0 - 1 && cur == 32 && gn == 16 && f == 0x10000000000 && g == 0 && h >= 8) {
+        q_ok("RDL-S-EXT2-REFUSE-OK");
+    } else { q_fail("S-EXT2-REFUSE", b); }
+    # readdir_at#101's cursor snaps the same way (aligned but inside a record: the next one; misaligned: still -5)
+    var cu[8];
+    store64(&cu, 0);
+    var na = syscall(101, "/tw/many", &q_rec, 400, &cu);
+    var i = 0;
+    while (i < na && i < 512) {
+        var rec = &q_rec + i * 64;
+        store64(&q_rah + i * 8, q_nhash(rec, q_len(rec)));
+        i = i + 1;
+    }
+    store64(&cu, 0);
+    var n5 = syscall(101, "/tw/many", &q_rec, 5, &cu);
+    var c5 = load64(&cu);
+    store64(&cu, c5 + 4);
+    var nb = syscall(101, "/tw/many", &q_rec, 400, &cu);
+    var ok = 1;
+    if (nb != na - 6) { ok = 0; }
+    i = 0;
+    while (ok == 1 && i < nb) {
+        var rec2 = &q_rec + i * 64;
+        if (q_nhash(rec2, q_len(rec2)) != load64(&q_rah + (i + 6) * 8)) { ok = 0; }
+        i = i + 1;
+    }
+    store64(&cu, c5 + 1);
+    var mis = syscall(101, "/tw/many", &q_rec, 400, &cu);
+    q_out("RDL-S-RA"); q_kv("all", na); q_kv("n5", n5); q_kv("c5", c5); q_kv("from+4", nb); q_kv("mis", mis); q_nl();
+    if (ok == 1 && n5 == 5 && mis == 0 - 5) { q_ok("RDL-S-EXT2-RA-SNAP-OK"); } else { q_fail("S-EXT2-RA-SNAP", nb); }
+    # the whole tree, walked with no fd held across a descent
+    var w = s_walks("/tw", "EXT2");
+    if (w == 0) { q_ok("RDL-S-EXT2-TREE-OK"); } else { q_fail("S-EXT2-TREE", w); }
+    return 0;
+}
+
+# ═══ Z — the ZFS mount ═══
+fn z_mk() {
+    var base = "/mnt/zfs/somewhere/else/ln";
+    var bl = q_len(base);
+    var mk = syscall(9, base, bl, 0, 0);
+    var bad = 0;
+    if (mk != 0) { bad = bad + 1; }
+    var i = 0;
+    while (i < LN_N) {
+        q_cpy(&q_p, base, bl);
+        store8(&q_p + bl, 47);
+        var nl = ln_name(i, &q_p + bl + 1);
+        var pl = bl + 1 + nl;
+        store8(&q_p + pl, 0);
+        if (i == 9 || i == 10) {
+            if (syscall(9, &q_p, pl, 0, 0) != 0) { bad = bad + 1; q_out("RDL-ZMK-DIR"); q_kv("i", i); q_nl(); }
+        } else {
+            var fd = q_openl(&q_p, pl, 0x2101);
+            if (fd < 0) { bad = bad + 1; q_out("RDL-ZMK-FILE"); q_kv("i", i); q_kv("fd", fd); q_nl(); }
+            else {
+                var bd = ln_body(i);
+                syscall(1, fd, bd, q_len(bd), 0);
+                q_close(fd);
+            }
+        }
+        i = i + 1;
+    }
+    q_out("RDL-ZMK"); q_kv("mkdir", mk); q_kv("bad", bad); q_nl();
+    if (bad == 0) { q_ok("RDL-Z-CREATE-OK"); } else { q_fail("Z-CREATE", bad); }
+    return 0;
+}
+fn z_root81() {
+    var n = syscall(81, "/mnt/zfs/agnostank", &q_rec, 400, 0);
+    var cut = 0;
+    var cutok = 0;
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        var rec = &q_rec + i * 64;
+        var l = q_len(rec);
+        var fl = load8(rec + 63);
+        if ((fl & 2) != 0) {
+            cut = cut + 1;
+            q_fill(&q_nm, 120, 62);
+            q_cpy(&q_nm, "long-", 5);
+            if (l == 62 && fl == 2 && q_eq(rec, &q_nm, 62) == 1) { cutok = 1; }
+        }
+        if (q_utf8(rec, l) == 0 || l > 62 || (fl & 0xFC) != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    q_out("RDL-Z81"); q_kv("n", n); q_kv("cut", cut); q_kv("cutok", cutok); q_kv("bad", bad); q_nl();
+    if (n > 20 && cut == 1 && cutok == 1 && bad == 0) { q_ok("RDL-Z81-ROOT-OK"); } else { q_fail("Z81-ROOT", cut); }
+    return 0;
+}
+fn z_readlink() {
+    var bad = 0;
+    q_cpy(&q_tg, "hello.txt", 9);
+    bad = bad + rl_one("/mnt/zfs/agnostank/sym-short", 4, 4, &q_tg, "RL-ZFS-SHORT-4");
+    bad = bad + rl_one("/mnt/zfs/agnostank/sym-short", 9, 9, &q_tg, "RL-ZFS-SHORT-9");
+    bad = bad + rl_one("/mnt/zfs/agnostank/sym-short", 64, 9, &q_tg, "RL-ZFS-SHORT-64");
+    var zl = tg_zlong();
+    bad = bad + rl_one("/mnt/zfs/agnostank/sym-long", 8, 8, &q_tg, "RL-ZFS-LONG-8");
+    bad = bad + rl_one("/mnt/zfs/agnostank/sym-long", zl - 1, zl - 1, &q_tg, "RL-ZFS-LONG-M1");
+    bad = bad + rl_one("/mnt/zfs/agnostank/sym-long", zl, zl, &q_tg, "RL-ZFS-LONG-N");
+    bad = bad + rl_one("/mnt/zfs/agnostank/sym-long", 2048, zl, &q_tg, "RL-ZFS-LONG-2048");
+    q_out("RDL-ZRL"); q_kv("long", zl); q_kv("bad", bad); q_nl();
+    if (bad == 0) { q_ok("RDL-RL-ZFS-OK"); }
+    # the is_symlink probe shape on ZFS, and a ZFS file is still -1
+    var b8[8];
+    var s1 = syscall(70, "/mnt/zfs/agnostank/sym-long", 27, &b8, 8);
+    var s2 = syscall(70, "/mnt/zfs/agnostank/hello.txt", 28, &b8, 8);
+    q_out("RDL-ZISLINK"); q_kv("long", s1); q_kv("file", s2); q_nl();
+    if (s1 == 8 && s2 == 0 - 1) { q_ok("RDL-ISLINK-ZFS-OK"); } else { q_fail("ISLINK-ZFS", s1); }
+    return 0;
+}
+# getdents of dir3000 from cookie ck: every record a genuine "fNNNN" (or a dot only where dots says so), none twice.
+# The count of names / -1 on a forged or repeated one.
+fn z_genuine(fd, dots) {
+    var i = 0;
+    while (i < 512) { store8(&q_seen + i, 0); i = i + 1; }
+    var cnt = 0;
+    var g = q_gdn(fd, &q_gd, 4096);
+    var first = 1;
+    while (g > 0) {
+        var o = 0;
+        while (o < g) {
+            var rl = load16(&q_gd + o);
+            var nl = load8(&q_gd + o + 3);
+            var nm = &q_gd + o + 8;
+            if (q_isdot(nm, nl) == 1) {
+                if (dots == 0) { return 0 - 1; }
+                if (first == 1 && nl != 2) { return 0 - 1; }
+            } else {
+                if (nl != 5 || load8(nm) != 102) { return 0 - 1; }
+                var v = (load8(nm + 1) - 48) * 1000 + (load8(nm + 2) - 48) * 100 + (load8(nm + 3) - 48) * 10 + (load8(nm + 4) - 48);
+                if (v < 0 || v >= 3000) { return 0 - 1; }
+                var bit = 1 << (v & 7);
+                if ((load8(&q_seen + (v >> 3)) & bit) != 0) { return 0 - 1; }
+                store8(&q_seen + (v >> 3), load8(&q_seen + (v >> 3)) | bit);
+                cnt = cnt + 1;
+            }
+            first = 0;
+            if (rl < 8) { return 0 - 1; }
+            o = o + rl;
+        }
+        g = q_gdn(fd, &q_gd, 4096);
+    }
+    if (g < 0) { return 0 - 1; }
+    return cnt;
+}
+fn z_seek() {
+    var dp = "/mnt/zfs/agnostank/dir3000";
+    var dl = q_len(dp);
+    var n1 = s_single(dp, dl);
+    var h1 = Q_H;
+    var n2 = s_resumed(dp, dl, 300, 0);
+    q_out("RDL-S-ZFS"); q_kv("single", n1); q_kv("resumed", n2); q_kv("calls", Q_CALL); q_kv("same", q_b(h1 == Q_H)); q_nl();
+    if (n1 == 3002 && n2 == 3002 && h1 == Q_H && Q_CALL > 100) { q_ok("RDL-S-ZFS-RESUME-OK"); } else { q_fail("S-ZFS-RESUME", n2); }
+    # hostile cookies
+    var fd = q_openl(dp, dl, 0x800);
+    var a = q_lseek(fd, 0 - 8, 0);
+    var b = q_lseek(fd, 0, 2);
+    var c = q_lseek(fd, 0, 1);
+    # still 0: "." (16 bytes). Were a negative cursor accepted, zfs_dir_next refuses it (-1) — the second wall: its dots
+    # arm would store a NUL at ZR_NAME + c + 1
+    var gneg = q_gdn(fd, &q_gd, 16);
+    var p1 = q_lseek(fd, 2 + (1 << 20) + 7, 0);
+    var gz = z_genuine(fd, 0);
+    var p2 = q_lseek(fd, 0x0FFFFFFFFFFFFFF0, 0);
+    var g2 = q_gdn(fd, &q_gd, 4096);
+    var p3 = q_lseek(fd, 0x1000000000000000 + 100000, 0);
+    var g3 = q_gdn(fd, &q_gd, 4096);
+    var p4 = q_lseek(fd, 1, 0);
+    var g4 = z_genuine(fd, 1);
+    q_close(fd);
+    q_out("RDL-S-ZREF"); q_kv("neg", a); q_kv("end", b); q_kv("cur", c); q_kv("g0", gneg); q_kv("zap", p1); q_kv("zapn", gz);
+    q_kv("pastzap", g2); q_kv("pastx", g3); q_kv("from1", g4); q_nl();
+    if (a == 0 - 1 && b == 0 - 1 && c == 0 && gneg == 16 && p1 > 0 && gz >= 0 && p2 > 0 && g2 == 0 && p3 > 0 && g3 == 0 && p4 == 1 && g4 == 3000) {
+        q_ok("RDL-S-ZFS-HOSTILE-OK");
+    } else { q_fail("S-ZFS-HOSTILE", gz); }
+    var w = s_walks("/mnt/zfs/agnostank", "ZFS");
+    if (w == 0) { q_ok("RDL-S-ZFS-TREE-OK"); } else { q_fail("S-ZFS-TREE", w); }
+    return 0;
+}
+
+fn main(): i64 {
+    q_out("RDL-BEGIN"); q_nl();
+    ph_list("/ln", 0);
+    ph_readlink();
+    ph_follow();
+    ph_small("/ln", 0);
+    ph_seek_ext2();
+    z_mk();
+    ph_list("/mnt/zfs/somewhere/else/ln", 1);
+    ph_small("/mnt/zfs/somewhere/else/ln", 1);
+    z_root81();
+    z_readlink();
+    z_seek();
+    q_out("RDL-DONE"); q_kv("pass", Q_PASS); q_kv("fail", Q_FAIL); q_nl();
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, 0); return r; }
+_entry();

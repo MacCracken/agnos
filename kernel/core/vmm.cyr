@@ -137,8 +137,15 @@ fn vmm_remap_uc_2mb(phys) {
 
 # Remap a 2MB chunk as Write-Combining (WC). Flag bits: PWT=1 (bit 3),
 # PCD=0 (bit 4 clear), PAT-bit=0 (bit 12 clear) on the controlling PDE.
-# Selects PAT entry 1 = WC under the firmware-default PAT MSR
-# (0x0007040600070406, where PA1=WC per Attempt-43 audit).
+# Selects PAT entry 1, which is WC ONLY BECAUSE pat_init_cpu (below) MAKES IT SO.
+# ⛔ 1.57.18 — UNTIL THEN IT WAS WRITE-THROUGH. The firmware-default PAT MSR is
+# 0x0007040600070406 and its byte 1 is 0x04 = WT (SDM Vol.3 11.12.2: 00 UC, 01 WC,
+# 04 WT, 05 WP, 06 WB, 07 UC-); the Attempt-43 audit read it as WC, and the headers
+# here and in fb_console.cyr repeated that. Every framebuffer store since was a
+# write-through store: measured under KVM (AMD, 2048x2048) a 16 MB console flush took
+# 183 ms with `rep movsq` and 0.8 ms once entry 1 was WC (issue 2026-11-06-the-console-
+# is-short-of-a-terminal). Linux programs the same entry the same way (pat_bp_init:
+# PAT1 = WC). The vmm_remap_uc_2mb header's "PA1=WC" is the same misreading.
 #
 # For framebuffers: WC coalesces CPU pixel writes into burst transactions
 # to the display controller, eliminating the WB-cached eviction-timing
@@ -152,6 +159,26 @@ fn vmm_remap_uc_2mb(phys) {
 # (0x9B = UC vs 0x8B = WC).
 #
 # Returns 1 on success, 0 on pmm_alloc failure.
+#
+# ⭐ pat_init_cpu — program THIS CPU's PAT MSR (0x277) so entry 1 is WC: the CPU's own value with byte 1 rewritten
+# (0x04 WT at reset -> 0x01 WC). Every other entry keeps whatever it held (at reset PA0 WB, PA2 UC-, PA3 UC — what
+# vmm_remap_uc_2mb's 0x9B selects), so the ONLY mappings whose type changes are the PWT-only ones: this file's WC
+# remaps (the framebuffer, the DCN pan / back buffers). The PAT is per CPU, so the BSP calls this before its first WC
+# remap (main.cyr) and every AP in ap_entry (smp.cyr) before it can run anything that paints: two CPUs mapping the
+# same frame WC on one and WT on the other is a memory-type alias the SDM leaves undefined (11.12.4). Then wbinvd (no
+# line cached under the old type survives) and a CR3 reload (no TLB entry carries it) — Linux pat_cpu_init writes the
+# MSR and flushes the TLB; the wbinvd is the SDM 11.11.8 belt, once per CPU at boot.
+# asm contract (the CR3 reload): `mov rax, cr3; mov cr3, rax` — clobbers rax only.
+var pat_fw_value = 0;          # the BSP's PAT before pat_init_cpu rewrote entry 1 (fb_verify_wc reports it)
+fn pat_init_cpu(is_bsp) {
+    var pv = rdmsr(0x277);
+    if (is_bsp == 1) { pat_fw_value = pv; }
+    wrmsr(0x277, (pv & (0 - 1 - 0xFF00)) | 0x0100);
+    wbinvd();
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+    return 0;
+}
 fn vmm_remap_wc_2mb(phys) {
     var chunk = phys & 0xFFFFFFFFFFE00000;
     if (phys < 0x40000000) {

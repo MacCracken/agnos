@@ -248,6 +248,11 @@ fi
 strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}syswr: exFAT write+readback OK" \
     && echo "  PASS: 1.41.7 syscall write+read-back over exFAT (open/write/close ABI)" \
     || { echo "  FAIL: 1.41.7 syscall exFAT write (no 'syswr: exFAT write+readback OK')"; rc=1; }
+# 1.57.18 — fsync#115 on the exFAT write-back fd: its 16 bytes readable through another fd BEFORE the close, the fd kept
+# (4 more bytes land at the close: 20).
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}syswr: exFAT fsync#115 write-through OK" \
+    && echo "  PASS: 1.57.18 fsync#115 on an exFAT write-back fd wrote its buffer through before the close, the fd kept" \
+    || { echo "  FAIL: 1.57.18 fsync#115 over exFAT ($(strings "$LOG" | grep -o 'syswr: exFAT fsync#115.*' | head -1))"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

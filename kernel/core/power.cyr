@@ -539,3 +539,532 @@ fn power_stop_final() {
     arch_halt();
     return 0;
 }
+
+# === The power source: power_source#114 (1.57.18) ============================
+#
+# Issue 2026-11-06-no-way-to-read-the-power-source (daimon 2.5.4: crab's index "pauses on battery"). Operator
+# ruling 2026-11-08: answer from an ACPI NAMESPACE SCAN at boot. No AML interpreter and no EC driver this cut.
+#
+# WHAT MAINSTREAM KERNELS DO, AND WHERE THIS DEPARTS. Linux binds drivers/acpi/battery.c to every PNP0C0A device
+# and drivers/acpi/ac.c to every ACPI0003 one; the answer comes from EVALUATING AML — acpi_bus_get_status runs _STA,
+# ac.c runs _PSR (1 = on line), battery.c runs _BST — through ACPICA, which walks the namespace it built by loading
+# the DSDT and every SSDT (acpi_ns_walk_namespace). FreeBSD's acpi_acad.c / acpi_cmbat.c do the same through the same
+# ACPICA. systemd's on_ac_power() then reads /sys/class/power_supply: an online Mains supply says AC, an offline one
+# says battery, and NO Mains supply at all says AC (the desktop case); upower's on-battery needs a discharging battery.
+# agnos has no interpreter, so it PATTERN-MATCHES the bytes instead of evaluating them, like acpi_find_s5 does for
+# \_S5_. That can answer exactly one of the three questions honestly:
+#   no battery device declared anywhere          -> MAINS (inferred: nothing else could power the machine — the
+#                                                   on_ac_power / upower answer for a box with no battery);
+#   every declared battery's _STA is a CONSTANT  -> MAINS (desktop firmware declares a disabled battery this way);
+#     with bit 0 (present) clear
+#   any other battery                            -> CANNOT SAY: only _PSR / _BST evaluation could answer, and the
+#                                                   BATTERY state (2) stays reserved for that interpreter;
+#   no usable ACPI tables, or a table fails a    -> CANNOT SAY.
+#     bound check
+# An AC adapter (ACPI0003) is REPORTED, never decisive: without a battery the machine cannot be off mains, and with
+# one only _PSR could say whether the line is up (upower likewise derives on-battery from the batteries).
+#
+# THE SCAN. DSDT (FADT X_DSDT/DSDT) + every SSDT the XSDT (else the RSDT) lists. Per table: signature, length in
+# [36, 1 MB], checksum; then one pass over the AML body that does two independent things:
+#   1. FLAT: counts every battery-ID constant anywhere (EISAID PNP0C0A as DWordConst 0x0A0CD041 or a QWordConst of
+#      it; the strings "PNP0C0A" and "ACPI0002" — the smart-battery subsystem, Linux sbs.c, is a battery too).
+#   2. DEVICES: every DeviceOp (5B 82) with a well-formed PkgLength and NameString is scanned for its OWN direct
+#      objects (nested Devices are skipped — the outer pass scans them for themselves): Name(_HID/_CID, <id>) with
+#      _CID as one id or a Package of them, and every _STA — Name(_STA, k), or Method(_STA) whose whole body is
+#      Return(k).
+# A battery counts as ABSENT only when its body names "_STA" exactly once (a device that Stores to or otherwise
+# names its own _STA is not constant) and every reading of that _STA is a constant with bit 0 clear. Any battery-ID
+# constant the device pass did not attribute to a _HID/_CID (a Method(_HID), an id in a Scope, a byte-scan
+# ambiguity) counts as a PRESENT battery. So every doubt lands on "cannot say", never on "mains".
+# ⚠ Departures recorded: (a) Linux reads battery presence from _STA bit 4 (acpi_battery_present); a slot whose _STA
+#   is a constant with bit 0 set and bit 4 clear is "cannot say" here, where Linux would report no battery inserted.
+#   (b) A Name(_STA, 0) that a method in ANOTHER scope Stores into is read as absent: only evaluation sees that.
+#   (c) Tables loaded at run time (Load / LoadTable from _OSC or _PDC) are not scanned; firmware ships batteries in
+#   the static DSDT/SSDTs.
+# ⛔ Every read is bounded by the table it is in (a device's objects by the device's own extent), every PkgLength is
+#   checked against its container, and the total scanned is capped (16 MB, 256 SSDTs): a malformed table can make the
+#   answer "cannot say" (PSRC_F_MALFORMED), never fault or loop. Runs from acpi_init (BSP, boot, pre-scheduler, IF
+#   either way, no lock); re-run by TSC_SELFTEST's acpi_fadt_reset_selftest, so it is a pure function of the tables.
+#
+# THE ANSWER IS ONE WORD, CACHED: psrc_word, published by ONE aligned 8-byte store at the end of the scan.
+# power_source#114 returns it — no pointer, no lock, no blocking — so a 10 s poll costs one load.
+var PSRC_UNKNOWN    = 0;       # w & 0xFF: cannot say
+var PSRC_MAINS      = 1;       #           on mains
+var PSRC_BATTERY    = 2;       #           on battery — RESERVED for an AML _PSR/_BST evaluator; never produced in 1.57.18
+var PSRC_F_TABLES   = 0x100;   # the DSDT was found and passed its checks (signature, length, checksum)
+var PSRC_F_BATTERY  = 0x200;   # a battery is declared (PNP0C0A / ACPI0002, by _HID or _CID)
+var PSRC_F_PRESENT  = 0x400;   # a declared battery is NOT ruled absent (the reason for "cannot say")
+var PSRC_F_AC       = 0x800;   # an AC adapter (ACPI0003) is declared (informational)
+var PSRC_F_INFERRED = 0x1000;  # the state is inferred from what is declared, not read from _PSR (every MAINS this cut)
+var PSRC_F_MALFORMED = 0x2000; # a table or an AML package length failed a bound check: the answer is "cannot say"
+var PSRC_TABLE_MAX  = 0x100000;    # 1 MB per table (acpi_find_s5's DSDT bound)
+var PSRC_BUDGET_MAX = 0x1000000;   # 16 MB scanned in total
+var PSRC_SSDT_MAX   = 256;
+
+var psrc_word = 0;          # THE ANSWER (#114). 0 = cannot say, nothing scanned — also every pre-acpi_init read.
+# Scan accumulators (boot-only scratch: written only by psrc_scan on the BSP; the report line prints them).
+var psrc_dsdt = 0;          # 1 = the DSDT was scanned
+var psrc_ssdt = 0;          # SSDTs scanned
+var psrc_raw_batt = 0;      # battery-ID constants anywhere (the FLAT count)
+var psrc_attr_batt = 0;     # battery IDs the device pass attributed to a _HID/_CID
+var psrc_batt_dev = 0;      # devices declaring a battery
+var psrc_batt_absent = 0;   # ... of which ruled absent by a constant _STA
+var psrc_ac = 0;            # devices declaring an AC adapter
+var psrc_bad = 0;           # 1 = a bound check failed somewhere
+var psrc_budget = 0;        # bytes of tables accepted so far
+# Per-device scratch (psrc_scan_device) and decoder out-params (Cyrius has no out-params; acpi_aml_cursor precedent).
+var psrc_d_batt = 0;
+var psrc_d_ac = 0;
+var psrc_d_sta_raw = 0;     # "_STA" NameSegs in the device's own body
+var psrc_d_sta_n = 0;       # _STA definitions read (Name or Method)
+var psrc_d_sta_abs = 0;     # ... of which a constant with bit 0 clear
+var psrc_pl_nb = 0;         # psrc_pkglen: bytes of the PkgLength encoding
+var psrc_dev_body = 0;      # psrc_dev_end: where the device's TermList starts
+var psrc_dev_over = 0;      # psrc_dev_end: 1 = a well-formed Device header whose package runs past its container
+var psrc_int_ok = 0;        # psrc_int_at: 1 = an integer constant was decoded
+var psrc_cur = 0;           # psrc_int_at: the position after it
+
+# AML PkgLength at p (ACPI 6.5 §20.2.4): lead byte bits 7-6 = how many bytes follow (0-3). With none, bits 5-0 are
+# the length; otherwise bits 3-0 are its low nibble, bits 5-4 must be 0, and each following byte adds 8 more bits.
+# Returns the length (it counts from p, the PkgLength's own first byte) or -1; psrc_pl_nb = the encoding's bytes.
+fn psrc_pkglen(p, end) {
+    if (p >= end) { return 0 - 1; }
+    var b0 = acpi_load8(p);
+    var n = (b0 >> 6) & 3;
+    if (p + 1 + n > end) { return 0 - 1; }
+    psrc_pl_nb = n + 1;
+    if (n == 0) { return b0 & 0x3F; }
+    if ((b0 & 0x30) != 0) { return 0 - 1; }
+    var v = b0 & 0x0F;
+    var i = 0;
+    while (i < n) {
+        v = v | (acpi_load8(p + 1 + i) << (4 + 8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+# NameSeg at p (the caller has bounded p + 4): LeadNameChar 'A'-'Z' | '_', then three of those or '0'-'9'.
+fn psrc_namechar(c, lead) {
+    if (c == 0x5F) { return 1; }
+    if (c >= 0x41) { if (c <= 0x5A) { return 1; } }
+    if (lead == 0) { if (c >= 0x30) { if (c <= 0x39) { return 1; } } }
+    return 0;
+}
+fn psrc_seg_ok(p) {
+    if (psrc_namechar(acpi_load8(p), 1) == 0) { return 0; }
+    if (psrc_namechar(acpi_load8(p + 1), 0) == 0) { return 0; }
+    if (psrc_namechar(acpi_load8(p + 2), 0) == 0) { return 0; }
+    if (psrc_namechar(acpi_load8(p + 3), 0) == 0) { return 0; }
+    return 1;
+}
+
+# NameString at p (§20.2.2): '\' or any run of '^', then a NameSeg, DualNamePath (2E) or MultiNamePath (2F count).
+# NullName is refused (a Device is always named). Returns its length in bytes, or -1.
+fn psrc_namestr_len(p, end) {
+    var q = p;
+    if (q >= end) { return 0 - 1; }
+    if (acpi_load8(q) == 0x5C) { q = q + 1; }
+    else {
+        while (q < end) {
+            if (acpi_load8(q) == 0x5E) { q = q + 1; } else { break; }
+        }
+    }
+    if (q >= end) { return 0 - 1; }
+    var b = acpi_load8(q);
+    var segs = 1;
+    if (b == 0x00) { return 0 - 1; }
+    if (b == 0x2E) { segs = 2; q = q + 1; }
+    if (b == 0x2F) {
+        if (q + 1 >= end) { return 0 - 1; }
+        segs = acpi_load8(q + 1);
+        if (segs == 0) { return 0 - 1; }
+        q = q + 2;
+    }
+    if (q + segs * 4 > end) { return 0 - 1; }
+    var i = 0;
+    while (i < segs) {
+        if (psrc_seg_ok(q + i * 4) == 0) { return 0 - 1; }
+        i = i + 1;
+    }
+    return q + segs * 4 - p;
+}
+
+# DeviceOp at s (5B 82 PkgLength NameString TermList). Returns the device's end (exclusive) with psrc_dev_body set,
+# or 0 when the bytes are not a well-formed Device header or the package runs past `end` (then psrc_dev_over = 1).
+fn psrc_dev_end(s, end) {
+    psrc_dev_over = 0;
+    if (s + 2 >= end) { return 0; }
+    var pl = psrc_pkglen(s + 2, end);
+    if (pl < 0) { return 0; }
+    var nb = psrc_pl_nb;
+    var ns = s + 2 + nb;
+    var nl = psrc_namestr_len(ns, end);
+    if (nl < 0) { return 0; }
+    if (pl < nb + nl) { return 0; }                   # the package cannot end inside its own name
+    if (s + 2 + pl > end) { psrc_dev_over = 1; return 0; }
+    psrc_dev_body = ns + nl;
+    return s + 2 + pl;
+}
+
+# Do the n bytes of firmware memory at p equal the kernel string s?
+fn psrc_bytes_eq(p, s, n) {
+    var i = 0;
+    while (i < n) {
+        if (acpi_load8(p + i) != load8(s + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# THE ONE ID MATCHER — the flat count and the device pass both call it, so a constant it misses is missed by both.
+# The data object at p: 1 = a battery (EISAID PNP0C0A as DWordConst / QWordConst, or the string "PNP0C0A" or
+# "ACPI0002"), 2 = an AC adapter (the string "ACPI0003"; ACPI0003 has no EISAID form), 0 = anything else.
+fn psrc_id_kind(p, end) {
+    if (p >= end) { return 0; }
+    var op = acpi_load8(p);
+    if (op == 0x0C) {
+        if (p + 5 <= end) { if (acpi_load32(p + 1) == 0x0A0CD041) { return 1; } }
+        return 0;
+    }
+    if (op == 0x0E) {
+        if (p + 9 <= end) { if (acpi_load32(p + 1) == 0x0A0CD041) { if (acpi_load32(p + 5) == 0) { return 1; } } }
+        return 0;
+    }
+    if (op == 0x0D) {
+        if (p + 9 <= end) {
+            if (acpi_load8(p + 8) == 0) { if (psrc_bytes_eq(p + 1, "PNP0C0A", 7) == 1) { return 1; } }
+        }
+        if (p + 10 <= end) {
+            if (acpi_load8(p + 9) == 0) {
+                if (psrc_bytes_eq(p + 1, "ACPI0002", 8) == 1) { return 1; }
+                if (psrc_bytes_eq(p + 1, "ACPI0003", 8) == 1) { return 2; }
+            }
+        }
+    }
+    return 0;
+}
+
+# An integer constant at p (ZeroOp, OneOp, OnesOp, Byte/Word/DWord/QWordConst). Sets psrc_int_ok and psrc_cur (the
+# position after it); OnesOp is all bits set (-1 here), so its bit 0 reads "present".
+fn psrc_int_at(p, end) {
+    psrc_int_ok = 0;
+    psrc_cur = 0 - 1;
+    if (p >= end) { return 0; }
+    var op = acpi_load8(p);
+    var w = 0;
+    var v = 0;
+    if (op == 0x00) { w = 1; v = 0; }
+    if (op == 0x01) { w = 1; v = 1; }
+    if (op == 0xFF) { w = 1; v = 0 - 1; }
+    if (op == 0x0A) { w = 2; }
+    if (op == 0x0B) { w = 3; }
+    if (op == 0x0C) { w = 5; }
+    if (op == 0x0E) { w = 9; }
+    if (w == 0) { return 0; }
+    if (p + w > end) { return 0; }
+    if (op == 0x0A) { v = acpi_load8(p + 1); }
+    if (op == 0x0B) { v = acpi_load16(p + 1); }
+    if (op == 0x0C) { v = acpi_load32(p + 1); }
+    if (op == 0x0E) { v = acpi_load64(p + 1); }
+    psrc_int_ok = 1;
+    psrc_cur = p + w;
+    return v;
+}
+
+# The position after the simple data object at p (an integer constant, or a string up to its NUL), or -1.
+fn psrc_obj_skip(p, end) {
+    psrc_int_at(p, end);
+    if (psrc_int_ok == 1) { return psrc_cur; }
+    if (p >= end) { return 0 - 1; }
+    if (acpi_load8(p) != 0x0D) { return 0 - 1; }
+    var q = p + 1;
+    while (q < end) {
+        if (acpi_load8(q) == 0) { return q + 1; }
+        q = q + 1;
+    }
+    return 0 - 1;
+}
+
+fn psrc_d_count(k) {
+    if (k == 1) { psrc_d_batt = psrc_d_batt + 1; }
+    if (k == 2) { psrc_d_ac = psrc_d_ac + 1; }
+    return 0;
+}
+
+# NameOp at q inside a device body ending at dend: _HID / _CID (one id, or a Package of ids) / _STA (a constant?).
+fn psrc_d_name(q, dend) {
+    if (q + 5 > dend) { return 0; }
+    if (acpi_sig_match(q + 1, 0x5F, 0x48, 0x49, 0x44) == 1) {          # _HID
+        psrc_d_count(psrc_id_kind(q + 5, dend));
+        return 0;
+    }
+    if (acpi_sig_match(q + 1, 0x5F, 0x43, 0x49, 0x44) == 1) {          # _CID
+        if (q + 6 <= dend) {
+            if (acpi_load8(q + 5) == 0x12) {                           # PackageOp PkgLength NumElements elements
+                var pl = psrc_pkglen(q + 6, dend);
+                if (pl < 0) { return 0; }              # undecodable: its ids stay unattributed (-> present)
+                var pe = q + 6 + pl;
+                if (pe > dend) { psrc_bad = 1; return 0; }
+                var e = q + 6 + psrc_pl_nb;
+                if (e >= pe) { return 0; }
+                var cnt = acpi_load8(e);
+                var pos = e + 1;
+                var i = 0;
+                while (i < cnt) {
+                    if (pos >= pe) { break; }
+                    psrc_d_count(psrc_id_kind(pos, pe));
+                    pos = psrc_obj_skip(pos, pe);
+                    if (pos < 0) { break; }
+                    i = i + 1;
+                }
+                return 0;
+            }
+        }
+        psrc_d_count(psrc_id_kind(q + 5, dend));
+        return 0;
+    }
+    if (acpi_sig_match(q + 1, 0x5F, 0x53, 0x54, 0x41) == 1) {          # _STA
+        psrc_d_sta_n = psrc_d_sta_n + 1;
+        var v = psrc_int_at(q + 5, dend);
+        if (psrc_int_ok == 1) { if ((v & 1) == 0) { psrc_d_sta_abs = psrc_d_sta_abs + 1; } }
+        return 0;
+    }
+    return 0;
+}
+
+# MethodOp at q (14 PkgLength NameString MethodFlags TermList): a constant only when the NameString is _STA and the
+# TermList is exactly ReturnOp (A4) and one integer constant, ending at the method's end. Returns that end when it
+# is (the caller then steps over the whole method, so its PkgLength byte is never re-read as a NameOp: a 0x08
+# PkgLength followed by "_STA" is also the bytes of Name(_STA, <MethodFlags>)), else 0.
+fn psrc_d_method(q, dend) {
+    var pl = psrc_pkglen(q + 1, dend);
+    if (pl < 0) { return 0; }
+    var ns = q + 1 + psrc_pl_nb;
+    if (ns + 5 > dend) { return 0; }
+    if (acpi_sig_match(ns, 0x5F, 0x53, 0x54, 0x41) == 0) { return 0; }
+    psrc_d_sta_n = psrc_d_sta_n + 1;
+    var me = q + 1 + pl;
+    if (me > dend) { return 0; }                       # cannot be bounded: not a constant
+    var bp = ns + 5;                                   # past the name and MethodFlags
+    if (bp >= me) { return 0; }
+    if (acpi_load8(bp) != 0xA4) { return 0; }
+    var v = psrc_int_at(bp + 1, me);
+    if (psrc_int_ok == 0) { return 0; }
+    if (psrc_cur != me) { return 0; }                  # something follows the Return: not the whole body
+    if ((v & 1) == 0) { psrc_d_sta_abs = psrc_d_sta_abs + 1; }
+    return me;
+}
+
+# One device's OWN objects, [body, dend). A nested DeviceOp that fits inside dend is skipped whole (the outer pass
+# scans it for itself); one that does not fit is not a device of this body and is read through.
+fn psrc_scan_device(body, dend) {
+    psrc_d_batt = 0;
+    psrc_d_ac = 0;
+    psrc_d_sta_raw = 0;
+    psrc_d_sta_n = 0;
+    psrc_d_sta_abs = 0;
+    var q = body;
+    while (q < dend) {
+        var b = acpi_load8(q);
+        var adv = 1;
+        if (b == 0x5B) {
+            if (q + 1 < dend) {
+                if (acpi_load8(q + 1) == 0x82) {
+                    var ne = psrc_dev_end(q, dend);
+                    if (ne > 0) { adv = ne - q; }
+                }
+            }
+        }
+        if (adv == 1) {
+            if (b == 0x5F) {
+                if (q + 4 <= dend) {
+                    if (acpi_sig_match(q, 0x5F, 0x53, 0x54, 0x41) == 1) { psrc_d_sta_raw = psrc_d_sta_raw + 1; }
+                }
+            }
+            if (b == 0x08) { psrc_d_name(q, dend); }
+            if (b == 0x14) {
+                var mj = psrc_d_method(q, dend);
+                if (mj > 0) { adv = mj - q; psrc_d_sta_raw = psrc_d_sta_raw + 1; }   # stepped over: count its own "_STA"
+            }
+        }
+        q = q + adv;
+    }
+    if (psrc_d_batt > 0) {
+        psrc_batt_dev = psrc_batt_dev + 1;
+        psrc_attr_batt = psrc_attr_batt + psrc_d_batt;
+        if (psrc_d_sta_raw == 1) {
+            if (psrc_d_sta_n >= 1) {
+                if (psrc_d_sta_abs == psrc_d_sta_n) { psrc_batt_absent = psrc_batt_absent + 1; }
+            }
+        }
+    }
+    if (psrc_d_ac > 0) { psrc_ac = psrc_ac + 1; }
+    return 0;
+}
+
+# A table the scan may read: signature, length in [36, PSRC_TABLE_MAX], inside the total budget, checksum 0.
+# Returns its length, or 0 (psrc_bad set) — the bytes past the header are never read unless all four hold.
+fn psrc_table_ok(t, c0, c1, c2, c3) {
+    if (acpi_sig_match(t, c0, c1, c2, c3) == 0) { psrc_bad = 1; return 0; }
+    var len = acpi_load32(t + 4);
+    if (len < 36) { psrc_bad = 1; return 0; }
+    if (len > PSRC_TABLE_MAX) { psrc_bad = 1; return 0; }
+    if (psrc_budget + len > PSRC_BUDGET_MAX) { psrc_bad = 1; return 0; }
+    psrc_budget = psrc_budget + len;
+    var sum = 0;
+    var i = 0;
+    while (i < len) {
+        sum = sum + acpi_load8(t + i);
+        i = i + 1;
+    }
+    if ((sum & 0xFF) != 0) { psrc_bad = 1; return 0; }
+    return len;
+}
+
+# One definition block's AML body [t+36, t+len): the FLAT count and the DEVICE pass in one walk.
+fn psrc_scan_table(t, len) {
+    var end = t + len;
+    var p = t + 36;
+    while (p < end) {
+        var b = acpi_load8(p);
+        if (b == 0x0C) { if (psrc_id_kind(p, end) == 1) { psrc_raw_batt = psrc_raw_batt + 1; } }
+        if (b == 0x0D) { if (psrc_id_kind(p, end) == 1) { psrc_raw_batt = psrc_raw_batt + 1; } }
+        if (b == 0x0E) { if (psrc_id_kind(p, end) == 1) { psrc_raw_batt = psrc_raw_batt + 1; } }
+        if (b == 0x5B) {
+            if (p + 1 < end) {
+                if (acpi_load8(p + 1) == 0x82) {
+                    var de = psrc_dev_end(p, end);
+                    var dov = psrc_dev_over;                       # read BEFORE the device pass: its nested probes reuse it
+                    if (de > 0) { psrc_scan_device(psrc_dev_body, de); }
+                    if (dov == 1) { psrc_bad = 1; }                # a well-formed Device whose package overruns its table
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+# A root table (XSDT / RSDT) the SSDT walk may trust: signature, length in [36, 0x10000] (acpi_xsdt_find's bound),
+# checksum 0. Returns its length or 0. Not counted against the budget (a 64 KB pointer array).
+fn psrc_root_ok(t, c0, c1, c2, c3) {
+    if (t == 0) { return 0; }
+    if (acpi_sig_match(t, c0, c1, c2, c3) == 0) { return 0; }
+    var len = acpi_load32(t + 4);
+    if (len < 36) { return 0; }
+    if (len > 0x10000) { return 0; }
+    var sum = 0;
+    var i = 0;
+    while (i < len) {
+        sum = sum + acpi_load8(t + i);
+        i = i + 1;
+    }
+    if ((sum & 0xFF) != 0) { return 0; }
+    return len;
+}
+
+# Every accumulator AND the published word back to "cannot say, nothing scanned". acpi_init calls it first, so its
+# no-RSDP return answers "cannot say" — never a previous scan's answer (the acpi_fadt_clear rule, 1.57.7 S1b).
+fn psrc_clear() {
+    psrc_word = 0;
+    psrc_dsdt = 0;
+    psrc_ssdt = 0;
+    psrc_raw_batt = 0;
+    psrc_attr_batt = 0;
+    psrc_batt_dev = 0;
+    psrc_batt_absent = 0;
+    psrc_ac = 0;
+    psrc_bad = 0;
+    psrc_budget = 0;
+    return 0;
+}
+
+# The scan (acpi_init's last step, after acpi_find_fadt has set acpi_dsdt_addr). Publishes psrc_word.
+fn psrc_scan() {
+    psrc_clear();
+    var len = 0;
+    if (acpi_dsdt_addr != 0) {
+        len = psrc_table_ok(acpi_dsdt_addr, 0x44, 0x53, 0x44, 0x54);        # 'DSDT'
+        if (len > 0) { psrc_scan_table(acpi_dsdt_addr, len); psrc_dsdt = 1; }
+    }
+    # Every SSDT the XSDT lists — the RSDT only when there is no usable XSDT (ACPI 6.5 §5.2.8: an OS uses the XSDT).
+    var root = 0;
+    var esz = 8;
+    var rlen = psrc_root_ok(acpi_xsdt_addr, 0x58, 0x53, 0x44, 0x54);        # 'XSDT'
+    if (rlen > 0) { root = acpi_xsdt_addr; }
+    else {
+        rlen = psrc_root_ok(acpi_rsdt_addr, 0x52, 0x53, 0x44, 0x54);        # 'RSDT'
+        if (rlen > 0) { root = acpi_rsdt_addr; esz = 4; }
+    }
+    if (root == 0) {
+        if (acpi_rsdp_addr != 0) { psrc_bad = 1; }   # an RSDP whose root tables both fail: the SSDT set is unknown
+    } else {
+        var n = (rlen - 36) / esz;
+        var i = 0;
+        while (i < n) {
+            var ta = 0;
+            if (esz == 8) { ta = acpi_load64(root + 36 + i * 8); }
+            else { ta = acpi_load32(root + 36 + i * 4); }
+            if (ta != 0) {
+                if (acpi_sig_match(ta, 0x53, 0x53, 0x44, 0x54) == 1) {      # 'SSDT'
+                    if (psrc_ssdt >= PSRC_SSDT_MAX) { psrc_bad = 1; }
+                    else {
+                        len = psrc_table_ok(ta, 0x53, 0x53, 0x44, 0x54);
+                        if (len > 0) { psrc_scan_table(ta, len); psrc_ssdt = psrc_ssdt + 1; }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    var w = 0;
+    var present = 0;
+    if (psrc_dsdt == 1) { w = w | PSRC_F_TABLES; }
+    if (psrc_raw_batt > 0) { w = w | PSRC_F_BATTERY; }
+    if (psrc_batt_dev > 0) { w = w | PSRC_F_BATTERY; }
+    if (psrc_raw_batt != psrc_attr_batt) { present = 1; }     # an id no _HID/_CID accounts for (or one counted twice)
+    if (psrc_batt_absent < psrc_batt_dev) { present = 1; }
+    if (present == 1) { w = w | PSRC_F_PRESENT; }
+    if (psrc_ac > 0) { w = w | PSRC_F_AC; }
+    if (psrc_bad == 1) { w = w | PSRC_F_MALFORMED; }
+    if (psrc_dsdt == 1) {
+        if (psrc_bad == 0) {
+            if (present == 0) { w = w | PSRC_MAINS | PSRC_F_INFERRED; }
+        }
+    }
+    psrc_word = w;                                             # ONE store: #114 reads it on any CPU, unlocked
+    return w;
+}
+
+# The boot line (main.cyr, once, after acpi_init): what the scan found and why it answered as it did.
+#   power: source mains (no battery declared; dsdt 1 ssdt 0 battery 0 absent 0 ids 0 ac 0) word 0x1101
+fn psrc_report() {
+    var w = psrc_word;
+    kprint("power: source ", 14);
+    if ((w & 0xFF) == PSRC_MAINS) { kprint("mains (", 7); } else { kprint("cannot say (", 12); }
+    if ((w & PSRC_F_MALFORMED) != 0) { kprint("a table failed a bound check", 28); }
+    else {
+        if ((w & PSRC_F_TABLES) == 0) { kprint("no usable ACPI tables", 21); }
+        else {
+            if ((w & PSRC_F_PRESENT) != 0) { kprint("a battery may be present", 24); }
+            else {
+                if ((w & PSRC_F_BATTERY) != 0) { kprint("every battery absent by a constant _STA", 39); }
+                else { kprint("no battery declared", 19); }
+            }
+        }
+    }
+    kprint("; dsdt ", 7);    kprint_num(psrc_dsdt);
+    kprint(" ssdt ", 6);     kprint_num(psrc_ssdt);
+    kprint(" battery ", 9);  kprint_num(psrc_batt_dev);
+    kprint(" absent ", 8);   kprint_num(psrc_batt_absent);
+    kprint(" ids ", 5);      kprint_num(psrc_raw_batt);
+    kprint(" ac ", 4);       kprint_num(psrc_ac);
+    kprint(") word 0x", 9);  kprint_hex(w);
+    kprintln("", 0);
+    return 0;
+}
+
+# power_source#114's body: the cached word. a1..a4 are never read (the arm passes none).
+fn power_source_sys() { return psrc_word; }

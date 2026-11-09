@@ -1,6 +1,6 @@
 # Blocking waits — the BLOCKED state and the wait/wake primitive (invariants)
 
-> **Last Updated**: 2026-11-04 (1.57.17 — `epoll_wait`#21 blocks: § epoll_wait, `WK_EPOLL`, `wq_wake_anybit`, the signal-post wakes. Before: 1.57.9 ENDFIX — the #108 handoff; pipeline fd hygiene. Before that: 1.57.9 — `#44` is a quiet local yield again; the directed yield `sched_yield_to`#108
+> **Last Updated**: 2026-11-08 (1.57.18 — terminal channel WRITES block: § Channel writes, `WK_CHAN | CHAN_WKEY`, `chan_lock`; `epoll_wait`#21 watches `#97` channel endpoints: `WK_EPOLL` bits 8..39, `ep_wake_chan`; `sock_connect`#47's `SC_TIMED` caller deadline and non-blocking form: § Network waits. Before: 1.57.17 — `epoll_wait`#21 blocks: § epoll_wait, `WK_EPOLL`, `wq_wake_anybit`, the signal-post wakes. Before that: 1.57.9 ENDFIX — the #108 handoff; pipeline fd hygiene. Before that: 1.57.9 — `#44` is a quiet local yield again; the directed yield `sched_yield_to`#108
 > kicks only its named peer's CPU; pipe WRITES block too — `wr1_wait`, `pipe_wkey`, `pipe_lock`, PIPE_BUF 512, EPIPE. 1.57.8 — blocking pipe / channel reads, `WK_PIPE`/`WK_CHAN`, `wq_wake_m`, the `#44`
 > directed park kick (withdrawn 1.57.9). 1.57.7 — Path 2 step S3d, bites S3.6–S3.9: keep-current, the `#44`/`#14` park, the
 > halt protocol and `cpu_kickable`, the idle step, the 0xE1 reschedule kick, the keyboard's one-reader-per-line wait,
@@ -61,7 +61,9 @@ current on a CPU is state 2 with `on_cpu` == that CPU.
 
 Keys (high byte = class, low bits = object): `WK_SLEEP | pid`, `WK_FLOCK | inode`, `WK_CHILD | ppid`, `WK_KBD`,
 `WK_KBD_OWNER`, `WK_SND` (S3d), `WK_TCP | cid`, `WK_ICMP | pid` (S6), `WK_PIPE | buffer`, `WK_CHAN | endpoint`
-(1.57.8), `WK_EPOLL | <TCP slot bits>` (1.57.17, below — the low 8 bits are the slots the wait watches, matched by `wq_wake_anybit`), `WK_TEST | n` (selftests). `wq_wake_m(key, msk)` wakes `(wait key & msk) == key` — `wq_wake` is msk −1; a
+(1.57.8; `WK_CHAN | CHAN_WKEY | endpoint`, `CHAN_WKEY` = 0x100, is a writer blocked for room in that endpoint's inbox —
+1.57.18), `WK_EPOLL | <bits>` (1.57.17, below — bits 0..7 are the TCP slots the wait watches, bits 8..39 (1.57.18) the
+`#97` channel endpoints, matched by `wq_wake_anybit`), `WK_TEST | n` (selftests). `wq_wake_m(key, msk)` wakes `(wait key & msk) == key` — `wq_wake` is msk −1; a
 CLASS wake (msk `0xFF00…`) serves a waker that can no longer name the objects (a pipe writer's death). Reasons: `WR_NONE`
 0, `WR_EVENT` 1, `WR_TIMEOUT` 2, `WR_SIGNAL` 3. The cells are pid-indexed arrays in proc.cyr (shared, because
 vfs.cyr names `WK_FLOCK` and `proc_alloc_slot` scrubs them): `proc_wait_key`, `proc_wait_deadline`,
@@ -101,7 +103,8 @@ arm; a re-check moved before the arm (mutation M-C6) loses the wake every round 
 - **R4 — never reuse `pcpu_cpu()`, a `pcpu_*` pointer or per-CPU scratch across a wait**; recompute after it (the
   process may resume on another CPU). Only `wq_sleep`'s `c0` is compared across the switch (the cross-CPU witness).
   Per-CPU scratch whose live span must never contain a `wq_*` call: `pcpu_spawn_elf_buf`, `pcpu_spawn_path_buf`,
-  `pcpu_spawn_env_buf`, `pcpu_sc_open_abs`, `pcpu_sc_gpuop`, the `fb_scale` row buffer, `gpu_texl_stage`
+  `pcpu_spawn_env_buf`, `pcpu_sc_path` (the path ingress, ROOM slot 13 since 1.57.18 — `pcpu_sc_open_abs` before),
+  `pcpu_sc_gpuop`, the `fb_scale` row buffer, `gpu_texl_stage`
   (syscall.cyr), `pcpu_elf_hdr_buf`, `pcpu_exec_env_src/len` (elf.cyr) — each carries an R4/R6 comment.
 - **R5 — ISRs only wake.**
 - **R6 — the live CR3 must be the slot's** (`sched_live_cr3_ok`): the loaders' `cr3_load(0x1000)` windows contain
@@ -376,8 +379,9 @@ ring is empty and `pipe_writers_open` finds a writer, `WK_CHAN | endpoint` while
 is open, else 0 (data, EOF or an error — the read itself decides). **Wakers, each AFTER its condition store:**
 `pipe_write` (the head), `vfs_close_inner` (every pipe-end close — it may be the last writer), `proc_death_finish`
 (a CLASS wake of every `WK_PIPE` reader after the writer's state 0 or its orphan teardown: `pipe_writers_open` skips
-dead tables, and an orphan's table is already gone, so the pipes cannot be named), `chan_queue` (the sender's
-`chan_w`; both `CH_SEND`#97 and `write`#1), `CH_CLOSE` and `chan_release_pid` (the peer's `chan_end_open`). A 100 ms
+dead tables, and an orphan's table is already gone, so the pipes cannot be named), `chan_queue` / `chan_queue_bp` (the
+sender's `chan_w`; both `CH_SEND`#97 and `write`#1 — `chan_wake_in`), `CH_CLOSE` and `chan_release_pid` (the peer's
+`chan_end_open` — since 1.57.18 `chan_wake_all`, a class-masked wake of both ends' readers and writers). A 100 ms
 backstop deadline re-checks anyway: a writer dropped by a path with no wake costs latency, never a hang. **Kill
 (S7 boundary D):** a SIGKILL's `WR_SIGNAL`, or a kill pending at the arm, ABORTs with −1, which never reaches ring 3
 (B1 ends the process); a STOP parks inside `wq_signal_point` and the loop re-arms. `CH_RECV`#97 stays non-blocking
@@ -435,6 +439,67 @@ sleep time + 30 ms — measured 68–71 ms against 66–74 ms asleep), `wr-epipe
 the close wake back to readers-only → wr-epipe-close 139 ms; the death class wake masked to readers only →
 wr-epipe-death 121 ms (eof-death stays green); the PIPE_BUF all-or-nothing rule dropped → two-writer 36 mixed
 records and wr-nb.
+
+## Channel writes (1.57.18)
+
+Issue `2026-11-06-a-channel-write-drops-the-oldest-record-and-nobody-is-told` (thoth: 4,037 of a 20,000-byte reply
+arrived; the writer saw 20000). A `#97` channel endpoint's inbox holds 64 records of ≤ 64 bytes. Two rules, chosen by
+the CHANNEL:
+
+- **A terminal channel** — either end endowed in PTY mode (`chan_is_tty`: the terminal end the program holds at fd 0/1/2,
+  or the emulator's end of one) — has **back-pressure on `write`#1**: `chan_write_tty` takes the buffer as successive
+  64-byte records while the peer's inbox has free slots (`chan_queue_bp`, one `chan_lock` hold), and with **`a4 == 0`**
+  waits for the rest (`chan_wr1_wait`, `wr1_wait`'s mirror, the canonical C9 loop): it sleeps on its own key
+  **`WK_CHAN | CHAN_WKEY | pe`** (`pe` = the inbox it writes into; `CHAN_WKEY` = 0x100, so a reader's `WK_CHAN | e` is
+  never woken by a drain). `chan_wr_key(fd)` is the pre-check and the side-effect-free re-check after the arm (the key
+  while the caller's claim authorizes, the peer is open and the inbox is full, else 0); it loads `chan_w` BEFORE `chan_r`,
+  so "full" is never reported for an inbox that was not full at the second load. `a4 != 0` (O_NONBLOCK) keeps what fit:
+  **0** when nothing does, the pipe's convention. **Returns** `len`; the **partial count** when the peer goes (or the
+  caller's own claim does — `CH_CLOSE`, the owner's death) after some bytes were taken; **-1** with nothing taken. A
+  write of ≤ 64 bytes is one record and lands whole. ⛔ No "is it still a terminal?" test inside the loop: the terminal
+  end's `chan_end_pty` is cleared when its owner dies, so that test answered "display" exactly on the peer-death path and
+  returned 0 instead of -1 (measured: death-none). **Wakers, each AFTER its condition store:** `chan_deliver` (CH_RECV and
+  `read`#5) when the inbox was FULL before the record left (`rfull` — Linux's `was_full`, sound because it is computed
+  under the same `chan_lock` as the writers' refusal; a writer blocks only after seeing the inbox full), and
+  `chan_wake_all` (`CH_CLOSE`, `chan_release_pid`): `wq_wake_m(WK_CHAN | (e & ~1), ~0x101)` wakes the readers AND the
+  writers of BOTH ends of the channel. The 100 ms backstop re-checks anyway. **Kill/stop** exactly as pipe writes (S7
+  boundary D): SIGKILL → -1, never reaching ring 3 (265); SIGSTOP parks in `wq_signal_point`, a drain while stopped does
+  not resume it, SIGCONT re-arms and the write completes.
+- **A display channel** (no PTY end) and **every `CH_SEND`** keep the 1.56.40 bounded-queue-with-DROP-OLDEST, never
+  waiting (planning/ipc.md §3: presents are idempotent overwrites; a blocking send would starve the peer it waits on).
+  `write`#1 there is still one record of ≤ 64 bytes.
+- **`chan_lock`** (smp.cyr; a leaf below `sched_lock`, nothing acquired under it, never held across a wait, never taken
+  in an interrupt body) covers every inbox cursor read-modify-write and record copy (`chan_queue`, `chan_queue_bp`,
+  `chan_deliver`) and a mint's epoch bump + cursor/page reset. Until 1.57.18 the band took no lock: two writers on two
+  CPUs loaded the same `chan_w` and wrote one slot, and a drop-oldest bumped `chan_r` under a reader. Mutation (the lock a
+  no-op, `-smp 4`): two-writer lost 10 of 400 records, tore 4, reordered 291. Every copy re-checks, under the lock, that
+  the claim's channel epoch (`cep` = the fd's payload[1]) is still the channel's, so a claim whose channel was closed and
+  re-minted between `chan_auth` and the copy is refused rather than writing into (or reading out of) the new channel
+  (reasoned — a nanosecond window, not mutation-provable).
+- ⛔ **THE EMULATOR DEADLOCK** is the caller's: an emulator that writes keystrokes into the terminal with a blocking
+  `write`#1 while the program inside is blocked writing output into the emulator's full inbox has built a cycle — each
+  waits for the other to read. Linux PTY masters have the same hazard (a master writer blocked on a full slave input
+  queue while the slave blocks on output). An emulator writes the terminal with `a4 != 0`, with `CH_SEND` (drop-oldest —
+  puka does), or waits with `epoll_wait`#21 for EPOLLIN | EPOLLOUT on its end and drains its inbox whenever it is
+  readable before writing again.
+- **Prior art.** Linux `n_tty_write()` (drivers/tty/n_tty.c: write what `tty->ops->write` takes, `-EAGAIN` under
+  O_NONBLOCK, else `wait_woken(&wait, TASK_INTERRUPTIBLE, …)` on `tty->write_wait`, partial count on a signal —
+  `return (b - buf) ? b - buf : retval`), `pty_write()` bounded by `pty_write_room()` (the link's flip-buffer space),
+  woken by `tty_wakeup()`; `iterate_tty_write()` chunks a large write. FreeBSD `ttydisc_write()` → `tty_wait(tp,
+  &tp->t_outwait)` (`EWOULDBLOCK` under `IO_NDELAY`), woken by `tty_wakeup(tp, FWRITE)` from `ptsdev_read`; the master's
+  `ptsdev_write` waits on `pts_inwait`. Mach `ipc_mqueue_send()` on a port at its `mpl_qlimit` blocks the sender
+  (`MACH_SEND_TIMEOUT` = the bounded form), woken in `ipc_mqueue_release_msgcount()`. **Departures:** no SIGPIPE / EIO
+  (D3: -1 is the answer); no ordinary signal interrupts the wait (agnos has no handlers — the pipe write's rule); the
+  atomic unit is one 64-byte record, not Linux's per-chunk none or POSIX's PIPE_BUF; `CH_SEND` keeps drop-oldest on a
+  terminal too (the record op, where newest-wins is the contract).
+- **Gate:** `scripts/smoke/pty-backpressure-smoke.sh` (`tests/chan/ptybp.cyr`, `-smp 1` and `-smp 4`): big (20,000 bytes
+  whole and in order; the writer seen BLOCKED; drain 190 ms), nb-emulator / nb-terminal (4096, then 0; -1 after death),
+  death-none / death-partial (-1 / 64 in 31–38 ms), kill (265 in 0.25–3 ms), stop-cont, display-drop, send-drop,
+  two-writer (owner + grandchild, 400 records). Mutations (each RED at `-smp 4`): the terminal branch off → nine phases;
+  the drain's writer wake dropped → big's drain 440 ms (5 backstop rounds); the close wake back to the peer's readers only
+  → death-* 106 ms; `wq_signal_point` skipped on `WR_SIGNAL` → stop-cont returns 4096 short; both signal points
+  skipped → kill never reaps (a hang); `chan_lock` a no-op → two-writer; every channel a terminal → display-drop (the 2 s
+  watchdog kills the waiting child); `CH_SEND` through the back-pressure path → send-drop.
 
 ## Keyboard line ownership (S3.7)
 
@@ -528,7 +593,10 @@ only). S6 shipped without it and DOOM_SELFTEST's `/bin/doom` hung forever in #47
 loopback:7700 (doom-smoke 3 colours; now a sweep row). Wakes (condition stored under the net lock,
 `wq_wake` after the unlock): an ACK that covers or partially covers the held segment, SYN_SENT → ESTABLISHED, every RST,
 ESTABLISHED → CLOSE_WAIT, a window-opening ACK, retransmit exhaustion (timer-scan mask), `tcp_close_own` /
-`tcp_release_pid`, a matched echo reply. **Deadlines are computed once** (#47's ~8 s from entry; #48's D6 progress clock
+`tcp_release_pid`, a matched echo reply. **Deadlines are computed once** (#47's ~8 s from entry — since 1.57.18
+min(the caller's `SC_TIMED` a4 ms, ~8 s), and a4 0 is a NON-BLOCKING connect: `tcp_connect_ex` budget 0 sends the SYN,
+runs one `net_poll` and returns the id, which `epoll_wait`#21 on `EP_TCP | id` finishes (EPOLLOUT when the SYN-ACK
+clears the held SYN — a `tcp_demux_wake` event, so `ep_wake_tcp` already covers it); #48's D6 progress clock
 restarts only on ACK progress; #109's caller ceiling is computed once from entry, never re-armed by progress, and clamps
 every D6 deadline — `tcp_send_cap_clamp`, Linux SO_SNDTIMEO's one budget per call; #100's bound) and are absolute
 locals on the blocked frame. **ABORT** (`wq_signal_point`
@@ -558,10 +626,12 @@ canonical C9 wait (`ep_wait`, syscall.cyr); without the bit it is the old poll, 
   re-derived from the fd (R4). A level-triggered wait re-scans at its deadline, so a LOST wake still returns `rc 1`
   there — **every wake gate must bound the elapsed time**, never only the return code (epoll-smoke does).
 - **The key.** `WK_EPOLL | bits`: bit `i` = the wait watches TCP slot `i` (an `EP_TCP | i` target or a VFS_SOCK whose
-  conn is `i`). `wq_wake_anybit(WK_EPOLL, m)` wakes every BLOCKED proc of that class whose bits overlap `m` — the "any
-  bit" match `wq_wake_m`'s equality cannot express. Linux `ep_poll_callback` likewise reaches only the epitems on the
-  woken file's wait queue; FreeBSD `KNOTE` only the object's knote list. A wait with no socket watch arms the bare class
-  and no TCP event matches it.
+  conn is `i`); 1.57.18: bit `8 + e` (`EP_CHAN_SHIFT`) = it watches `#97` channel endpoint `e` (a VFS_CHAN target the
+  caller is authorized for). `wq_wake_anybit(WK_EPOLL, m)` wakes every BLOCKED proc of that class whose bits overlap `m` —
+  the "any bit" match `wq_wake_m`'s equality cannot express. Linux `ep_poll_callback` likewise reaches only the epitems on
+  the woken file's wait queue; FreeBSD `KNOTE` only the object's knote list. A wait with no socket or channel watch arms
+  the bare class and no TCP or channel event matches it. ⛔ The arm masks the scan's bits with `0xFFFFFFFFFF` (bits 0..39):
+  masked back to `0xFF` (mutation), every channel wait ran to its 5 s deadline.
 - **The wakers, each AFTER its condition store.** TCP: `net_handle_tcp` collects `tcp_demux_epm` under `tcp_tab_lock`
   (bytes queued; a passive child reaching ESTABLISHED sets its LISTENER's bit; every `tcp_demux_wake` event — the ACK
   that clears the held segment (**EPOLLOUT**), a FIN, a RST — sets the touched slot's) and calls `ep_wake_tcp` after the
@@ -574,7 +644,24 @@ canonical C9 wait (`ep_wait`, syscall.cyr); without the bit it is the old poll, 
   posts DURING the wait count) and, when `t` is BLOCKED on `WK_EPOLL`, wakes it `WR_EVENT` (not `WR_SIGNAL`: an
   ordinary signal is not a lifecycle interrupt); the poster kicks `t`'s CPU after its unlock (its `lm + 8` mask, or a
   local). Timerfds: the deadline. Lifecycle: `wq_interrupt_locked` → `WR_SIGNAL` → `wq_signal_point` (ABORT −1, never
-  reaching ring 3; a STOP parks and the loop re-arms with the SAME deadline).
+  reaching ring 3; a STOP parks and the loop re-arms with the SAME deadline). **Channels (1.57.18)**, `ep_wake_chan(m)`
+  (syscall.cyr; endpoint bit mask `m`, gated on `ep_waiters` after the `chan_lock` / `sched_lock` xchg — `ep_wake_tcp`'s
+  Dekker pair): `chan_wake_in(pe)` after a record lands in `pe`'s inbox (EPOLLIN of `pe`'s holders), `chan_wake_out(re)`
+  after a record leaves a FULL inbox (EPOLLOUT of `re ^ 1`'s holders), `chan_wake_all(e)` on `CH_CLOSE` and the owner's
+  death (both ends: the survivor's EPOLLHUP), and `CH_MINT` (both ends of the fresh channel — a watch on an fd number the
+  mint re-used). ⚠ **A child's death also posts SIGCHLD to its parent, and that post wakes the parent's `epoll_wait` by
+  itself** (`ep_sig_locked`): a test of the channel-close wake whose peer is the waiter's own dying child cannot fail —
+  pty-backpressure's ep-hup closes with `CH_CLOSE` instead (measured: with the close wake removed, a child's death still
+  ended the wait in 58 ms; the `CH_CLOSE` form ran to its 5 s deadline).
+- **Channel readiness** (`chan_ep_events`, re-derived each pass after `chan_auth_as` — an inert claim, inherited or
+  endowed away or closed, reports NOTHING, and op 3 refuses to SET one): **EPOLLIN** = the inbox is non-empty (`chan_r`
+  loaded before `chan_w`), or the peer is gone; **EPOLLOUT** = the peer's inbox has a free slot (`chan_w` before
+  `chan_r`, `chan_wr_key`'s order), always on a display channel (its write never waits); **peer gone** =
+  EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP (Linux `unix_poll` on a socketpair whose peer closed: a read is EOF, a write
+  -1, neither waits). Prior art: Linux `n_tty_poll()` (EPOLLIN on input, EPOLLOUT while `tty_write_room() > 0`,
+  EPOLLHUP on `TTY_OTHER_CLOSED`), `unix_dgram_poll()` (not writable while the PEER's receive queue is full —
+  `unix_recvq_full`: exactly this inbox rule), FreeBSD `tty_kqops_write` (`kn_data = ttyoutq_bytesleft()`, EV_EOF when
+  gone).
 - **EINTR.** -4 needs a POST during the wait (`ep_signew`), not merely a pending bit — under D3 a bit stays pending
   until a signalfd read clears it, so "pending" would make every later wait return at once. A signal blocked by
   `sigprocmask`#17 does not end the wait (it wakes it; the re-scan finds nothing and it re-arms); SIGCONT never does
@@ -592,4 +679,15 @@ canonical C9 wait (`ep_wait`, syscall.cyr); without the bit it is the old poll, 
 - **Gate:** `scripts/smoke/epoll-smoke.sh` (`tests/epoll/epw.cyr` as `/bin/agnsh`, `-smp 1` and `-smp 4`). Mutations:
   the ACK/FIN/RST wake dropped from `net_handle_tcp` → every EPOLLOUT wait runs to its deadline (B1 stalls), H1/H2 at
   their timeouts; the data-queued bit dropped → R1 at its timeout; `ep_sig_locked` never waking → K1/K2 at their
-  timeouts.
+  timeouts. Channels (1.57.18): `scripts/smoke/pty-backpressure-smoke.sh` ep-timeout (300 ms → 0 at 300–309 ms), ep-in /
+  ep-out / ep-hup / ep-in-term (50–60 ms into a 5 s wait), ep-display-out, ep-inert. Mutations (each RED at `-smp 4`):
+  `chan_wake_in`'s, `chan_wake_out`'s and `chan_wake_all`'s epoll wake each dropped → ep-in + ep-in-term / ep-out /
+  ep-hup at their 5 s deadlines; the key mask back to `0xFF` → all four; op 3's `chan_auth` dropped → ep-inert (SET
+  accepted); the scan's `chan_auth_as` dropped → ep-inert (a legacy entry reports); EPOLLOUT unconditional → ep-out's
+  poll; no EPOLLHUP → ep-hup; EPOLLIN unconditional → ep-timeout.
+- **`fd_wait_ready` on agnos.** ONE watch — an op-3 SET on an instance, `epoll_wait` with `EPW_TIMED`, an op-3 DELETE —
+  is a readiness wait on one fd with a deadline in ms that consumes nothing (issue `2026-11-06-no-readiness-wait-on-one-fd`):
+  a channel, a signalfd, a timerfd, a kernel socket fd, or `EP_TCP | id` for a ring-3 socket (cyrius's tagged fds name a
+  TCP id, not a VFS fd). ⛔ On ONE kept instance, never an `epoll_create` per wait: the list is never freed (the banner
+  above `EP_WATCH_MAX`, ABI row 19), so a fresh instance per call leaks 128 B of kernel heap. Filed for cyrius:
+  `cyrius/docs/development/issues/2026-11-08-agnos-fd-wait-ready-and-sock-connect-deadline.md`.

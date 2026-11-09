@@ -609,6 +609,7 @@ fn role_park(te) {
 
 fn wx_child(role) {
     if (wx_eq(role, "kbdblk") == 1) { return role_kbdblk(); }
+    if (wx_eq(role, "ansi-say") == 1) { return role_ansi_say(wx_atoi(argv(2))); }
     if (wx_eq(role, "winch-w") == 1) { return role_winch_w(wx_atoi(argv(2))); }
     if (wx_eq(role, "winch-n") == 1) { return role_winch_n(wx_atoi(argv(2))); }
     if (wx_eq(role, "noecho-die") == 1) { return role_noecho_die(); }
@@ -1866,7 +1867,7 @@ fn ph_tty() {
     if (q2b != 1) { ok2 = 0; }
     if (c2 != 1) { ok2 = 0; }
     if (q2c != 0) { ok2 = 0; }
-    var bad2 = wxt_cm(4, 0);                                # an unknown bit: -1, nothing changed
+    var bad2 = wxt_cm(8, 0);                                # an unknown bit: -1, nothing changed (4 is CM_NOSERIAL since 1.57.18)
     var bad2b = wxt_cm(0, 2);                               # FLUSH is no mode: clearing it is -1
     if (bad2 != (0 - 1)) { ok2 = 0; }
     if (bad2b != (0 - 1)) { ok2 = 0; }
@@ -2167,6 +2168,221 @@ fn ph_tty() {
     return 0;
 }
 
+# ═════════════════════════════ ANSI (1.57.18, mode `ansi`; driven by scripts/harness/console-ansi-test.py) ═════════════════════════════
+# The console as a terminal (issue 2026-11-06-the-console-is-short-of-a-terminal): EL 0/1/2, ED 0/1, UTF-8 through kashi's
+# CP437 cells with one replacement cell per maximal subpart, a drawn cursor (?25h/?25l, never a ghost), 16+ CSI
+# parameters, SGR 7/27, OSC/DCS/APC/PM/SOS swallowed (bounded), Tab, the last-column pending wrap, DECAWM ?7, the
+# console_mode#110 per-process COM1 opt-out (CM_NOSERIAL 4), and the scroll / frame-mirror timings.
+# ⛔ THE ORACLE IS THE FRAMEBUFFER (an HMP screendump), never this program: it only DRAWS each screen, prints
+# `WXA-READY <shot>` (row 46, which no check reads) and blocks in a hidden read of fd 0 until the harness has taken the
+# screendump and typed Enter. The probe's own verdicts are the #110 return values and the serial-side facts it can see.
+# ⚠ Typeahead is FLUSHED before every wait (#110 CM_FLUSH): the harness retries an Enter the console swallowed (the
+# first key of a session), and a retry that crossed a slow screen must not end the NEXT wait before its screendump.
+var wxa_b[4096];        # 32 KB: one output batch, written with ONE write(1) (a whole 128 x 64 frame is ~8.7 KB)
+var wxa_o = 0;
+var WXA_COLS = 80;
+var WXA_ROWS = 24;
+var WXA_FB = 0;         # the last wxa_frame's byte count
+fn wxa_c(c) {
+    if (wxa_o < 32760) { store8(&wxa_b + wxa_o, c & 0xFF); wxa_o = wxa_o + 1; }
+    return 0;
+}
+fn wxa_s(s) { var l = strlen(s); var i = 0; while (i < l) { wxa_c(load8(s + i)); i = i + 1; } return 0; }
+fn wxa_n(n) { if (wxa_o < 32700) { wxa_o = wx_catnum(&wxa_b, wxa_o, n); } return 0; }
+fn wxa_rep(c, n) { var i = 0; while (i < n) { wxa_c(c); i = i + 1; } return 0; }
+fn wxa_e(s) { wxa_c(27); wxa_s(s); return 0; }                                   # ESC + s
+fn wxa_cup(r, c) { wxa_c(27); wxa_c(91); wxa_n(r); wxa_c(59); wxa_n(c); wxa_c(72); return 0; }   # 1-based CUP
+fn wxa_flush() { if (wxa_o > 0) { syscall(1, 1, &wxa_b, wxa_o, 0); } wxa_o = 0; return 0; }
+fn wxa_cls() { wxa_e("[0m"); wxa_e("[2J"); wxa_e("[H"); return 0; }
+# The marker, appended to the batch: row 46, default colours, the rest of that row erased. The caller appends the
+# shot's TAIL (the final cursor placement) after it, so marker and tail reach the console in ONE write.
+fn wxa_mark(name) { wxa_cup(46, 1); wxa_e("[0m"); wxa_s("WXA-READY "); wxa_s(name); wxa_e("[K"); return 0; }
+# Flush the batch, then wait (hidden: NOECHO is set for the whole phase) for the harness's Enter, then say `WXA-GOT
+# <name>` on row 47 (no check reads it): the harness re-types an Enter the console swallowed until it sees that line,
+# and never after it, so a retry cannot end the NEXT wait before its screendump.
+fn wxa_go(name) {
+    syscall(110, 2, 0, 0, 0);                    # CM_FLUSH: typeahead from before the marker is not this shot's Enter
+    wxa_flush();
+    syscall(5, 0, &wx_kb, 255, 0);
+    wxa_cup(47, 1); wxa_e("[0m"); wxa_s("WXA-GOT "); wxa_s(name); wxa_e("[K"); wxa_flush();
+    return 0;
+}
+fn wxa_shot(name) { wxa_mark(name); wxa_go(name); return 0; }
+# One full frame (every row repainted by CUP + `cols` glyphs), as ONE write. -> the write's duration in µs.
+fn wxa_frame(ch) {
+    wxa_o = 0;
+    wxa_e("[H");
+    var r = 0;
+    while (r < WXA_ROWS) {
+        wxa_cup(r + 1, 1);
+        wxa_rep(ch + (r % 20), WXA_COLS);
+        r = r + 1;
+    }
+    WXA_FB = wxa_o;
+    var t0 = wx_us();
+    wxa_flush();
+    return wx_us() - t0;
+}
+# Children: `ansi-say <n>`. 1 = an ordinary write (must reach COM1 while its PARENT is opted out: per process);
+# 2 = opt out, write, and EXIT still opted out (the bit dies with it); 3 = an ordinary write from the process that
+# (likely) reuses 2's slot — it must reach COM1, so a recycled slot never inherits the bit.
+fn role_ansi_say(n) {
+    if (n == 1) { wx_out("WXA-CHILD-MIRRORED\r\n"); return 0; }
+    if (n == 2) { syscall(110, 4, 0, 0, 0); wx_out("WXA-SECRET-CHILD\r\n"); return 0; }
+    if (n == 3) { wx_out("WXA-CHILD2-MIRRORED\r\n"); return 0; }
+    return 9;
+}
+
+fn ph_ansi() {
+    wx_phase("ansi");
+    var ws = syscall(60, 0, 0, 0, 0);
+    if (ws > 0) { WXA_COLS = (ws >> 16) & 0xFFFF; WXA_ROWS = ws & 0xFFFF; }
+    wx_out("WXA-GRID"); wx_kv("cols", WXA_COLS); wx_kv("rows", WXA_ROWS); wx_end();
+    var n0 = wxt_cm(1, 0);                       # NOECHO for the phase: the harness's Enters draw nothing
+    wx_sleep(1500);                              # let the boot's last lines land before the first screen
+
+    # ---- N: the COM1 opt-out (per process, dies with it) and what mirroring a frame costs ----
+    wx_out("WXA-READY noser-begin\r\n");
+    var mir = wxa_frame(65);                     # mirrored (this process has not opted out)
+    var fb_bytes = WXA_FB;
+    var p4 = wxt_cm(4, 0);                       # set CM_NOSERIAL: the console's previous flags + this caller's bit
+    var qui = wxa_frame(103);                    # opted out: drawn, not mirrored (rows of 'g'..'z': absent from COM1)
+    wxa_cls(); wxa_s("WXA-SECRET-OPTOUT"); wxa_s("\r\n"); wxa_flush();
+    var pa = wx_spawn("ansi-say", 1, 0 - 1, 0 - 1);
+    var ra = wx_reap(pa);
+    var pb = wx_spawn("ansi-say", 2, 0 - 1, 0 - 1);
+    var rb = wx_reap(pb);
+    var pc = wx_spawn("ansi-say", 3, 0 - 1, 0 - 1);
+    var rc = wx_reap(pc);
+    wx_out("WXA-SECRET-WAITING\r\n");            # the harness types now: the first key's kernel line lands IN the window
+    syscall(110, 2, 0, 0, 0);
+    syscall(5, 0, &wx_kb, 255, 0);
+    var q = wxt_cm(0, 0);                        # a query: NOECHO | NOSERIAL
+    var u1 = wxt_cm(8, 0);                       # an unknown bit is still refused
+    var u2 = wxt_cm(0, 2);                       # FLUSH in clear is still refused
+    var c = wxt_cm(0, 4);                        # clear it: answers the flags BEFORE the clear
+    var q2 = wxt_cm(0, 0);
+    var okn = 1;
+    if (n0 != 0) { okn = 0; }
+    if (p4 != 1) { okn = 0; }
+    if (q != 5) { okn = 0; }
+    if (c != 5) { okn = 0; }
+    if (q2 != 1) { okn = 0; }
+    if (u1 != (0 - 1)) { okn = 0; }
+    if (u2 != (0 - 1)) { okn = 0; }
+    if (ra != 0) { okn = 0; }
+    if (rb != 0) { okn = 0; }
+    if (rc != 0) { okn = 0; }
+    wx_out("WXA-NOSER-END");
+    wx_kv("n0", n0); wx_kv("p4", p4); wx_kv("q", q); wx_kv("c", c); wx_kv("q2", q2); wx_kv("u1", u1); wx_kv("u2", u2);
+    wx_kv("pa", pa); wx_kv("pb", pb); wx_kv("pc", pc);
+    wx_kv("frame_bytes", fb_bytes); wx_kv("mirror_us", mir); wx_kv("quiet_us", qui); wx_end();
+    wx_verdict(okn, "ansi-noser"); wx_end();
+    wxa_shot("nshot");
+
+    # ---- A: the static cases (one screen) ----
+    wxa_cls();
+    # r0 EL 0 in blue: cells 0-4 'A', 5.. blue (bce)
+    wxa_cup(1, 1); wxa_rep(65, 10); wxa_cup(1, 6); wxa_e("[44m"); wxa_e("[K"); wxa_e("[0m");
+    # r1 EL 1 in green: cells 0-5 green, 6-9 'B'
+    wxa_cup(2, 1); wxa_rep(66, 10); wxa_cup(2, 6); wxa_e("[42m"); wxa_e("[1K"); wxa_e("[0m");
+    # r2 EL 2 in red: the whole row red
+    wxa_cup(3, 1); wxa_rep(67, 10); wxa_cup(3, 6); wxa_e("[41m"); wxa_e("[2K"); wxa_e("[0m");
+    # r3 ten U+2500 then '|': the row keeps its width
+    wxa_cup(4, 1);
+    var k = 0;
+    while (k < 10) { wxa_c(0xE2); wxa_c(0x94); wxa_c(0x80); k = k + 1; }
+    wxa_c(124);
+    # r4 'R' U+0100 (no CP437 cell -> the replacement cell, the reference) '|'
+    wxa_cup(5, 1); wxa_c(82); wxa_c(0xC4); wxa_c(0x80); wxa_c(124);
+    # r5 a lone continuation byte -> 1 cell
+    wxa_cup(6, 1); wxa_c(0x80); wxa_c(124);
+    # r6 an overlong C0 AF -> 2 cells (C0 is never a lead byte)
+    wxa_cup(7, 1); wxa_c(0xC0); wxa_c(0xAF); wxa_c(124);
+    # r7 a truncated E2 94 then 'x' -> 1 cell, 'x'
+    wxa_cup(8, 1); wxa_c(0xE2); wxa_c(0x94); wxa_c(120); wxa_c(124);
+    # r8 a surrogate ED A0 80 -> 3 cells (A0 cannot follow ED)
+    wxa_cup(9, 1); wxa_c(0xED); wxa_c(0xA0); wxa_c(0x80); wxa_c(124);
+    # r9 U+1F600 (wide) -> the replacement cell + a blank pad, '|' at col 2
+    wxa_cup(10, 1); wxa_c(0xF0); wxa_c(0x9F); wxa_c(0x98); wxa_c(0x80); wxa_c(124);
+    # r10 U+4E00 (wide CJK) -> the same
+    wxa_cup(11, 1); wxa_c(0xE4); wxa_c(0xB8); wxa_c(0x80); wxa_c(124);
+    # r11 'e' + U+0301 (combining, zero width) -> 'e' then '|' at col 1
+    wxa_cup(12, 1); wxa_c(101); wxa_c(0xCC); wxa_c(0x81); wxa_c(124);
+    # r12 U+00E9 -> CP437 0x82 (a real glyph, not the replacement)
+    wxa_cup(13, 1); wxa_c(0xC3); wxa_c(0xA9); wxa_c(124);
+    # r13 U+2500 split across TWO write calls: the decoder's state persists
+    wxa_cup(14, 1); wxa_c(0xE2); wxa_c(0x94); wxa_flush();
+    wxa_c(0x80); wxa_c(124); wxa_flush();
+    # r14 a 10-parameter SGR: truecolour fg AND bg
+    wxa_cup(15, 1); wxa_e("[38;2;10;200;30;48;2;200;20;100m"); wxa_s("X  "); wxa_e("[0m");
+    # r15 a 17-parameter SGR: the bg is in parameters 14-16
+    wxa_cup(16, 1); wxa_e("[0;0;0;0;0;0;0;38;2;1;2;3;48;2;90;80;70m"); wxa_s("Y  "); wxa_e("[0m");
+    # r16 SGR 7 / 27: 'Z' reversed, a reversed space, 'W' and a space normal, then red-on-green reversed
+    wxa_cup(17, 1); wxa_e("[7m"); wxa_s("Z "); wxa_e("[27m"); wxa_s("W "); wxa_e("[31;42;7m"); wxa_s(" "); wxa_e("[0m");
+    # r17 OSC (BEL and ST), DCS, APC, PM, SOS, an OSC carrying LF + UTF-8, a CAN-cancelled OSC: eight '|' and nothing else
+    wxa_cup(18, 1);
+    wxa_e("]0;TITLE"); wxa_c(7); wxa_c(124);
+    wxa_e("]2;T2"); wxa_e("\\"); wxa_c(124);
+    wxa_e("Pq#0;2;0;0;0"); wxa_e("\\"); wxa_c(124);
+    wxa_e("_apc"); wxa_e("\\"); wxa_c(124);
+    wxa_e("^pm"); wxa_e("\\"); wxa_c(124);
+    wxa_e("Xsos"); wxa_e("\\"); wxa_c(124);
+    wxa_e("]0;a"); wxa_c(10); wxa_c(98); wxa_c(0xC3); wxa_c(0xA9); wxa_c(7); wxa_c(124);
+    wxa_e("]0;abc"); wxa_c(24); wxa_c(124);
+    # r19 an UNTERMINATED OSC is bounded: 4096 body bytes are swallowed, "OK|" after them is drawn
+    wxa_cup(20, 1); wxa_e("]"); wxa_rep(48, 4096); wxa_s("OK|");
+    # r20-r23 Tab
+    wxa_cup(21, 1); wxa_c(9); wxa_c(84);
+    wxa_cup(22, 1); wxa_s("ab"); wxa_c(9); wxa_c(99);
+    wxa_cup(23, 1); wxa_s("abcdefgh"); wxa_c(9); wxa_c(105);
+    wxa_cup(24, WXA_COLS - 1); wxa_c(9); wxa_c(69);
+    # r24-r25 pending wrap: a full row, CR LF, 'N' -> 'N' on the very next row (no blank line)
+    wxa_cup(25, 1); wxa_rep(87, WXA_COLS); wxa_c(13); wxa_c(10); wxa_c(78);
+    # r27-r28 a full row then a glyph: it wraps FIRST, so 'Y' lands at (28, 0)
+    wxa_cup(28, 1); wxa_rep(86, WXA_COLS); wxa_c(89);
+    # r31 DECAWM off (?7l): a row of Q then 'Z' overwrites the last cell; nothing reaches r32
+    wxa_cup(32, 1); wxa_e("[?7l"); wxa_rep(81, WXA_COLS); wxa_c(90); wxa_e("[?7h");
+    wxa_shot("a");
+
+    # ---- B: ED 1 (magenta) and ED 0 (cyan) over ten rows of 20 'E' ----
+    wxa_cls();
+    var r = 0;
+    while (r < 10) { wxa_cup(r + 1, 1); wxa_rep(69, 20); r = r + 1; }
+    wxa_cup(5, 11); wxa_e("[45m"); wxa_e("[1J");
+    wxa_cup(8, 6); wxa_e("[46m"); wxa_e("[J"); wxa_e("[0m");
+    wxa_shot("ed");
+
+    # ---- C: the cursor ----
+    wxa_cls(); wxa_e("[?25h");
+    wxa_cup(3, 5); wxa_s("AB");
+    wxa_mark("c1"); wxa_cup(3, 7); wxa_go("c1");                 # drawn at (2, 6)
+    wxa_e("[?25l"); wxa_mark("c2"); wxa_cup(3, 7); wxa_go("c2"); # hidden
+    wxa_e("[?25h"); wxa_cup(10, 10); wxa_flush(); wx_sleep(200);  # drawn at (9, 9) ...
+    wxa_cup(12, 20); wxa_flush(); wx_sleep(200);                  # ... then moved: (9, 9) must be clean
+    wxa_mark("c3"); wxa_cup(12, 20); wxa_go("c3");
+    wxa_cup(WXA_ROWS, 1); wxa_s("S"); wxa_flush(); wx_sleep(200); # drawn at (rows-1, 1) ...
+    wxa_c(10); wxa_flush(); wx_sleep(200);                        # ... then the screen scrolls: no ghost at (rows-2, 1)
+    wxa_mark("c4"); wxa_cup(WXA_ROWS, 1); wxa_go("c4");
+    wxa_cup(20, 1); wxa_s("LINE"); wxa_flush(); wx_sleep(200);    # drawn at (19, 4) ...
+    wxa_cup(20, 1); wxa_e("[2K"); wxa_flush(); wx_sleep(200);     # ... then the line is erased: no ghost at (19, 4)
+    wxa_mark("c5"); wxa_cup(20, 1); wxa_go("c5");
+    wxa_mark("c6"); wxa_cup(30, 1); wxa_rep(80, WXA_COLS); wxa_go("c6");   # pending wrap: drawn on the LAST column
+
+    # ---- the scroll: 32 line feeds on the bottom row, as one write ----
+    wxa_cls(); wxa_e("[?25h");
+    wxa_cup(WXA_ROWS, 1);
+    wxa_rep(10, 32);
+    var t0 = wx_us();
+    wxa_flush();
+    var sc = wx_us() - t0;
+    wxa_cls();
+    wx_out("WXA-SCROLL"); wx_kv("n", 32); wx_kv("us", sc); wx_kv("per_us", sc / 32); wx_end();
+    var n1 = wxt_cm(0, 1);
+    wx_out("WXA-DONE"); wx_kv("noecho_clear", n1); wx_end();
+    return 0;
+}
+
 fn wx_driver() {
     wx_out("WAITX-BEGIN\n");
     wx_mode_load();
@@ -2179,6 +2395,8 @@ fn wx_driver() {
         ph_kbd();                                       # S3d B2: the keyboard phases only (wait-kbd-test.py types)
     } elif (wx_mode_tok("tty") == 1) {
         ph_tty();                                       # 1.57.13: #110 / #111 / SIGWINCH (tty-test.py types)
+    } elif (wx_mode_tok("ansi") == 1) {
+        ph_ansi();                                      # 1.57.18: the console as a terminal (console-ansi-test.py)
     } else {
         # P8 FIRST: its klug witness is latched once per boot, so it must run before any other phase's waits
         if (wx_want("migrate", "P8") == 1) { ph_migrate(); }

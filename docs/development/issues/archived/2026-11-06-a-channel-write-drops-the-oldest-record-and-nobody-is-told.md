@@ -1,6 +1,15 @@
 # 2026-11-06 — A write to a terminal channel drops the oldest record when the inbox is full, and the writer is never told
 
-**Status:** 🟡 OPEN.
+**Status:** ✅ **RESOLVED in agnos 1.57.18** (2026-11-08, the issue's first ask). `write`#1 on a `#97` channel either of whose
+ends was endowed in PTY mode — the terminal end or the emulator's own end — never overwrites a full inbox: with **a4 == 0** it
+takes the WHOLE buffer as successive ≤ 64-byte records, waiting for room, and returns `len` (the partial count, or -1 with
+nothing taken, when the peer or the caller's claim goes; SIGKILL ends it, SIGSTOP / SIGCONT park and resume it); with
+**a4 != 0** it takes what fits and returns it (0 when nothing fits). Display channels and `CH_SEND` keep drop-oldest. The
+emulator's side of the deadlock both ends can build is named in the ABI (write with a4 != 0, or wait for `EPOLLOUT` — the
+same fix closes `2026-11-06-no-readiness-wait-on-one-fd`). Found and fixed with it: channel cursors and record copies had
+no lock (`chan_lock`; without it at -smp 4, 10 of 400 records lost, 4 torn). Gate `scripts/smoke/pty-backpressure-smoke.sh`
+(the issue's `big:20000` shape: 20,000 of 20,000 bytes arrive; 4,037 at 1.57.17). ABI rows 1, 21, 97;
+`docs/architecture/blocking-waits.md` § Channel writes.
 *(Filed from thoth **0.55.2**, which runs its TUI on a `#97` terminal end and paces its writes around this.)*
 **Checked against:** agnos **94145d95** (1.57.17), `chan_queue` in `kernel/core/syscall.cyr`, the `write`#1 channel arm.
 **Severity:** medium for any full-screen program in a terminal emulator. Output is lost with no error on either side.

@@ -21,7 +21,8 @@
 #
 # ⚠ The recipe is the one agnsh-smoke/fork-smoke proved: a 128 MB disk with the ESP at 1-33 MiB on NVMe
 # is the only combination that hands off reliably on this host (virtio-blk does not boot here), and
-# the ext2 features match what the kernel mounts. Env: R3_MEM (default 512M), QEMU_TRIES (default 6,
+# the ext2 features match what the kernel mounts. Env: R3_MACHINE (1.57.18; default q35 — power-source-smoke boots
+# `pc` and `q35,acpi=off` too), R3_MEM (default 512M), QEMU_TRIES (default 6,
 # via qemu_dwell_kernel), GNOBOOT_ROOT, R3_ACCEL (1.57.6 S3; default `-cpu max` = TCG, unchanged — pass
 # "$(smoke_accel 4)" for a multi-CPU boot that must really run in parallel, and print it).
 # ⚠ Build the kernel BEFORE calling ring3_seed_image and hand it the path you mean: the image copies
@@ -75,7 +76,7 @@ ring3_seed_boot() {
     QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @ EBS|BootManagerMenuApp|Please select boot device}"
     export QEMU_DWELL_VOID
     qemu_dwell_kernel "$_r3_log" "$_r3_marker" "$_r3_max" "$_r3_work/vars.fd" "$R3_OVMF_VARS" \
-        qemu-system-x86_64 -machine q35 -m "${R3_MEM:-512M}" ${R3_ACCEL:--cpu max} "$@" \
+        qemu-system-x86_64 -machine "${R3_MACHINE:-q35}" -m "${R3_MEM:-512M}" ${R3_ACCEL:--cpu max} "$@" \
         -drive "if=pflash,format=raw,readonly=on,file=$R3_OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$_r3_work/vars.fd" \
         -drive "file=$_r3_img,format=raw,if=none,id=disk0" \

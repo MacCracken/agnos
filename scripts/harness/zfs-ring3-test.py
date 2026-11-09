@@ -16,7 +16,7 @@
 # b6/sym -> new.txt (custom holds the symlink layout since fixture RECIPE 5), AO_CREAT|AO_TRUNC b6/t.txt (+ 10) — six more
 # txgs, with stat / lstat / readlink / getdents of what it made and the refusals (an existing name, AO_EXCL, a symlink
 # where the dataset has no symlink layout (coff/kid) or whose target holds a NUL, or on the read-only root, a 50-byte
-# name, a 266-byte relative AO_CREAT path): clauses 114-130.
+# name, a 4126-byte relative AO_CREAT path — 266 bytes until 1.57.18): clauses 114-130.
 # ⭐ B7 review (finding 1): clauses 146-147 — rename#31 / link#32 to a NEW name holding a NUL byte must be refused by name
 # ("name holds a NUL byte"): B7 as built wrote such a name into the microzap (a C-string twin of an existing entry, or
 # a chunk that reads as free).
@@ -24,6 +24,14 @@
 # and the run is held to EXPECT_REFUSED — each refusal by its NAME, in order, not only by its -1; and the objects zfsx
 # created are held to FreeBSD's zfs_mknode by zfs-sa-check.py's ring-3 form (the production clock, ntp_now, inside this
 # run's wall-clock window; one value per op; GEN = its txg; a FreeBSD twin), before OpenZFS's guest verify.
+# ⭐ 1.57.18 (issue 2026-11-06-open-has-no-create-mode): open#7's AO_MODE — zfsx creates m600.txt / m640.txt / m755.bin /
+# m604.txt (0604: an ACL with allow0 + deny2) and mdef.txt (no AO_MODE: 0644) on agnostank/custom (clauses 162-165), each
+# held to OpenZFS's stat(1) (B-stat) and getfacl (B-acl — a mode the fixture holds no FreeBSD object of gets a twin
+# FreeBSD makes in the guest, zfs-fixture-guest.sh twin_file) and to zfs-sa-check.py (`create PATH MODE` ops); then
+# fsync#115 in a CHILD zfsx forks, which runs once zfsx is gone and ends `zfsx: child verdict N` (170-174) — this harness
+# waits for that line, and the verify's kill is a CRASH CUT with f115b.bin's 700 bytes still pending: the expected
+# manifest has it EMPTY and the final txg (h3) one below what a stray commit would give. ZR3_SMP=1|2|4 (default 4) sets
+# the guest's CPUs; ZR3_SA=advisory (negative proofs only) lets a red sa-check through to OpenZFS — verdict PARTIAL.
 # ⭐ 1.57.12 B5 (design § i.1, § i.5): then it WRITES — open AO_RDWR, write, lseek, read back, extend, a write past the
 # end (a hole), AO_TRUNC, write again — on agnostank/custom's custom.txt: FIVE txgs (policy A), the bytes from
 # agnos-gen-1. On exit 95 this harness EXTRACTS the pool partition and has OpenZFS judge it exactly as
@@ -69,6 +77,10 @@ flags = open(AGNOS + ".flags").read() if os.path.exists(AGNOS + ".flags") else "
 # `KSTACK_HW=1 sh scripts/build.sh` kernel (measuring only: it paints every per-process kernel stack and prints the
 # high-water at each reap — a commit with windows open nests the tick on zfsx's 60 KB kernel stack)
 BUS = os.environ.get("ZR3_BUS", "nvme")
+# (1.57.18) ZR3_SMP: the guest's CPU count (default 4, the gate's; 1 runs zfsx and its fsync#115 child on ONE CPU)
+SMP = os.environ.get("ZR3_SMP", "4")
+if SMP not in ("1", "2", "4"):
+    p("REFUSED: ZR3_SMP must be 1, 2 or 4"); sys.exit(1)
 if BUS not in ("nvme", "ahci"):
     p("REFUSED: ZR3_BUS must be nvme or ahci"); sys.exit(1)
 _fl = re.search(r"^flags=(.*)$", flags, re.M)
@@ -118,7 +130,7 @@ accel = ["-enable-kvm", "-cpu", "host"] if os.access("/dev/kvm", os.W_OK) and os
 p("accel:", " ".join(accel))
 t_boot = time.time()             # the wall clock's lower bound for every time zfsx's ops stamp (QEMU's RTC starts at UTC now)
 qemu = subprocess.Popen([
-    "qemu-system-x86_64", "-machine", "q35", "-m", "2048M", *accel, "-smp", "4",
+    "qemu-system-x86_64", "-machine", "q35", "-m", "2048M", *accel, "-smp", SMP,
     "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF}",
     "-drive", f"if=pflash,format=raw,file={WORK}/vars.fd",
     "-drive", f"file={IMG},format=raw,if=none,id=disk0",
@@ -180,7 +192,7 @@ WHY = {
     127: "the new symlink b6/sym: lstat not mode 0120755 / nlink 1 / size 7, readlink not 'new.txt', or stat through it not new.txt's 100 bytes",
     128: "symlink#63 in agnostank/coff/kid failed (B8: a NEW SA layout — the LAYOUTS add), or its readlink is not kid.txt",
     129: "symlink#63 with a target holding a NUL byte was accepted",
-    130: "a 266-byte relative AO_CREAT path was accepted, or its 254-byte truncation exists (open#7 used to truncate it)",
+    130: "a 4126-byte relative AO_CREAT path (input over CWD_MAX 4095) was accepted, or its 4095-byte truncation exists (open#7 used to truncate a long relative name)",
     131: "link#32 b6/new.txt -> b6/new-link.txt failed, or new.txt's nlink is not 2",
     132: "rename#31 b6/t.txt -> b6/t2.txt failed (t2.txt not 10 bytes, or t.txt still there)",
     133: "rename#31 of the hard link's name across directories (-> custom-hl.txt) failed",
@@ -212,6 +224,15 @@ WHY = {
     159: "B11: a write through a third fd, then sync#12 — the write, sync's 0, or the size after it failed",
     160: "B11: b11big.bin (2 MiB through one fd, its close commits it — the tick probe) or sysinfo#35 failed",
     161: "B11: b11exit.bin (written, left OPEN for the exit's teardown to commit) could not be created or written",
+    162: "1.57.18: an AO_MODE create (0600 / 0640 / 0755 / 0604) failed, or stat#33 did not read S_IFREG | the mode",
+    163: "1.57.18: a create without AO_MODE (the field set) did not get the default 0100644",
+    164: "1.57.18: an EXISTING file opened AO_CREAT | AO_MODE 0777 failed or lost its 0600",
+    165: "1.57.18: an AO_MODE field above 07777 was not refused, or the refused create made a file",
+    170: "1.57.18 child: fsync#115 of a file with pending writes failed or committed nothing (the sectors band did not move)",
+    171: "1.57.18 child: fsync#115 of a READ-ONLY fd did not commit the pending writes another fd of its file left",
+    172: "1.57.18 child: an ext2 fsync#115 wrote a sector (or committed ZFS's pending txg), or sync#12 did not commit it",
+    173: "1.57.18 child: fsync#115 of a ZFS directory fd was not 0, or of the console / a pipe / a closed fd / 99 not -1",
+    174: "1.57.18 child: fsync#115 of five OTHER fds wrote a sector while f115b.bin was pending (it committed another file's writes)",
 }
 # Every refusal zfsx provokes through a ZFS arm, IN ORDER, as the kernel logs it (zfs_wr_say; the relative-path refusal
 # never reaches a ZFS arm, so it logs nothing — 1.57.12 B7: unlink#30 / rename#31 / link#32 / rmdir#10 do now): (verb,
@@ -290,10 +311,22 @@ write /somewhere/else/b11.bin 524288 100 zfsx/b11e
 write /somewhere/else/b11.bin 600000 50 zfsx/b11s
 create /somewhere/else/b11big.bin
 write /somewhere/else/b11big.bin 0 2097152 zfsx/b11big
+create /somewhere/else/m600.txt 0600
+create /somewhere/else/m640.txt 0640
+create /somewhere/else/m755.bin 0755
+create /somewhere/else/m604.txt 0604
+create /somewhere/else/mdef.txt
 create /somewhere/else/b11exit.bin
 write /somewhere/else/b11exit.bin 0 1000 zfsx/b11x
+create /somewhere/else/f115a.bin
+write /somewhere/else/f115a.bin 0 1000 zfsx/f115a
+create /somewhere/else/f115r.bin
+write /somewhere/else/f115r.bin 0 500 zfsx/f115r
+create /somewhere/else/f115p.bin
+write /somewhere/else/f115p.bin 0 600 zfsx/f115p
+create /somewhere/else/f115b.bin
 """
-RING3_TXGS = 44          # B5: four write(2)s and one truncating open; B6: a mkdir, two creates, a symlink, two writes; B7:
+RING3_TXGS = 56          # B5: four write(2)s and one truncating open; B6: a mkdir, two creates, a symlink, two writes; B7:
 #                          a link, three renames, two unlinks, a mkdir, an rmdir, an unlink under an fd, a create; B8: a
 #                          symlink in coff/kid (a new SA layout), the 50-byte name (b6 upgraded), the 255-byte name and the
 #                          unlinks of both; B9 (the snapshotted root): three writes, a truncating open and its write, an
@@ -303,7 +336,11 @@ RING3_TXGS = 44          # B5: four write(2)s and one truncating open; B6: a mkd
 #                          another fd, an extend committed by stat, a write committed by sync#12, a create + 2 MiB through
 #                          one fd (one txg at its close), a create + a write committed by the exit's teardown — nine more,
 #                          and the exact final txg (h3's --final-txg) is the proof every one of them coalesced: a write
-#                          that committed per write#1 would end the run several txgs later
+#                          that committed per write#1 would end the run several txgs later; 1.57.18: four AO_MODE creates
+#                          and a default one (clauses 162-163), then the fsync#115 child's seven (f115a create + its
+#                          fsync's commit, f115r create + the read-only fd's, f115p create + sync#12's, f115b create —
+#                          its 700 bytes stay PENDING at the kill: f115b.bin must come back EMPTY, and an fsync that
+#                          committed it would end the run one txg later)
 def verify_pool(t_lo, t_hi):
     """Extract the pool partition and have OpenZFS judge what zfsx wrote (lane main@ring3). 0 PASS / 1 FAIL / 2 VOID.
     [t_lo, t_hi]: the run's wall clock (QEMU's start, zfsx's exit) — the window every time zfsx's ops stamped must be in."""
@@ -349,8 +386,14 @@ def verify_pool(t_lo, t_hi):
                         "--clock", str(int(t_lo) - 2), str(int(t_hi) + 2)], capture_output=True, text=True)
     for l in r.stdout.splitlines():
         p("  " + l[:220])
-    if r.returncode != 0:
+    sa_red = r.returncode != 0
+    if sa_red and os.environ.get("ZR3_SA") != "advisory":
         p("FAIL: zfs-sa-check.py (ring-3 form) of what zfsx created and wrote"); return 1
+    if sa_red:
+        # (1.57.18) ZR3_SA=advisory — NEGATIVE PROOFS ONLY (zfs-write-smoke's ZWS_SPACE precedent): a red sa-check is
+        # printed and the image still goes to OpenZFS, so a proof shows which GUEST step its defect reaches (B-acl's
+        # guest-made twin for an AO_MODE create). The verdict is then PARTIAL, never a PASS.
+        p("  ADVISORY: zfs-sa-check.py is RED (ZR3_SA=advisory) — the verify runs anyway; the verdict cannot be PASS")
     p("  OpenZFS verify (FreeBSD 15.1 guest) of main@ring3, final txg %d ..." % final)
     r = subprocess.run(["bash", os.path.join(ROOT, "scripts/tool/zfs-fixture.sh"), "--verify", vdir, "--fixture", fix],
                        capture_output=True, text=True)
@@ -366,6 +409,8 @@ def verify_pool(t_lo, t_hi):
         miss = [st for st in ("B-stat", "B-acl", "B-snap", "B-snapacct") if not re.search(r"^main@ring3 %s PASS" % st, steps, re.M)]
         if miss:
             p("FAIL: the verify passed without %s PASS on the objects zfsx created" % " / ".join(miss)); return 1
+        if sa_red:
+            p("PARTIAL: the verify passed, but zfs-sa-check.py was red (ZR3_SA=advisory)"); return 1
         p("PASS: zfsx's writes are a pool OpenZFS accepts — import, scrub, the expected manifest, B-stat / B-acl of what it")
         p("      created, a round trip, destroy")
         return 0
@@ -418,8 +463,17 @@ try:
         m = re.findall(r"run: exit (\d+)", ser()[mark:])
         if m: code = int(m[-1]); break
         time.sleep(0.25)
+    # (1.57.18) zfsx's fsync#115 CHILD runs once zfsx is gone (tests/zfs/zfsx.cyr zx_child) and ends on its verdict line,
+    # then sleeps with f115b.bin's writes pending: wait for that line before the verify's kill — the crash cut
+    child = None
+    if code == 95:
+        for _ in range(240):     # 60 s: four commits and a sync#12
+            m = re.findall(r"zfsx: child verdict (\d+)", ser()[mark:])
+            if m: child = int(m[-1]); break
+            time.sleep(0.25)
     t_exit = time.time()
     out = ser()[mark:]
+    for _m in re.findall(r"zfsx: (?:AO_MODE|child) [^\r\n]*", out): p(_m)
     refused = re.findall(r"^(?:\[[^]]*\] )?zfs: (open|mkdir|symlink|write|unlink|rmdir|rename|link) refused \((.*)\)\s*$", out, re.M)
     p("zfsx exit code:", code if code is not None else "(never reported)")
     # (B11, design k.126) the interrupt-latency probe: the per-CPU 100 Hz tick counters (sysinfo#35) around the close
@@ -443,6 +497,9 @@ try:
             exp = "%s (%s)" % EXPECT_REFUSED[i] if i < len(EXPECT_REFUSED) else "-"
             p("  %2d  got: %-60s  expected: %s" % (i + 1, got[:60], exp[:90]))
         rc = 1
+    elif code == 95 and child != 95:
+        p("FAIL: zfsx exit 95, but its fsync#115 child %s" % ("never reported" if child is None else
+          "ended %d: %s" % (child, WHY.get(child, "unrecognised verdict")))); rc = 1
     elif code == 95:
         p("zfsx: a ring-3 process exec'd from ZFS read, seek, stat, list and statfs /mnt/zfs, wrote a writable dataset")
         p("      (five txgs), created a directory, two files and a symlink in it (six more), linked, renamed, unlinked and")
@@ -450,7 +507,9 @@ try:
         p("      255 bytes and a symlink in a dataset with no symlink layout (five more, B8), wrote, truncated, unlinked,")
         p("      renamed and created in the SNAPSHOTTED root (nine more, B9: every kill a snapshot's block, deadlisted),")
         p("      wrote through fds under POLICY B (nine more, B11: 8 x 64 KiB one txg at close, a read through another fd")
-        p("      and a stat committing first, sync#12, a file the exit's teardown committed) and")
+        p("      and a stat committing first, sync#12, a file the exit's teardown committed), created four files with")
+        p("      AO_MODE modes and one without (five more, 1.57.18), had a forked child fsync#115 three files (seven more —")
+        p("      one left pending for the kill to lose) and")
         p("      had every write verb refused")
         p("      where it must be (a new name with a NUL byte too) — %d refusals, each by its name, in order; now OpenZFS"
           " judges the pool" % len(refused))
