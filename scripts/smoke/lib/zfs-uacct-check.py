@@ -473,7 +473,25 @@ def dl_check(z, p, mos, mosdir, feats_w, heads):
         b, _ = p.bonus(h, o)
         return struct.unpack_from("<16Q", h.content, b)
 
+    def head_line(name, hp, dd):
+        # (1.57.19) the writer's own report of a head in its exact form (zfs_write.cyr zfs_wt_dl), so the smoke holds
+        # every `zfs-wtest: deadlist` line to the image: the head deadlist's entries and those naming empty_bpobj, its
+        # dl_used, the prev snapshot's ds_unique_bytes, the dir's dd_used_breakdown[SNAP] (zfs_wt_dl's reads, mirrored:
+        # a non-DEADLIST object counts 0 / 0 / 0, no prev snapshot prints nothing)
+        n = ne = du = 0
+        h, o = p.dnode(mos, hp[8])
+        if h.content[o] == 50:
+            b, _ = p.bonus(h, o)
+            du = struct.unpack_from("<Q", h.content, b)[0]
+            zz = p.zap(h, o)
+            n = len(zz)
+            ne = sum(1 for v in zz.values() if ebo and v[1] == ebo)
+        pu = str(ds(hp[1])[12]) if hp[1] else ""
+        return ("deadlist-head /%s object %d: %d entries (%d naming empty_bpobj), dl_used %d, prev snapshot unique %s,"
+                " dir SNAP %d" % (name, hp[8], n, ne, du, pu, struct.unpack_from("<Q", dd, 112)[0]))
+
     nid = 0
+    hl = []
     for name, dobj, head in heads:
         dh, do = p.dnode(mos, dobj)
         db, _ = p.bonus(dh, do)
@@ -484,6 +502,7 @@ def dl_check(z, p, mos, mosdir, feats_w, heads):
                 one(ll[1], name + " (livelist)", False)
         hp = ds(head)
         one(hp[8], name, cap=hp[2])
+        hl.append(head_line(name, hp, dd))
         chain, prev = [(head, hp)], hp[1]
         while prev:                                          # its own snapshots, newest first, then the origin's
             sp_ = ds(prev)
@@ -521,9 +540,9 @@ def dl_check(z, p, mos, mosdir, feats_w, heads):
     if refs != ebr:
         bad.append("features_for_write empty_bpobj refcount %d != the %d deadlist entries naming it" % (ebr, refs))
     if bad:
-        return ["FAIL deadlists: " + "; ".join(bad[:4]) + (" (+%d more)" % (len(bad) - 4) if len(bad) > 4 else "")], 1
+        return ["FAIL deadlists: " + "; ".join(bad[:4]) + (" (+%d more)" % (len(bad) - 4) if len(bad) > 4 else "")] + hl, 1
     return ["deadlists: %d deadlist(s), %d entries recounted (dl_used == Σ entries, every BP in its interval), empty_bpobj"
-            " refcount %d == the entries naming it, %d snapshot-unique / SNAP identit(ies)" % (len(seen), nent, ebr, nid)], 0
+            " refcount %d == the entries naming it, %d snapshot-unique / SNAP identit(ies)" % (len(seen), nent, ebr, nid)] + hl, 0
 
 
 def main(argv):

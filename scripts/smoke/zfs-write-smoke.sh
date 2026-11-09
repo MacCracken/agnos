@@ -986,6 +986,25 @@ for b in bad:
         if [ "$_uac_rc" != 0 ] && [ "${ZWS_SPACE:-}" = advisory ]; then
             echo "    uacct: red but ADVISORY (ZWS_SPACE=advisory, a negative proof) — the image still goes to the guest"
         elif [ "$_uac_rc" != 0 ]; then _ok=0; fi
+        # (1.57.19) every `zfs-wtest: deadlist` line the writer printed == the host's recount of that head in the written
+        # image (zfs-uacct-check.py's `deadlist-head` lines, zfs_wt_dl's exact form: entries, entries naming empty_bpobj,
+        # dl_used, the prev snapshot's unique, the dir's SNAP). No op after zfs_wt_dl touches the dataset it reports, so the
+        # line and the image describe one state. How many entries still name empty_bpobj is the fixture BUILD's (RECIPE 8's
+        # post-@c1 writes: edgec reads 2 or 3 before the op list and after it across builds), so it is held to the image,
+        # not to a literal (issue 2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build)
+        _dlk=$(slog "$_log" | sed -n -E 's/^(\[[^]]*\] )?zfs-wtest: deadlist (\/[^ ]+ object [0-9]+: .*)$/\2/p')
+        if [ -n "$_dlk" ]; then
+            _dlbad=""; _dlnk=0
+            while IFS= read -r _l; do
+                _dlnk=$((_dlnk + 1))
+                grep -qxF "uacct:   deadlist-head $_l" "$LOGS/$_name.uacct" && continue
+                _dlbad="$_dlbad; writer '$_l', host '$(grep -F "uacct:   deadlist-head ${_l%% object *} object " "$LOGS/$_name.uacct" \
+                    | head -1 | sed 's/^uacct:   deadlist-head //')'"
+            done <<< "$_dlk"
+            if [ -z "$_dlbad" ]; then echo "    ok: $_dlnk writer deadlist line(s) == the host recount of the written image"
+            elif [ "${ZWS_SPACE:-}" = advisory ]; then echo "    deadlists: red but ADVISORY (ZWS_SPACE=advisory)$_dlbad" | cut -c1-600
+            else echo "    FAIL: writer deadlist line(s) != the host recount$_dlbad" | cut -c1-600; _ok=0; fi
+        fi
         # B5: hole births (scripts/smoke/lib/zfs-hole-check.py — the audit's h8, design § k.12): every hole a changed
         # object holds where the start image had a block (or a punched hole) carries a birth; zdb never looks
         # (B5 review, finding 7(4)) every hole the writer punched carries free_blocks' LSIZE, and — with the serial log —
@@ -1227,7 +1246,7 @@ WRB=(--timeout 450
      --want "zfs-wtest: trunc ok refused \(deadlist entries in one txg over 3\)"
      --want "zfs-wtest: trunc /agnoswr/edgec/t.bin -> 0 txgs=4"
      --want "zfs-wtest: deadlist /agnoswr/edge object [0-9]+: 5 entries \(1 naming empty_bpobj\), dl_used [0-9]+, prev snapshot unique [0-9]+, dir SNAP [0-9]+"
-     --want "zfs-wtest: deadlist /agnoswr/edgec object [0-9]+: 6 entries \(3 naming empty_bpobj\), dl_used [0-9]+, prev snapshot unique [0-9]+, dir SNAP [0-9]+"
+     --want "zfs-wtest: deadlist /agnoswr/edgec object [0-9]+: 6 entries \([0-9]+ naming empty_bpobj\), dl_used [0-9]+, prev snapshot unique [0-9]+, dir SNAP [0-9]+"
      --want "zfs-wtest: deadlist /agnoswr/snap object [0-9]+: 2 entries \(1 naming empty_bpobj\), dl_used [0-9]+, prev snapshot unique [0-9]+, dir SNAP [0-9]+"
      --want "zfs-wtest: deadlist /agnoswr/clone object [0-9]+: 2 entries \(1 naming empty_bpobj\), dl_used [0-9]+, prev snapshot unique [0-9]+, dir SNAP 0"
      --want "zfs-wtest: deadlist /agnoswr/snap2 object [0-9]+: 3 entries \(1 naming empty_bpobj\), dl_used [0-9]+, prev snapshot unique [0-9]+, dir SNAP [0-9]+"

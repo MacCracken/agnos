@@ -16,6 +16,16 @@
 # Exit 0 if both markers print AND fsck is clean; 1 otherwise.
 
 set -u
+# (1.57.19) `--spawn-lane=require|auto|off` sets the same thing as EXEC_SMOKE_SPAWN_LANE: sweep.sh's run_gate hands its
+# buildenv to build.sh, not to the smoke, so the EXEC + RING3 row declares the lane with the argument.
+# Parsed before anything boots, and the positional parameters cleared: nothing sourced below reads them.
+for _a in "$@"; do
+    case "$_a" in
+        --spawn-lane=require|--spawn-lane=auto|--spawn-lane=off) EXEC_SMOKE_SPAWN_LANE="${_a#--spawn-lane=}" ;;
+        *) echo "exec-smoke: unknown argument '$_a' (usage: exec-smoke.sh [--spawn-lane=require|auto|off])"; exit 2 ;;
+    esac
+done
+set --
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -331,18 +341,18 @@ if [ "${SPAWN_STRINGS_N:-0}" -lt 500 ]; then
     echo "        Fix the binary or the enumeration; do not read this as an EXEC-only build."
     rc=1
 elif [ "$SPAWN_LANE" = "off" ]; then
-    echo "  SKIP: spawn_path #43 lane switched off by EXEC_SMOKE_SPAWN_LANE=off — #43 spawn + #4 poll-reap NOT verified by this run ($SPAWN_STRINGS_N strings scanned)"
-    skipped=$((skipped + 2))
+    echo "  SKIP: spawn_path #43 lane switched off by EXEC_SMOKE_SPAWN_LANE=off — #43 spawn + #4 poll-reap + the RING3 verdicts NOT verified by this run ($SPAWN_STRINGS_N strings scanned)"
+    skipped=$((skipped + 3))
 elif [ "$SPAWN_MARK_N" -eq 0 ] && [ "$SPAWN_LANE" = "require" ]; then
     echo "  FAIL: spawn_path #43 lane REQUIRED (RING3_SELFTEST / EXEC_SMOKE_SPAWN_LANE=require) but 'ring3: spawnpath OK' is not in $AGNOS"
     echo "        $SPAWN_STRINGS_N strings scanned, 0 matched — the build dropped the define, or main.cyr's kprintln text was reworded and this gate's oracle rotted."
     echo "        rebuild: EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1 sh scripts/build.sh"
     rc=1
 elif [ "$SPAWN_MARK_N" -eq 0 ]; then
-    echo "  SKIP: spawn_path #43 lane not built — no 'ring3: spawnpath OK' in $SPAWN_STRINGS_N strings of $AGNOS; #43 spawn + #4 poll-reap NOT verified by this run"
+    echo "  SKIP: spawn_path #43 lane not built — no 'ring3: spawnpath OK' in $SPAWN_STRINGS_N strings of $AGNOS; #43 spawn + #4 poll-reap + the RING3 verdicts NOT verified by this run"
     echo "        this is the sweep's default profile (sweep.sh:132 sets no RING3_SELFTEST); close it with"
     echo "        EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1 sh scripts/build.sh && sh scripts/smoke/exec-smoke.sh"
-    skipped=$((skipped + 2))
+    skipped=$((skipped + 3))
 else
     echo "  (spawn_path #43 lane present — 'ring3: spawnpath OK' found in $SPAWN_STRINGS_N strings of $AGNOS)"
     if strings "$LOG" | grep -q "ring3: spawnpath OK"; then
@@ -357,6 +367,16 @@ else
         echo "  PASS: the #43-spawned /bin/prog2 ran in ring 3 — EXEC-DISK-OK appeared $EXEC_OK_N times (foreground + #43)"
     else
         echo "  FAIL: EXEC-DISK-OK count $EXEC_OK_N < 2 (the #43-spawned prog2's write(1) never reached the console)"; rc=1
+    fi
+    # (1.57.19) the RING3 profile's own verdicts, which nothing here read: from 1.57.7 to 1.57.18 its #3 parent P and
+    # #43 parent SP were reaped while kmain's #37 callers ran ahead of ring3_selftest_verify, envprop and its child
+    # (both exit 81) took their slots, and the boot printed `ring3: FAIL parent spawn` with this smoke checking only
+    # the #43 line. Now: P's `ring3: parent spawn+wait OK` (#3 spawn + #4 poll-reap from ring 3) and no `ring3: FAIL`.
+    R3FAIL_N=$(strings "$LOG" | grep -c "ring3: FAIL" || true)
+    if [ "${R3FAIL_N:-0}" = 0 ] && strings "$LOG" | grep -q "ring3: parent spawn+wait OK"; then
+        echo "  PASS: the RING3 lane's verdicts — 'ring3: parent spawn+wait OK' (#3 + #4 from ring 3) and no 'ring3: FAIL' line"
+    else
+        echo "  FAIL: the RING3 lane — ${R3FAIL_N:-0} 'ring3: FAIL' line(s) or no 'ring3: parent spawn+wait OK': $(strings "$LOG" | grep -E 'ring3: (FAIL|Pcode=|SPcode=)' | head -4 | tr '\n' ' ')"; rc=1
     fi
 fi
 

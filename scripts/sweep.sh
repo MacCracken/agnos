@@ -721,6 +721,11 @@ run_gate "1.57.18 open#7 AO_MODE + fsync#115 on ext2: tests/fsmode ring 3 -smp 1
 
 # --- 1.40.x exec-from-disk: load + ring-3 run + ENOEXEC + subdir + clean return ---
 run_gate "1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)" "EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1" "exec-smoke.sh"
+# ⭐ 1.57.19 — the same smoke on the EXEC + RING3 profile, whose lanes no row ran: the #3 ring-3 parent's spawn + #4
+# poll-reap (`ring3: parent spawn+wait OK`), the #43 spawn_path parent's from-disk /bin/prog2 (`ring3: spawnpath OK`, exit
+# 42 round-tripped) and no `ring3: FAIL`. Red from 1.57.7 to 1.57.18 with #3 and #43 working: kmain's #37 callers ran
+# ahead of ring3_selftest_verify and took P's and SP's reaped slots (`ring3: Pcode=81 / SPcode=81`, envprop's code).
+run_gate "1.44.x/1.57.19 exec-from-disk + the RING3 spawn lanes (#3 parent spawn + #4 reap, #43 spawn_path from disk)" "EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1" "exec-smoke.sh --spawn-lane=require"
 
 # --- 1.47.x ring-3 fault kills the process, the box survives (1.57.7 HAR: a row at last) ---
 # fault-kill-smoke builds its OWN FAULT_SELFTEST+EXT2_WRITE_SELFTEST kernel (smoke_require_image refuses any other)

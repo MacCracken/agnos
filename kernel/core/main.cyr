@@ -6413,6 +6413,21 @@ var ring3_counter_a = 0;
 var ring3_counter_b = 0;
 var ring3_pid_a = 0;
 var ring3_pid_b = 0;
+# (1.57.19) proc_epoch[pid] of B, P and SP when setup made them: the verify reads each BY PID after it exited, and a
+# slot handed out again in between (proc_alloc_slot bumps the epoch) holds a stranger's state and exit code.
+var ring3_epoch_b = 0;
+var ring3_epoch_p = 0;
+var ring3_epoch_sp = 0;
+# 1 when pid is still the incarnation setup recorded; else prints `ring3: FAIL <what> slot recycled before verify`.
+fn ring3_same_incarnation(pid, epoch, what, wlen) {
+    if (pid >= 0) {
+        if (pid < proc_count) {
+            if (proc_epoch_get(pid) == epoch) { return 1; }
+        }
+    }
+    kprint("ring3: FAIL ", 12); kprint(what, wlen); kprintln(" slot recycled before verify", 28);
+    return 0;
+}
 var ring3_payload[16];          # raw ring-3 code (proc A, getpid loop); first 22 bytes used
 var ring3_elf[24];              # a minimal in-memory ELF64 for proc B (159 bytes used)
 fn ring3_payload_fill() {
@@ -6898,6 +6913,7 @@ fn ring3_selftest_setup() {
     # loader, which (1.44.8) sets ring-3 selectors + state=ready (proc_create_full).
     ring3_elf_fill();
     ring3_pid_b = elf_load(&ring3_elf, 159);
+    if (ring3_pid_b >= 0) { ring3_epoch_b = proc_epoch_get(ring3_pid_b); }
     if (ring3_pid_b >= 0) { proc_map_page(proc_get_cr3(ring3_pid_b), 0x2000000, ring3_counter_b); }
     # P = a ring-3 PARENT that spawn(#3)s + poll-waitpid(#4)s a child ELF entirely from
     # ring 3 (1.44.10). Unlike B (loaded by a KERNEL-context elf_load), P invokes spawn as
@@ -6907,6 +6923,7 @@ fn ring3_selftest_setup() {
     # already left it state=ready; only proc_set_ring3 (ring-3 selectors) is needed.
     spawn_parent_fill();
     spawn_parent_pid = spawn_user_proc(&spawn_parent_payload);
+    if (spawn_parent_pid >= 0) { ring3_epoch_p = proc_epoch_get(spawn_parent_pid); }
     if (spawn_parent_pid >= 0) { proc_set_ring3(spawn_parent_pid); }
     # Y = the 1.44.16 sched_yield(#44) YIELDER (own counter at its 0x2000000, like A).
     # Spawned BEFORE the stress block so the stress pids stay contiguous.
@@ -6941,6 +6958,7 @@ fn ring3_selftest_setup() {
     if (ext2_active != 0) {
         spawn_path_parent_fill();
         spawn_path_parent_pid = spawn_user_proc(&spawn_path_parent_payload);
+        if (spawn_path_parent_pid >= 0) { ring3_epoch_sp = proc_epoch_get(spawn_path_parent_pid); }
         if (spawn_path_parent_pid >= 0) { proc_set_ring3(spawn_path_parent_pid); }
     }
     return 0;
@@ -6972,13 +6990,16 @@ fn ring3_selftest_verify() {
     var cb = load64(ring3_counter_b);
     var bstate = proc_get_state(ring3_pid_b);
     kprint("ring3: A=", 9); kprint_num(ca); kprint(" B=", 3); kprint_num(cb); kprint(" Bst=", 5); kprint_num(bstate); kprintln("", 0);
-    # B (real ELF) ran to completion (counter == N) and exited (state 0) WHILE A kept running.
-    if (bstate == 0) {
-        if (cb == 16777216) {
-            if (ca > 0) { kprintln("ring3: child exited", 19); }
-            else { kprintln("ring3: FAIL A idle", 18); }
-        } else { kprintln("ring3: FAIL B partial", 21); }
-    } else { kprintln("ring3: FAIL B hung", 18); }
+    # B (real ELF) ran to completion (counter == N) and exited (state 0) WHILE A kept running. (1.57.19) Only while B's
+    # slot is still B: a slot handed out again since setup holds another process's state (ring3_same_incarnation).
+    if (ring3_same_incarnation(ring3_pid_b, ring3_epoch_b, "B", 1) == 1) {
+        if (bstate == 0) {
+            if (cb == 16777216) {
+                if (ca > 0) { kprintln("ring3: child exited", 19); }
+                else { kprintln("ring3: FAIL A idle", 18); }
+            } else { kprintln("ring3: FAIL B partial", 21); }
+        } else { kprintln("ring3: FAIL B hung", 18); }
+    }
     # A is still live + preemptible — proves "another proc stays live".
     if (ca > 0) { kprintln("ring3: preempt OK", 17); } else { kprintln("ring3: FAIL no A", 16); }
     # P (ring-3 PARENT) spawn(#3)ed a child ELF + poll-waitpid(#4)ed it to exit, all from
@@ -6988,7 +7009,10 @@ fn ring3_selftest_verify() {
     var pcode = proc_get_exit_code(spawn_parent_pid);
     var pstate = proc_get_state(spawn_parent_pid);
     kprint("ring3: Pcode=", 13); kprint_num(pcode); kprint(" Pst=", 5); kprint_num(pstate); kprintln("", 0);
-    if (pcode == 0xABCD) { kprintln("ring3: parent spawn+wait OK", 27); } else { kprintln("ring3: FAIL parent spawn", 24); }
+    # (1.57.19) P's exit code is P's only while its slot is still P (1.57.7–1.57.18 read envprop's 81 here).
+    if (ring3_same_incarnation(spawn_parent_pid, ring3_epoch_p, "P", 1) == 1) {
+        if (pcode == 0xABCD) { kprintln("ring3: parent spawn+wait OK", 27); } else { kprintln("ring3: FAIL parent spawn", 24); }
+    }
     # spawn_path(#43) end-to-end: the ring-3 SP-parent issued spawn_path(#43) on "/bin/prog2"
     # (from DISK, non-blocking), poll-waitpid(#4)ed it, and exited with prog2's code (42). 42
     # proves #43 made a READY ring-3 proc the scheduler ran AND #4 reaped its real exit code —
@@ -6997,7 +7021,9 @@ fn ring3_selftest_verify() {
         var spcode = proc_get_exit_code(spawn_path_parent_pid);
         var spstate = proc_get_state(spawn_path_parent_pid);
         kprint("ring3: SPcode=", 14); kprint_num(spcode); kprint(" SPst=", 6); kprint_num(spstate); kprintln("", 0);
-        if (spcode == 42) { kprintln("ring3: spawnpath OK", 19); } else { kprintln("ring3: FAIL spawnpath", 21); }
+        if (ring3_same_incarnation(spawn_path_parent_pid, ring3_epoch_sp, "SP", 2) == 1) {
+            if (spcode == 42) { kprintln("ring3: spawnpath OK", 19); } else { kprintln("ring3: FAIL spawnpath", 21); }
+        }
     }
     # STRESS / page-table-fix proof: every extra proc (pids pushed into PD[8..63]) is still
     # ALIVE (state 1) after the scheduler round-robined to it many times. Reaching this print
@@ -8641,29 +8667,9 @@ if (tsc_per_us == 0) {
 sched_home_cr3 = dm_read_cr3() & 0x000FFFFFFFFFF000;
 sched_active = 1;
 
-#ifdef EXEC_SELFTEST
-# ⭐ 1.57.7 (S3b) — the two execwait#37 callers run HERE, after `sched_active = 1`: #37 is a blocking wait and returns
-# -1 before the scheduler runs. exec_disk_selftest (pre-scheduler) wrote /bin/exwv and /bin/envprop. Each is a
-# kmain `run` whose child calls #37: the caller blocks in the kernel (state 6) while its own child runs as an
-# ordinary scheduled process, then `exec: rsp0 restored` checks the caller's TSS.RSP0 + syscall top came back
-# through the switch tail (never at pid 0 now: pid 0 is kmain). exec-smoke counts `run: exit 90` >= 2 (argv, exwv),
-# reads envprop's own result (81) and counts `exec: rsp0 restored` >= 2, and denies STALE and VACUOUS.
-kprintln("exec: running /bin/exwv", 23);
-sh_exec("run /bin/exwv", 13);
-kprintln("exec: running /bin/envprop", 26);
-sh_exec("run /bin/envprop", 16);
-#endif
-
-#ifdef FORK_SELFTEST
-# ⛔ DELIBERATELY HERE, AFTER `sched_active = 1`, AND NOT WITH THE OTHER SELFTESTS. A forked child is
-# a state-1 proc and nothing else — it runs only when the SCHEDULER round-robins to it. The boot
-# selftest block sits ~2350 lines earlier, where `sched_active` is still 0, so a child marked ready
-# there can never be dispatched: the first placement of this call printed its banner and then simply
-# stopped, because the parent was polling for an exit that could not happen.
-# ⇒ fork is the first thing in this kernel whose test REQUIRES a live scheduler. Anything added here
-# must stay after this line.
-fork_disk_selftest();
-#endif
+# (1.57.19) the kmain launches that need the live scheduler — EXEC_SELFTEST's #37 callers, FORK_SELFTEST's fork —
+# run below, after every boot self-test's verify (see there): a launch allocates proc slots, and a verify reads its
+# own procs by pid.
 
 # === CMOS kernel checkpoint 16 (scheduler armed) ===
 # This is the AGNOS MVP closed-beta gate: reaching CP 16 means kernel
@@ -8725,6 +8731,37 @@ kstack_selftest_verify();
 # concurrent-proc scheduler stress: spawn a storm near the proc-table cap, churn
 # slot-reclaim across rounds, assert count/leak/starve/canary/cap invariants.
 sched_stress_verify();
+#endif
+
+#ifdef EXEC_SELFTEST
+# ⭐ 1.57.7 (S3b) — the two execwait#37 callers run after `sched_active = 1`: #37 is a blocking wait and returns -1
+# before the scheduler runs. exec_disk_selftest (pre-scheduler) wrote /bin/exwv and /bin/envprop. Each is a kmain
+# `run` whose child calls #37: the caller blocks in the kernel (state 6) while its own child runs as an ordinary
+# scheduled process, then `exec: rsp0 restored` checks the caller's TSS.RSP0 + syscall top came back through the
+# switch tail (never at pid 0 now: pid 0 is kmain). exec-smoke counts `run: exit 90` >= 2 (argv, exwv), reads
+# envprop's own result (81) and counts `exec: rsp0 restored` >= 2, and denies STALE and VACUOUS.
+# ⛔ 1.57.19 — and they run HERE, after every boot self-test's verify, not right after `sched_active = 1` where 1.57.7
+# put them: each `run` allocates proc slots, and a verify reads its own procs BY PID (proc_get_exit_code /
+# proc_get_state; the RING3 verify also checks proc_epoch now and names a recycled slot). Ahead of ring3_selftest_verify, RING3's parent P (#3) and SP (#43)
+# exited and were reaped while these ran, envprop and its envtest child (both exit 81) took the two freed slots, and
+# the verify read `ring3: Pcode=81` / `SPcode=81` — the EXEC + RING3 lane exec-smoke runs was red from 1.57.7 to
+# 1.57.18 with #3 and #43 both working (EXEC-DISK-OK twice). Anything else that launches from kmain goes below the
+# verifies too (FORK_SELFTEST, next).
+kprintln("exec: running /bin/exwv", 23);
+sh_exec("run /bin/exwv", 13);
+kprintln("exec: running /bin/envprop", 26);
+sh_exec("run /bin/envprop", 16);
+#endif
+
+#ifdef FORK_SELFTEST
+# ⛔ DELIBERATELY AFTER `sched_active = 1`, AND NOT WITH THE OTHER SELFTESTS. A forked child is
+# a state-1 proc and nothing else — it runs only when the SCHEDULER round-robins to it. The boot
+# selftest block sits ~2350 lines earlier, where `sched_active` is still 0, so a child marked ready
+# there can never be dispatched: the first placement of this call printed its banner and then simply
+# stopped, because the parent was polling for an exit that could not happen.
+# ⇒ fork's test REQUIRES a live scheduler. (1.57.19) It sat right after `sched_active = 1` until it moved here, below
+# every boot self-test's verify, with the #37 callers above: its parent and child take proc slots a verify reads by pid.
+fork_disk_selftest();
 #endif
 
 #ifdef KTEST
