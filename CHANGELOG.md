@@ -20,6 +20,57 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.19] — 2026-11-09 — repairs: the ZFS write row's edgec count, the EXEC + RING3 spawn lanes
+
+The repair minor's next cut: the 1.57.18 sweep's ZFS write row (shipped red, operator 2026-11-08: "Ship red, fix in
+1.57.19") and the exec-smoke `RING3_SELFTEST` lane that cut found red on a clean tree with no row to run it. **The plain
+kernel is byte-identical to 1.57.18's** (2,733,632 B); only the `EXEC_SELFTEST` / `FORK_SELFTEST` flag builds change.
+
+### Fixed — the ZFS write smoke's `wr` / `wr@u0` lanes no longer depend on the fixture build
+
+- The lanes pinned `deadlist /agnoswr/edgec … 6 entries (3 naming empty_bpobj)`, a count fixture RECIPE 8's post-`@c1`
+  writes decide: before the op list edgec's head deadlist has 2 entries naming `empty_bpobj` on `r8-83705beec7b1` and 3 on
+  `r8-9f0354ae0bb9` / `r8-36904f551255`; after it the kernel prints 2, 3 and 2. Now every `zfs-wtest: deadlist` line the
+  writer prints is held to the host's recount of the same written image: `zfs-uacct-check.py` prints each head in
+  `zfs_wt_dl`'s exact form (`deadlist-head /<ds> object O: N entries (E naming empty_bpobj), dl_used U, prev snapshot
+  unique P, dir SNAP S`), and the smoke requires the writer's line to equal it (`ok: 5 writer deadlist line(s) == the host
+  recount of the written image`). No op after `zfs_wt_dl` touches the dataset it reports. edgec's want keeps `6 entries`.
+- Proven (`ZWS_LANES="wr wr@u0 main"`, OpenZFS verify 37 steps each) on `r8-83705beec7b1` (edgec 2) and `r8-9f0354ae0bb9`
+  (edgec 3); a kernel printing `ne + 1` goes red on the new check by name. ([issue](docs/development/issues/archived/2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build.md).)
+
+### Fixed — the EXEC + RING3 profile's spawn lanes read their own processes again
+
+- **Kernel (`main.cyr`, flag builds only):** EXEC_SELFTEST's two `#37` callers (`/bin/exwv`, `/bin/envprop`) and
+  FORK_SELFTEST's `fork_disk_selftest` run after every boot self-test's verify (after `sched_stress_verify`, before
+  KTEST), not right after `sched_active = 1`. A verify reads its procs by pid and a slot carries no generation: from
+  1.57.7 (S3b) to 1.57.18 RING3's `#3` parent P and `#43` parent SP exited and were reaped while the `#37` callers ran,
+  envprop and its envtest child (both exit 81) took the two slots, and the boot printed `ring3: Pcode=81` / `SPcode=81`
+  with `#3` and `#43` both working (EXEC-DISK-OK twice). Now `ring3: Pcode=43981` (0xABCD) / `SPcode=42`.
+- **And the RING3 verify checks the incarnation** it reads: setup records `proc_epoch` of B, P and SP (the per-slot
+  generation `proc_alloc_slot` bumps), and `ring3_same_incarnation` prints `ring3: FAIL <B|P|SP> slot recycled before
+  verify` instead of judging a recycled slot's state or exit code. Proven: the `#37` runs put back ahead of the verify
+  print `ring3: FAIL P slot recycled before verify` / `SP slot recycled …`. `RING3_SELFTEST` builds only.
+- **`exec-smoke`** holds the RING3 lane's own verdicts — `ring3: parent spawn+wait OK` and no `ring3: FAIL` (it read only
+  the `#43` line) — and takes `--spawn-lane=require|auto|off` (as `EXEC_SMOKE_SPAWN_LANE`; run_gate hands its buildenv
+  to `build.sh`, not the smoke), parsed before anything boots. Proven: the 1.57.18 kernel red on both checks, the moved
+  order green; the sweep's EXEC-only profile green with 3 checks SKIPPED by name; `fork-smoke` green at `-smp 1` and 4;
+  `ring3-smoke` 20/20 (`-smp 1` and 4).
+
+### Gates
+
+- New sweep row: `exec-smoke.sh --spawn-lane=require` under `EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1`.
+  `grep -c '^run_gate "' scripts/sweep.sh` 85 → **86**.
+
+### Closeout
+
+- **The touched rows through the sweep's own run_gate** (`SWEEP_ONLY`, 4 workers, 1,649 s, 0 serial retries; firmware
+  VOIDs relaunched inside 3 rows): the full ZFS write row **21/21 lanes, OpenZFS 12/12**, both exec rows (the new EXEC +
+  RING3 row included), the ring3 row and the fork row — **5/5**, on the code of `b1d944ce` (the copies predate the version
+  bump). No full sweep: the plain kernel's bytes changed only in the version digits (2,733,632 B).
+- `check.sh` **39/40** (the `syscall ABI` gate alone, red by design until cyrius carries `#112`–`#115`); `test.sh --all`
+  **8/8**. Source gates: formatting, preprocessor and brace balance, smoke hygiene, issue pointers (71) green.
+- **Dead-code audit: waived** — the operator's standing rule *grow before refactor* (2026-10-11) stands.
+
 ## [1.57.18] — 2026-11-08 — repairs: a working directory, a power query, a terminal's back-pressure, the console as a terminal, readlink / readdir / open / fsync
 
 The repair minor's consumer cut (operator, 2026-11-08: "repair all issues in docs/development/issues/"): the eight open
@@ -201,7 +252,7 @@ free is **#116**); the `syscall ABI` gate is red by design until cyrius's peers 
   /agnoswr/edgec … 6 entries (3 naming empty_bpobj)`, where the kernel prints 2 on fixture `r8-83705beec7b1` (the 1.57.17
   kernel prints 2 or 3 on two other builds); every other check of both lanes green, h7's recount of the written image
   included; the other 10 rw lanes verified by OpenZFS (37 steps each, verify exit 0); red on the parallel run and the serial
-  retry. Issue [`2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build`](docs/development/issues/2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build.md).
+  retry. Issue [`2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build`](docs/development/issues/archived/2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build.md).
   One serial-retry pass (fg recovery `-smp 4`); 28 firmware VOIDs (`gnoboot: fail @ EBS`) inside 11 rows, each relaunched
   within its row.
 - `check.sh` **39/40** (the `syscall ABI` gate alone); `test.sh --all` **8/8** (x86 4 + aarch64 4: 0 unresolved-call

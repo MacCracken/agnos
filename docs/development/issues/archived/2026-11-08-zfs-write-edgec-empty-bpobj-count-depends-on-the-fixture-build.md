@@ -1,8 +1,19 @@
 # 2026-11-08 — the ZFS write smoke's `wr` / `wr@u0` lanes pin edgec's empty_bpobj count, which the fixture build decides
 
-**Status:** 🟡 OPEN — slotted for **1.57.19** (operator, 2026-11-08: "Ship red, fix in 1.57.19").
-*(Found by the 1.57.18 full sweep, row 8 — the ZFS write row red on both its parallel run and its serial retry, on these
-two lanes alone.)*
+**Status:** ✅ RESOLVED in **1.57.19** — the fix's first direction: every `zfs-wtest: deadlist` line the writer prints is
+held to the host's recount of the same written image. `scripts/smoke/lib/zfs-uacct-check.py` prints each head deadlist
+in `zfs_wt_dl`'s exact form (`deadlist-head /<ds> object O: N entries (E naming empty_bpobj), dl_used U, prev snapshot
+unique P, dir SNAP S`); `scripts/smoke/zfs-write-smoke.sh` requires the writer's line to equal it (`ok: 5 writer deadlist
+line(s) == the host recount of the written image`) and edgec's want keeps `6 entries` with the count free. No op after
+`zfs_wt_dl` touches the dataset it reports, so the line and the image are one state. Measured on the fixture's own
+pre-op `wr.img`: edgec names `empty_bpobj` in 2 entries on `r8-83705beec7b1`, 3 on `r8-9f0354ae0bb9` and
+`r8-36904f551255`; after the op list the kernel prints 2, 3 and 2 — the op list's own materialisations follow the build
+too, so no literal could hold. Proven: `ZWS_LANES="wr wr@u0 main"` green with OpenZFS verify (37 steps each) on
+`r8-83705beec7b1` (edgec 2) and on `r8-9f0354ae0bb9` (edgec 3, via a scratch `ZFS_FIXTURE_DIR`); a kernel printing
+`ne + 1` goes red on the new check by name (`FAIL: writer deadlist line(s) != the host recount; writer '…(2 naming
+empty_bpobj)…', host '…(1 naming …)…'`); then the full ZFS write row once (the sweep's own row, `SWEEP_ONLY`: 21/21 lanes, OpenZFS 12/12). The plain kernel is
+unchanged.
+**Was:** 🟡 OPEN — slotted for **1.57.19** (operator, 2026-11-08: "Ship red, fix in 1.57.19").
 **Checked against:** agnos **1.57.18** (merged tree, cyrius 6.7.18) on fixture `r8-83705beec7b1-c579a04a`, and (track T4,
 2026-11-08) agnos **8927c965** (1.57.17) on `r8-36904f551255-c579a04a` (red) and `r8-9f0354ae0bb9-c579a04a` (green).
 **Severity:** a gate defect, medium. No kernel behaviour is wrong as far as measured: on the red runs every other check of
