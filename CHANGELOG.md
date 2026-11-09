@@ -20,7 +20,204 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.57.18] — 2026-11-08
+## [1.57.18] — 2026-11-08 — repairs: a working directory, a power query, a terminal's back-pressure, the console as a terminal, readlink / readdir / open / fsync
+
+The repair minor's consumer cut (operator, 2026-11-08: "repair all issues in docs/development/issues/"): the eight open
+filings — thoth (a terminal channel's lost writes, the missing working directory, a one-fd readiness wait, readlink, open's
+create mode, the console), daimon (the power source) and crab (readdir's cut names) — as six tracks, each in its own
+worktree, merged and read together. Operator rulings (2026-11-08): **the kernel keeps a working directory per process**
+(`chdir`#112 / `getcwd`#113 — it reverses ABI § 3.2's "CWD is userland-owned"), and **the power query is an ACPI
+namespace scan** (`power_source`#114; no AML interpreter or EC driver this cut). Four numbers minted (#112–#115; the next
+free is **#116**); the `syscall ABI` gate is red by design until cyrius's peers land (filed). **Built, gated, NOT burned.**
+
+### Added — a working directory per process (`chdir`#112, `getcwd`#113)
+
+- **`chdir`#112(path, len) → 0 / -1**: the cwd becomes the cleaned absolute form of `path` (a relative one joined to the
+  current cwd) when it names an existing directory on ext2, ZFS, FAT or exFAT (a mount root counts; `/` always does).
+  Cleaning is LEXICAL (Plan 9 `cleanname`, a shell's logical `cd`): empty components and `.` vanish, `..` removes the one
+  before it and never climbs above `/`, crossing mounts (`..` from `/mnt/zfs` is `/mnt`). A final symlink to a directory is
+  followed for the check and the link's path kept. -1 with the cwd unchanged for a bad range, `len < 1`, a NUL in `path`,
+  an input over 4095 bytes or a result over 4095, a missing path or a non-directory.
+- **`getcwd`#113(buf, cap) → length / -1**: the cwd and a NUL; the length excludes the NUL; `cap < length + 1` is -1 with
+  nothing written (Linux ERANGE — never a cut name). A removed or renamed cwd: relative lookups fail cleanly, `getcwd` still
+  answers the string.
+- **Every relative path any syscall takes resolves from the cwd**, through one ingress (`sc_path_take` / `sc_cpath_take`: a
+  kernel copy, cleaned, never truncated): `open`#7, `mkdir`#9, `rmdir`#10, `unlink`#30, `rename`#31 (both), `link`#32
+  (both), `stat`#33, `symlink`#63 (the link path; the target text is never rewritten), `readlink`#70, `readdir`#81 /
+  `readdir_at`#101, `lstat`#102, `statfs`#103, and the program path of `spawn_path`#43 / `execwait`#37 (as `execve`: no
+  `/bin` search). An absolute path is used verbatim. Until 1.57.17 only `open`#7 rooted a relative name at `/`; every other
+  arm returned -1.
+- **Inherited** across `spawn`#3, `spawn_path`#43, `execwait`#37 and `fork`#96; a #43 / #37 child is **seeded from the
+  first valid `PWD=`** in its env blob (absolute, an existing directory; an invalid one is ignored and the env text left
+  untouched), so agnsh's children land where agnsh is with no agnsh change. The kernel's default env says
+  `PWD=<the child's cwd>` (byte-identical `PWD=/` at `/`). The first process and kernel threads start at `/`; a recycled pid
+  starts clean. Measured with an unchanged agnsh: `cd /etc/ssl` then `grep -c . cert.pem` prints 3059 (1.57.17: "operation
+  not permitted").
+- ROOM slots 12 `proc_cwd_buf` (65,536 B) and 13 `pcpu_sc_path` (32,768 B: 4 CPUs × 2 × 4 KB) — 13 arrays, 398,368 B out
+  of the image; `pcpu_sc_open_abs` (1 KB `.bss`) removed. Design: [`docs/architecture/working-directory.md`](docs/architecture/working-directory.md).
+
+### Added — `power_source`#114: mains, battery or cannot say
+
+- One word, a1..a4 never read, never negative: **`w & 0xFF`** = **0** cannot say · **1** mains · **2** battery (reserved for
+  an AML evaluator, never returned this cut); reasons `0x100` TABLES · `0x200` BATTERY declared · `0x400` PRESENT · `0x800`
+  AC declared · `0x1000` INFERRED · `0x2000` MALFORMED. ABI row 114 and § 4.10.
+- Computed once at `acpi_init` (`power.cyr` `psrc_scan`): the DSDT and every SSDT the XSDT (else the RSDT) lists, each
+  checked for signature, length in [36 B, 1 MB] and checksum 0 (at most 16 MB and 256 SSDTs). Batteries are `PNP0C0A`
+  (EISAID `0x0A0CD041` as a DWord or QWord constant, or the string) and `ACPI0002`; AC adapters `ACPI0003`; matched in
+  `_HID`, or `_CID` as one id or a Package. A battery is absent when its body names `_STA` once, as `Name(_STA, k)` or
+  `Method(_STA) { Return(k) }`, with bit 0 clear. **Mains** (INFERRED) = no battery declared or every one absent (an AC
+  adapter alone too); **cannot say** = a present battery, a battery id no Device accounts for, no DSDT, or a failed bound
+  check (a DeviceOp whose PkgLength runs past its table). QEMU q35 / pc answer `0x1101`; the scan costs 0.24 ms (q35, TCG).
+- Boot line: `power: source <mains|cannot say> (<reason>; dsdt D ssdt S battery B absent A ids I ac C) word 0x<w>`.
+
+### Added — a terminal channel has back-pressure; epoll waits on a channel; `sock_connect`#47 takes a deadline
+
+- **`write`#1 on a terminal `#97` channel** (either end endowed in PTY mode — the program's terminal end or the
+  emulator's own end) never overwrites a full inbox (64 × 64 B): **a4 == 0** takes the whole buffer as successive ≤ 64-byte
+  records, waiting for room, and returns `len` (the partial count, or -1 with nothing taken, when the peer or the caller's
+  claim goes; SIGKILL ends it → 265, SIGSTOP / SIGCONT park and resume it; an ordinary signal does not interrupt it);
+  **a4 != 0** takes what fits (0 when nothing does, -1 with the peer gone). Display channels and `CH_SEND` keep
+  drop-oldest. thoth's 20,000-byte reply arrives whole (4,037 bytes at 1.57.17). Probe: `write(fd, buf, 128, 1)` on a fresh
+  terminal end returns 128 (64 before).
+- **`epoll_ctl`#20 op 3 / `epoll_wait`#21 watch `#97` channel endpoints** the caller may use (`chan_auth`, re-derived on
+  every pass — an inherited inert claim is -1 to SET and reports nothing): EPOLLIN = inbox non-empty or peer gone; EPOLLOUT
+  = the peer's inbox has a free slot (a display channel: always); peer gone = IN | OUT | HUP (+ RDHUP when asked). The
+  `WK_EPOLL` key's mask widened 0xFF → bits 8..39. One watch on a kept instance with `EPW_TIMED` is the readiness wait on
+  one fd with a ms deadline that consumes nothing. Measured: a record, a drain of a full inbox or a `CH_CLOSE` 50 ms into a
+  5 s wait → 1 at 50–60 ms; a 300 ms timeout on a quiet channel → 0 at 300–309 ms.
+- **`sock_connect`#47 `SC_TIMED`** = a3 bit 32 (`0x100000000`), then a4 = ms: > 0 bounds the wait at min(a4, the ~8 s
+  ceiling), measured once from entry; < 0 the ceiling alone; **0 a non-blocking connect** (the id at once; EPOLLOUT on
+  `EP_TCP | id` = connected, EPOLLERR | EPOLLHUP = refused). A spent deadline is -1 with the slot released. Without the bit
+  a4 is never read and a3 means what it always did. Measured on a silent loopback peer: 1500 ms → -1 at +2.6–9.9 ms past
+  it, 3000 ms → +0.2–8.7 ms, 20000 ms → the 8.0 s ceiling; a non-blocking dial returns in 0.15–1.0 ms.
+- `docs/architecture/blocking-waits.md` § "Channel writes (1.57.18)".
+
+### Added — the console is a terminal (ABI § 4.11)
+
+- EL 0/1/2 and ED 0/1 in the active background (ED 2 unchanged: it still homes the cursor).
+- UTF-8 output decoded across writes (Unicode Table 3-7): a kashi CP437 glyph where one exists, else one U+FFFD cell per
+  maximal subpart; East-Asian Wide = 2 cells, combining / zero-width = 0. COM1 receives the bytes unchanged.
+- A drawn underline cursor (fbcon's `CUR_UNDERLINE`), `ESC[?25h` / `ESC[?25l`; hidden per byte, drawn once per write,
+  no ghost after a move, scroll or erase. agnsh's prompt has one.
+- 32 CSI parameters (each clamped to 65535); SGR 7 / 27; OSC / DCS / APC / PM / SOS swallowed up to BEL / ST (CAN / SUB
+  cancel; bounded at 4096 bytes); Tab to the next multiple of 8; the last column's pending wrap (VT100 / xterm DECAWM) and
+  `ESC[?7l/h`.
+- **`console_mode`#110 `CM_NOSERIAL` = 4**: per PROCESS (not the console's), its own console writes are drawn and kept in
+  the klug ring but not mirrored to COM1; it dies with the process and a child starts without it. One 8,634-byte 128x64
+  frame (KVM): 219–236 ms mirrored, 35 ms opted out (564 ms at 1.57.17). Probe `#110(4, 0)` ≥ 0.
+
+### Added — a create mode on `open`#7; `fsync`#115
+
+- **`AO_MODE`** (`0x4000`): bits 32..63 of a3 are a create's mode, 0..07777, stored as given (agnos has no umask; set-id
+  and sticky kept, Linux's root rules). Applied only when the call creates; an existing file keeps its mode; a field above
+  07777 is -1 with nothing made (before any backend, even without `AO_CREAT`); without the bit a create gets today's
+  default (ext2 0644, ZFS 0100644). ext2 writes the i_mode (`ext2_create_m`); ZFS the SA MODE plus `zfs_acl_chmod`'s full
+  ACL (allow0 / deny1 / deny2, 3–6 ACEs — a non-nested mode such as 0604 was refused before); FAT / exFAT check and ignore
+  it (vfat). `mkdir`#9 unchanged: no flags argument, a stale a3. § 3.3's AO_APPEND row's stale "next free bit 0x2000" now
+  reads 0x8000.
+- **`fsync`#115(fd) → 0 / -1**: ext2 (write-through) one device flush and no sector; ZFS commits the pool's pending
+  policy-B txg only when it holds this fd's object (OpenZFS `zil_commit(zilog, foid)`); a FAT / exFAT write-back fd writes
+  its buffer, keeps the fd and flushes. A read-only fd syncs too; a directory or memory-file fd is 0; the console, a pipe,
+  socket, channel or event fd is -1. Measured (KVM, NVMe): an ext2 fsync with another ZFS file's txg pending costs 0
+  sectors and 2.2 ms, `sync`#12 634 sectors and 26.1 ms; fsync of the pending file itself 632 sectors, 24.6 ms.
+
+### Changed — readlink truncates; readdir marks a cut name; lseek repositions a directory
+
+- **`readlink`#70** copies at most `buflen` bytes and returns how many it copied (ext2 and ZFS), as Linux and FreeBSD do —
+  it was -1 for a longer target, so cyrius's 8-byte `is_symlink` probe read every link over 8 bytes as "not a link".
+  `buflen < 1` is -1. The kernel's own path walk reads the whole target or refuses (`ext2_readlink_whole`,
+  `zfs_readlink_ref`).
+- **`readdir`#81 / `readdir_at`#101 byte 63 is flags**: bit 0 `RD_DIR` (1), **bit 1 `RD_CUT` (2)** — set exactly when the
+  name was longer than 62 bytes; the cut ends on a UTF-8 character boundary (59–62 bytes kept). One writer for all three
+  sites (`rd_rec_put`). ABI § 4.2.1 (new).
+- **`lseek`#58 accepts an ext2 or ZFS `AO_DIRECTORY` fd**: SEEK_SET / SEEK_CUR return an opaque cookie (`telldir` /
+  `seekdir`) valid across close and reopen; SEEK_END and a negative result are -1. A forged ext2 position is snapped to the
+  next record boundary (Linux `ext2_validate_entry`); a ZFS cookie resumes at the next genuine entry.
+- **The program path of #43 / #37 and every relative path** — see the working directory above.
+
+### Breaking (migration)
+
+- **Byte 63 of a #81 / #101 record**: test `& 1` (a directory) and `& 2` (a cut name), never `== 1` — a cut directory is 3.
+- **`readlink`#70**: a return equal to `buflen` may be a cut target; retry with a larger buffer.
+- **`getdents`#29** with a buffer too small for the next record is -1 with the position unchanged (ext2 answered 0, "end").
+- **A relative program path** given to #43 / #37 resolves from the cwd with no `/bin` search (`-SPAWN_E_NOENT` from
+  elsewhere); a #81 / #101 path window of 256 bytes with no NUL is -1 (it was cut at 255).
+- **`write`#1 on a terminal channel** can block (a4 == 0) where it dropped the oldest record; an emulator that writes its
+  terminal with a blocking write while the program inside is blocked writing to it has built a cycle — write with
+  a4 != 0, use `CH_SEND`, or wait for EPOLLIN | EPOLLOUT (the ABI's row 1 names it; Linux PTY masters have the same hazard).
+
+### Fixed — found along the way
+
+- **Security: an ext2 slow symlink whose size exceeds its one block** made #70 copy past the kernel's 4096-byte block
+  buffer to ring 3 (measured: 5,000 bytes returned, 904 of them kernel `.bss`). Now -1; a ZFS link over 4096 bytes
+  (`ZK_LNKMAX`, OpenZFS's `MAXPATHLEN`) likewise.
+- **PAT entry 1 was write-through, not write-combining.** The firmware default's byte 1 is 0x04 (WT) and every framebuffer
+  "WC" mapping (`0x8B`, PWT) selected it since the Attempt-43 audit read it as WC. `vmm.cyr` `pat_init_cpu` programs entry 1
+  WC on every CPU (the BSP before its first WC remap, each AP in `ap_entry`; byte 1 only, then `wbinvd` and a CR3 reload —
+  Linux `pat_bp_init` / `pat_cpu_init`). A scroll at 2048x2048 under KVM: **194,321 → ~2,000–2,400 µs**; scroll, clear and
+  the shadow sync use `rep movsq` / `rep stosq`.
+- **Channel cursors and record copies had no lock**: `chan_lock` (`smp.cyr`) covers them and re-checks the claim epoch
+  (a re-minted claim gets −5 from `CH_SEND` / `CH_RECV`). Measured without it at -smp 4: 10 of 400 records lost, 4 torn,
+  291 reordered.
+- **ext2 `getdents`#29 / `readdir`#81 / `readdir_at`#101 ran without `fs_lock`** (the 1.46.x SMP bite missed them).
+- **An aligned `readdir_at`#101 cursor inside a record** parsed a header out of a file name (measured: 294 of 300 entries
+  lost); it is snapped to the next boundary, and -5 now means only "misaligned".
+- **`zfs_dir_next` took a negative cursor** to an out-of-bounds store (latent until directory lseek could set one).
+- **`klog_raw_depth` removed**: a global raised around a ring-3 write outside the console lock, so an SMP lost update could
+  strip kernel lines of their timestamp prefix. Ring-3 output goes through `kprint_user`.
+- **`fb_set_geom`** wrote past the RAM shadow's end when a larger mode was set; it now takes the console lock and turns the
+  shadow off when the new geometry outgrows it.
+- **`tests/chan/ptyws.cyr`'s display phase** read -9 PEERGONE at -smp 4 once the console was fast: its child now holds a
+  go-byte pipe across the driver's SET.
+
+### Gates
+
+- New smokes and sweep rows: `pty-backpressure-smoke` (`tests/chan/ptybp.cyr`, 66 checks), `console-ansi-smoke` (FB oracle,
+  `scripts/harness/console-ansi-test.py`, group `waits`, 110 checks), `fs-listing-smoke` (`tests/readdir/rdlong.cyr`, ext2 +
+  ZFS, 72 checks), `cwd-smoke` (`tests/cwd`, ext2 + ZFS + FAT, 112 checks), `power-source-smoke` (`tests/telemetry/psrc.cyr`,
+  15 boots with 11 crafted SSDTs, 150 checks), `fs-create-mode-smoke` (`tests/fsmode`, debugfs + e2fsck after a crash cut,
+  58 checks) — each at -smp 1 and -smp 4 — plus a row for `symlink-smoke` (`SYMLINK_SELFTEST=1`), which existed and no row
+  ran. `grep -c '^run_gate "' scripts/sweep.sh` 78 → **85**. Widened: `fssys-smoke` (+4: AO_MODE, #115), `exfat-write-smoke`
+  (#115), `zfs-ring3-smoke` (zfsx clauses 162–174: AO_MODE creates, the #115 child, a crash cut that loses one pending
+  file; `RING3_TXGS` 44 → 56; clause 130 moved to the 4095-byte bound), `tsc-smoke` (T7p: the power word's re-decode),
+  `console-line-smoke` (a cursor after the prompt is required). Each track mutation-proved its new assertions.
+- Row 1 `baseline check.sh` is **KNOWN RED** on the `syscall ABI` gate's FAIL lines alone (kernel 115 · abi-doc 115 ·
+  cyrius 111) until cyrius's peers carry #112–#115.
+- `check.sh` 40 gates (none added). Manifests 25 → 30 pinned 6.7.18 (`tests/cwd`, `tests/fsmode`).
+- **The merge's joins:** the four-track merge took `ksyscall` past cyrius's 1,023-jump-target cap ("function exceeds
+  1023 jump targets (x86 LASE cap)"); the bodies of `#97`, `#39`, `#99` and `#35` moved verbatim into `chan_op_sys`,
+  `blit_sys`, `proclist_sys` and `sysinfo_sys` (each keeps its own canary; the arm calls it and checks ksyscall's), leaving
+  room measured at 80 more one-branch arms. T5's path ingress met T3's locked ext2 readdir bodies (hand-merged: the
+  kernel copy has no user-range check), and T4's `AO_MODE` refusal goes ahead of T5's ingress in the `open`#7 arm.
+- **Image** (merged tree, cyrius 6.7.18): plain **2,733,632 B** (+47,264 vs 1.57.17's 2,686,368: the console, the power
+  scan, the cwd ingress, channel back-pressure, readdir / readlink, AO_MODE + fsync), LOAD end `0x3ab4e0`, **346,912 B**
+  under gate 34's `0x400000`.
+
+### Closeout
+
+- **Full sweep 83/85** (85 rows, cyrius 6.7.18, `SWEEP_JOBS=4`: 6,652 s, the parallel phase 3,464 s). Row 1 `baseline
+  check.sh` KNOWN RED on the `syscall ABI` gate alone (above). **Row 8, the ZFS write row, RED on its fixture build — shipped
+  red** (operator, 2026-11-08: "Ship red, fix in 1.57.19"): 19/21 lanes; `wr` / `wr@u0` fail one literal, `deadlist
+  /agnoswr/edgec … 6 entries (3 naming empty_bpobj)`, where the kernel prints 2 on fixture `r8-83705beec7b1` (the 1.57.17
+  kernel prints 2 or 3 on two other builds); every other check of both lanes green, h7's recount of the written image
+  included; the other 10 rw lanes verified by OpenZFS (37 steps each, verify exit 0); red on the parallel run and the serial
+  retry. Issue [`2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build`](docs/development/issues/2026-11-08-zfs-write-edgec-empty-bpobj-count-depends-on-the-fixture-build.md).
+  One serial-retry pass (fg recovery `-smp 4`); 28 firmware VOIDs (`gnoboot: fail @ EBS`) inside 11 rows, each relaunched
+  within its row.
+- `check.sh` **39/40** (the `syscall ABI` gate alone); `test.sh --all` **8/8** (x86 4 + aarch64 4: 0 unresolved-call
+  placeholders, aarch64 687,352 B).
+- **Flag matrix:** every `build.sh` flag singly (six that need a prerequisite built with `HDMI_ATOM` / `SHADER_BLEND`) and
+  four combinations — 161 builds plus the plain one green, 0 warnings, 0 layout refusals; the binding build
+  `ZFS_SELFTEST ZFS_WRITE_SELFTEST ZFS_WRITE_OPS` 205,344 B under gate 34.
+- **Boot:** `agnsh-smoke` PASS on the merged tree (the banner and both `boot: … OK` layout lines); the ktest row's KTEST
+  boot prints `Userland exec complete` (`-smp 1` and `-smp 4`). The bench harness was not re-run (last at 1.56.60).
+- **Dead-code audit: waived** — the operator's standing rule *grow before refactor* (2026-10-11) stands.
+- Filed in sibling repos (uncommitted there): cyrius `2026-11-08-agnos-sys-chdir-getcwd-112-113-peer.md`,
+  `2026-11-08-agnos-sys-power-source-114-peer.md`, `2026-11-08-agnos-sys-fsync-115-peer.md`,
+  `2026-11-08-agnos-sys-console-mode-110-peer.md`, `2026-11-08-agnos-fd-wait-ready-and-sock-connect-deadline.md`,
+  `2026-11-08-agnos-readlink-readdir-lseek-wrapper-docs.md`; crab `2026-11-08-agnos-readdir-cut-bit-and-directory-lseek.md`;
+  daimon `2026-11-08-agnos-power-source-arm-for-fx-power-find.md`; agnoshi `docs/development/issue/2026-11-08-agnos-cd-can-call-chdir-112.md`;
+  thoth `2026-11-08-agnos-console-terminal.md`, `2026-11-08-agnos-fs-path-can-be-the-identity-on-1-57-18.md`.
 
 ## [1.57.17] — 2026-11-04 — repairs: ext2 rename-replace, a terminal's window size, closed-state RST, epoll that waits, the ZFS full lane
 
